@@ -8,6 +8,8 @@ Relict helps answer the question:
 
 It combines taxonomic classification, nearest-neighbour novelty scoring, neighbourhood density (crowding), and phylogenetic tree visualisation into a single per-sequence assessment file.
 
+![Hungate_Plus_NewSequences_example.jpg](examples/Hungate_Plus_NewSequences_example.jpg)
+
 ---
 
 ## Quick start
