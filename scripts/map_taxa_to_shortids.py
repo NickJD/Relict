@@ -171,7 +171,7 @@ def main():
         pre_ids, pre_color = read_preload_itol(Path(args.preload_itol))
 
     # avoid importing the package to keep this script runnable from repo root
-    # reimplement minimal functions from phylo16s.pipeline.itol used below
+    # reimplement minimal functions from pipeline.itol used below
     def _hash_to_hue(s: str) -> float:
         import hashlib
         h = hashlib.md5(s.encode('utf-8')).hexdigest()

@@ -1,10 +1,10 @@
 import sqlite3
-import re
-from phylo16s.db.schema import SCHEMA
+from relict.db.schema import SCHEMA
 from pathlib import Path
-from utils.fasta import write_fasta
+from relict.utils.fasta import write_fasta
 import hashlib
 import logging
+from relict.taxonomy import canonicalize_sequence_id, parse_taxon_string
 
 
 class Database:
@@ -65,21 +65,25 @@ class Database:
             if 'dataset' not in cols:
                 try:
                     cur.execute("ALTER TABLE distances ADD COLUMN dataset TEXT")
-                    # set existing rows to 'gg2' as they came from the original classification
                     cur.execute("UPDATE distances SET dataset = 'gg2' WHERE dataset IS NULL")
                     conn.commit()
                 except Exception:
                     pass
 
-    def get_reference_fasta(self):
-        # placeholder
-        return "reference.fasta"
+            # ensure unique indexes exist so INSERT OR REPLACE behaves as intended
+            try:
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_taxonomy_id_dataset ON taxonomy (id, dataset)")
+                cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_distances_id_dataset ON distances (id, dataset)")
+                conn.commit()
+            except Exception:
+                pass
+
 
     def get_input_ids(self, fasta):
-        from utils.fasta import read_fasta
+        from relict.utils.fasta import read_fasta
         return [h for h, _ in read_fasta(fasta)]
 
-    def preload_from_files(self, fasta_path, taxa_tsv=None, color_csv=None, source='preload', dataset='preload', outdir=None):
+    def preload_from_files(self, fasta_path, taxa_tsv=None, color_csv=None, source='preload', dataset='preload', outdir=None, shorten_ids=True):
         """Preload sequences (and optionally taxonomy/colors) into the DB.
 
         - fasta_path: FASTA file of reference sequences to add
@@ -87,7 +91,7 @@ class Database:
         - color_csv: optional CSV with id,color to set explicit colors
         - source: string to record as the source for inserted colors
         """
-        from utils.fasta import read_fasta
+        from relict.utils.fasta import read_fasta
         self.logger.info("[DB][PRELOAD] Reading fasta %s", fasta_path)
         records = [(h, s) for h, s in read_fasta(fasta_path)]
         self.logger.info("[DB][PRELOAD] Read %d records from %s", len(records), fasta_path)
@@ -99,30 +103,10 @@ class Database:
         if records:
             # assign deterministic short IDs (3 letters + 2 digits) per original header
 
-            def _short_id_for_header(header, used_set):
-                i = 0
-                while True:
-                    h = hashlib.md5((header + '|' + str(i)).encode('utf-8')).hexdigest()
-                    val = int(h[:8], 16)
-                    # letters: base-26 3 chars
-                    letters_val = val % (26 ** 3)
-                    dv = (val >> 12) % 100
-                    # convert letters_val to 3 uppercase letters
-                    letters = ''
-                    vv = letters_val
-                    for _ in range(3):
-                        letters = chr(ord('A') + (vv % 26)) + letters
-                        vv //= 26
-                    sid = f"{letters}{dv:02d}"
-                    if sid not in used_set:
-                        used_set.add(sid)
-                        return sid
-                    i += 1
-
             for orig_h, seq in records:
-                short = _short_id_for_header(orig_h, used_ids)
-                records_to_insert.append((short, seq))
-                orig_to_short[orig_h] = short
+                effective_id = self.choose_effective_sequence_id(orig_h, used_ids, shorten_ids=shorten_ids)
+                records_to_insert.append((effective_id, seq))
+                orig_to_short[orig_h] = effective_id
 
             # bulk-insert sequences and aliases in a single transaction to improve performance
             alias_entries = [(short, orig) for orig, short in orig_to_short.items()]
@@ -143,7 +127,6 @@ class Database:
                     self.logger.info("[DB][PRELOAD] Inserted %d sequences and %d alias mappings", len(seq_rows), len(alias_entries))
             except Exception as e:
                 self.logger.warning("[DB][PRELOAD] Bulk insert failed, falling back to per-record inserts: %s", e)
-                # fallback to previous behaviour
                 self.insert_sequences(records_to_insert, dataset=dataset)
                 if alias_entries:
                     self.insert_aliases(alias_entries)
@@ -239,8 +222,7 @@ class Database:
         # if no color entries, derive colors from taxonomy/genus
         if not color_entries:
             try:
-                # lazy import of itol generator color function
-                from phylo16s.pipeline.itol import _name_to_color, parse_taxon_string
+                from relict.pipeline.itol import _name_to_color
                 with self.connect() as conn:
                     cur = conn.cursor()
                     # restrict color derivation to taxonomy rows for this dataset only
@@ -384,15 +366,28 @@ class Database:
                 return sid
             i += 1
 
+    def choose_effective_sequence_id(self, header: str, used_set: set, shorten_ids: bool = True):
+        """Return the runtime ID to use for a sequence.
+
+        When `shorten_ids` is True, generate a deterministic compact ID.
+        Otherwise, use the canonicalized source ID directly and fail fast on
+        collisions so users do not silently merge distinct records.
+        """
+        if shorten_ids:
+            return self.generate_short_id(header, used_set)
+        cid = self._canonical_from_header(header)
+        if not cid:
+            raise ValueError(f"Could not derive a canonical ID from header: {header!r}")
+        if cid in used_set:
+            raise ValueError(
+                f"Canonical ID collision while --no-shorten-ids is active: {cid!r}. "
+                "Use unique input IDs or re-run with ID shortening enabled."
+            )
+        used_set.add(cid)
+        return cid
+
     def _canonical_from_header(self, header: str) -> str:
-        # derive canonical id: first token, strip pipe prefixes and trailing _digits
-        if header is None:
-            return None
-        token = str(header).split()[0]
-        if '|' in token:
-            token = token.split('|')[-1]
-        token = re.sub(r'_[0-9]+$', '', token)
-        return token
+        return canonicalize_sequence_id(header)
 
 
     def insert_sequences(self, records, dataset='user'):
@@ -422,19 +417,32 @@ class Database:
         tax_entries: iterable of (id, taxonomy, confidence)
         Uses INSERT OR REPLACE to update taxonomy info.
         """
+        # Only persist taxonomy for ids that are present in the sequences table
         with self.connect() as conn:
             cur = conn.cursor()
+            to_insert = []
+            skipped = 0
             for entry in tax_entries:
                 # accept either (sid, tax, conf) or (sid, tax, conf, dataset)
                 if len(entry) == 3:
                     sid, tax, conf = entry
-                    ds = None
+                    ds = ''
                 else:
                     sid, tax, conf, ds = entry
+                    ds = ds or ''
                 cid = self._canonical_from_header(sid) if sid is not None else None
-                cur.execute("INSERT OR REPLACE INTO taxonomy (id, taxonomy, confidence, dataset) VALUES (?, ?, ?, ?)",
-                            (cid or sid, tax, conf, ds))
+                key = cid or sid
+                # ensure this id was provided by the user (exists in sequences)
+                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
+                if cur.fetchone():
+                    to_insert.append((key, tax, conf, ds))
+                else:
+                    skipped += 1
+            if to_insert:
+                cur.executemany("INSERT OR REPLACE INTO taxonomy (id, taxonomy, confidence, dataset) VALUES (?, ?, ?, ?)", to_insert)
             conn.commit()
+            if skipped:
+                self.logger.info("[DB] Skipped %d taxonomy entries because ids are not present in sequences table", skipped)
 
     def insert_distances(self, dist_entries):
         """Insert nearest-hit distances.
@@ -442,41 +450,66 @@ class Database:
         dist_entries: iterable of (id, nearest, identity)
         Uses INSERT OR REPLACE.
         """
+        # Only persist distances for ids that are present in the sequences table
         with self.connect() as conn:
             cur = conn.cursor()
+            to_insert = []
+            skipped = 0
             for entry in dist_entries:
                 # accept either (sid, nearest, identity) or (sid, dataset, nearest, identity)
                 if len(entry) == 3:
                     sid, nearest, identity = entry
-                    ds = None
+                    ds = ''
                 else:
                     sid, ds, nearest, identity = entry
+                    ds = ds or ''
                 cid = self._canonical_from_header(sid) if sid is not None else None
+                key = cid or sid
+                # Only insert if the id exists in sequences
+                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
+                if not cur.fetchone():
+                    skipped += 1
+                    continue
                 n_cid = None
                 if nearest is not None:
                     n_cid = self._canonical_from_header(nearest)
-                cur.execute("INSERT OR REPLACE INTO distances (id, dataset, nearest, identity) VALUES (?, ?, ?, ?)",
-                            (cid or sid, ds, n_cid or nearest, identity))
+                to_insert.append((key, ds, n_cid or nearest, identity))
+            if to_insert:
+                cur.executemany("INSERT OR REPLACE INTO distances (id, dataset, nearest, identity) VALUES (?, ?, ?, ?)", to_insert)
             conn.commit()
+            if skipped:
+                self.logger.info("[DB] Skipped %d distance entries because ids are not present in sequences table", skipped)
 
     def insert_colors(self, color_entries):
         """Insert or replace color entries.
 
         color_entries: iterable of (id, color, source)
         """
+        # Only persist colors for ids that exist in the sequences table
         with self.connect() as conn:
             cur = conn.cursor()
+            to_insert = []
+            skipped = 0
             for entry in color_entries:
                 # accept (id, color, source) or (id, color, source, dataset)
                 if len(entry) == 3:
                     sid, color, source = entry
-                    ds = None
+                    ds = ''
                 else:
                     sid, color, source, ds = entry
+                    ds = ds or ''
                 cid = self._canonical_from_header(sid) if sid is not None else None
-                cur.execute("INSERT OR REPLACE INTO colors (id, color, source, dataset) VALUES (?, ?, ?, ?)",
-                            (cid or sid, color, source, ds))
+                key = cid or sid
+                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
+                if cur.fetchone():
+                    to_insert.append((key, color, source, ds))
+                else:
+                    skipped += 1
+            if to_insert:
+                cur.executemany("INSERT OR REPLACE INTO colors (id, color, source, dataset) VALUES (?, ?, ?, ?)", to_insert)
             conn.commit()
+            if skipped:
+                self.logger.info("[DB] Skipped %d color entries because ids are not present in sequences table", skipped)
 
     def get_color_map(self, ids=None):
         """Return a dict id->color for provided ids or for all if ids is None."""
@@ -489,4 +522,5 @@ class Database:
                 cur.execute("SELECT id, color FROM colors")
             rows = cur.fetchall()
         return {r[0]: r[1] for r in rows}
+
 

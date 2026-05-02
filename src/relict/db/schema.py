@@ -32,3 +32,4 @@ CREATE TABLE IF NOT EXISTS seq_aliases (
     original_header TEXT
 );
 """
+
