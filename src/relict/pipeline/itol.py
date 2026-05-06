@@ -1556,3 +1556,348 @@ def _make_palette_simple(names: list) -> dict:
     return {name: _hsv_to_hex(i / float(n), s=0.80, v=0.92) for i, name in enumerate(names)}
 
 
+
+# ── Rumen bacterial functional groups ────────────────────────────────────────
+
+# Broad-scale ruminant microbiome functional group assignments.
+# Keys are lowercase genus, family, order, or phylum names (or partial matches).
+# Values are human-readable functional group labels.
+# Hierarchy: genus match takes priority over family, then order, then phylum.
+# A sequence not matching any entry defaults to 'Other / Unclassified'.
+
+# Curated at genus level first (most specific)
+_RUMEN_GENUS: dict = {
+    # Cellulolytic / Fibrolytic
+    'fibrobacter': 'Cellulolytic/Fibrolytic',
+    'ruminococcus': 'Cellulolytic/Fibrolytic',
+    'hungateiclostridium': 'Cellulolytic/Fibrolytic',
+    'clostridium': 'Cellulolytic/Fibrolytic',
+    'caldicellulosiruptor': 'Cellulolytic/Fibrolytic',
+    'cellulosilyticum': 'Cellulolytic/Fibrolytic',
+    'pseudobutyrivibrio': 'Cellulolytic/Fibrolytic',
+    # Proteolytic
+    'prevotella': 'Proteolytic/Peptidolytic',
+    'bacteroides': 'Proteolytic/Peptidolytic',
+    'butyrivibrio': 'Proteolytic/Peptidolytic',
+    'selenomonas': 'Proteolytic/Peptidolytic',
+    'anaerovibrio': 'Lipolytic',
+    # Methanogenic Archaea
+    'methanobrevibacter': 'Methanogenic Archaea',
+    'methanobacterium': 'Methanogenic Archaea',
+    'methanomicrobium': 'Methanogenic Archaea',
+    'methanosarcina': 'Methanogenic Archaea',
+    'methanosphaera': 'Methanogenic Archaea',
+    'methanomassiliicoccus': 'Methanogenic Archaea',
+    'methanoregula': 'Methanogenic Archaea',
+    'methanoplanus': 'Methanogenic Archaea',
+    'methanoculleus': 'Methanogenic Archaea',
+    'methanocorpusculum': 'Methanogenic Archaea',
+    # Butyrate producers
+    'roseburia': 'Butyrate Producers',
+    'faecalibacterium': 'Butyrate Producers',
+    'eubacterium': 'Butyrate Producers',
+    'coprococcus': 'Butyrate Producers',
+    'anaerobutyricum': 'Butyrate Producers',
+    'anaerostipes': 'Butyrate Producers',
+    'lachnospira': 'Butyrate Producers',
+    'blautia': 'Butyrate Producers',
+    # Succinate/Propionate producers
+    'propionibacterium': 'Succinate/Propionate Producers',
+    'propionigenium': 'Succinate/Propionate Producers',
+    'veillonella': 'Succinate/Propionate Producers',
+    'succiniclasticum': 'Succinate/Propionate Producers',
+    'succinivibrio': 'Succinate/Propionate Producers',
+    'succinimonas': 'Succinate/Propionate Producers',
+    'ruminobacter': 'Succinate/Propionate Producers',
+    'fibrobacter': 'Cellulolytic/Fibrolytic',
+    # Lactate producers
+    'streptococcus': 'Lactate Producers',
+    'lactobacillus': 'Lactate Producers',
+    'lactococcus': 'Lactate Producers',
+    'ligilactobacillus': 'Lactate Producers',
+    'enterococcus': 'Lactate Producers',
+    'megasphaera': 'Lactate Producers',
+    # Acetate producers / Acetogens
+    'acetitomaculum': 'Acetogens',
+    'acetoanaerobium': 'Acetogens',
+    'moorella': 'Acetogens',
+    'sporomusa': 'Acetogens',
+    'ruminococcaceae': 'Acetogens',
+    # Amylolytic / starch degraders
+    'amylophilus': 'Amylolytic/Starch Degraders',
+    'treponema': 'Amylolytic/Starch Degraders',
+    # Sulfate-reducing bacteria
+    'desulfovibrio': 'Sulfate-Reducing Bacteria',
+    'desulfobulbus': 'Sulfate-Reducing Bacteria',
+    'desulfobacter': 'Sulfate-Reducing Bacteria',
+}
+
+# Family-level fallback
+_RUMEN_FAMILY: dict = {
+    'ruminococcaceae': 'Cellulolytic/Fibrolytic',
+    'lachnospiraceae': 'Butyrate Producers',
+    'clostridiaceae': 'Cellulolytic/Fibrolytic',
+    'bacteroidaceae': 'Proteolytic/Peptidolytic',
+    'prevotellaceae': 'Proteolytic/Peptidolytic',
+    'fibrobacteraceae': 'Cellulolytic/Fibrolytic',
+    'methanobacteriaceae': 'Methanogenic Archaea',
+    'methanomicrobiaceae': 'Methanogenic Archaea',
+    'methanosaetaceae': 'Methanogenic Archaea',
+    'methanosarcinaceae': 'Methanogenic Archaea',
+    'veillonellaceae': 'Succinate/Propionate Producers',
+    'selenomonadaceae': 'Succinate/Propionate Producers',
+    'succinivibrionaceae': 'Succinate/Propionate Producers',
+    'streptococcaceae': 'Lactate Producers',
+    'lactobacillaceae': 'Lactate Producers',
+    'desulfovibrionaceae': 'Sulfate-Reducing Bacteria',
+    'spirochaetaceae': 'Amylolytic/Starch Degraders',
+    'treponemataceae': 'Amylolytic/Starch Degraders',
+    'butyrivibrionaceae': 'Cellulolytic/Fibrolytic',
+}
+
+# Phylum-level fallback
+_RUMEN_PHYLUM: dict = {
+    'fibrobacterota': 'Cellulolytic/Fibrolytic',
+    'fibrobacteres': 'Cellulolytic/Fibrolytic',
+    'methanobacteriota': 'Methanogenic Archaea',
+    'euryarchaeota': 'Methanogenic Archaea',
+    'thermoplasmota': 'Methanogenic Archaea',
+    # Domain-level archaea fallback applied separately
+    'bacteroidota': 'Proteolytic/Peptidolytic',
+    'bacteroidetes': 'Proteolytic/Peptidolytic',
+    'bacillota': 'Butyrate Producers',
+    'firmicutes': 'Butyrate Producers',
+    'spirochaetota': 'Amylolytic/Starch Degraders',
+    'spirochaetes': 'Amylolytic/Starch Degraders',
+    'proteobacteria': 'Succinate/Propionate Producers',
+    'pseudomonadota': 'Succinate/Propionate Producers',
+    'desulfobacterota': 'Sulfate-Reducing Bacteria',
+    'actinobacteriota': 'Succinate/Propionate Producers',
+    'actinobacteria': 'Succinate/Propionate Producers',
+    'verrucomicrobiota': 'Glycan/Mucin Degraders',
+    'verrucomicrobia': 'Glycan/Mucin Degraders',
+}
+
+# Ordered palette for the known functional groups (for consistent, distinct colours)
+_RUMEN_FUNC_PALETTE: dict = {
+    'Cellulolytic/Fibrolytic':      '#1b7837',  # dark green
+    'Proteolytic/Peptidolytic':     '#762a83',  # purple
+    'Methanogenic Archaea':         '#4393c3',  # sky blue
+    'Butyrate Producers':           '#d6604d',  # coral red
+    'Succinate/Propionate Producers': '#f4a582', # light orange
+    'Lactate Producers':            '#fdae61',  # amber
+    'Acetogens':                    '#92c5de',  # pale blue
+    'Amylolytic/Starch Degraders':  '#e7d4e8',  # lavender
+    'Lipolytic':                    '#fee08b',  # yellow
+    'Sulfate-Reducing Bacteria':    '#878787',  # grey
+    'Glycan/Mucin Degraders':       '#a6d96a',  # lime
+    'Other / Unclassified':         '#cccccc',  # neutral grey
+}
+
+
+def _assign_rumen_function(parsed: dict) -> str:
+    """Return a broad ruminant functional group label for a parsed taxonomy dict.
+
+    Parameters
+    ----------
+    parsed : dict
+        Output of :func:`parse_taxon_string` with keys 'd','p','c','o','f','g','s'.
+
+    Returns
+    -------
+    str
+        Functional group label (one of the keys in :data:`_RUMEN_FUNC_PALETTE`).
+    """
+    def _lo(x):
+        return (x or '').lower().strip()
+
+    domain = _lo(parsed.get('d', ''))
+    phylum = _lo(_normalize_taxon_name(parsed.get('p', ''), preserve_subgroup=True))
+    family = _lo(_normalize_taxon_name(parsed.get('f', '')))
+    genus  = _lo(_normalize_taxon_name(parsed.get('g', '')))
+
+    # Archaea domain → Methanogenic Archaea (many rumen archaea are methanogens)
+    if 'archaea' in domain:
+        # Still allow a genus-level override first
+        hit = _RUMEN_GENUS.get(genus)
+        if hit:
+            return hit
+        return 'Methanogenic Archaea'
+
+    # Genus → family → phylum hierarchy
+    for lookup, key in (
+        (_RUMEN_GENUS,  genus),
+        (_RUMEN_FAMILY, family),
+        (_RUMEN_PHYLUM, phylum),
+    ):
+        # exact match
+        hit = lookup.get(key)
+        if hit:
+            return hit
+        # partial / prefix match (handles subgroup suffixes like 'bacillota_a')
+        for k, v in lookup.items():
+            if key and k and (key.startswith(k) or k.startswith(key)):
+                return v
+
+    return 'Other / Unclassified'
+
+
+def generate_rumen_function_draft(
+    taxonomy_tsv: str,
+    outdir: str,
+    id_map: dict = None,
+) -> tuple:
+    """Auto-generate a draft rumen functional annotation from a taxonomy TSV.
+
+    Reads the combined taxonomy TSV produced by a Relict run and maps each
+    sequence to one of the broad ruminant microbiome functional groups defined
+    in :data:`_RUMEN_FUNC_PALETTE`.
+
+    Two output files are written in *outdir*:
+
+    ``rumen_functions_draft.tsv``
+        Tab-separated.  Columns: ``sequence_id``, ``Rumen_Functional_Group``.
+        This file can be edited by the user and then supplied to future runs
+        via ``--functional`` for a refined annotation.
+
+    ``itol_func_Rumen_Functional_Group.itol``
+        iTOL ``DATASET_COLORSTRIP`` file ready for direct upload to iTOL after
+        the tree.
+
+    Parameters
+    ----------
+    taxonomy_tsv : str
+        Path to the taxonomy TSV (combined_taxonomy.tsv or similar).
+        Supports the ``ID\\tTaxon\\tConfidence`` and
+        ``ID\\tBestHit\\tIdentity\\tTaxon\\tConfidence`` formats.
+    outdir : str
+        Output directory.
+    id_map : dict, optional
+        ``{original_id: short_id}`` mapping to translate sequence IDs.
+
+    Returns
+    -------
+    (tsv_path, itol_path) : tuple of str
+        Paths to the written files.  Returns ``(None, None)`` on failure.
+    """
+    import csv as _csv
+
+    out_p = Path(outdir)
+    out_p.mkdir(parents=True, exist_ok=True)
+
+    # ── ID mapper ────────────────────────────────────────────────────────────
+    def _map_id(qid: str):
+        if not id_map:
+            return qid
+        if qid in id_map:
+            return id_map[qid]
+        lk = qid.lower()
+        for k, v in (id_map or {}).items():
+            try:
+                if k.lower() == lk:
+                    return v
+            except Exception:
+                continue
+        return qid
+
+    rows: list = []   # [(short_id, func_group)]
+    try:
+        # Support gzipped taxonomy files
+        import gzip as _gzip
+        _opener = _gzip.open if str(taxonomy_tsv).endswith(('.gz', '.gzip')) else open
+        with _opener(taxonomy_tsv, 'rt') as fh:
+            reader = _csv.reader(fh, delimiter='\t')
+            header = next(reader, None)  # skip header
+            for line in reader:
+                if not line:
+                    continue
+                qid = line[0].strip()
+                # Accept both 5-column and 3-column taxonomy TSV formats
+                taxon = 'NA'
+                if len(line) > 3:
+                    taxon = line[3].strip()
+                elif len(line) > 1:
+                    taxon = line[1].strip()
+                short_id = _map_id(qid)
+                parsed   = parse_taxon_string(taxon)
+                func_grp = _assign_rumen_function(parsed)
+                rows.append((short_id, func_grp))
+    except Exception as e:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "generate_rumen_function_draft: failed to read %s: %s", taxonomy_tsv, e
+        )
+        return None, None
+
+    if not rows:
+        return None, None
+
+    # ── Write draft TSV ──────────────────────────────────────────────────────
+    tsv_path = out_p / 'rumen_functions_draft.tsv'
+    try:
+        with open(tsv_path, 'w', newline='') as fh:
+            w = _csv.writer(fh, delimiter='\t')
+            w.writerow(['sequence_id', 'Rumen_Functional_Group'])
+            w.writerows(rows)
+    except Exception as e:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "generate_rumen_function_draft: failed to write TSV: %s", e
+        )
+        return None, None
+
+    # ── Write iTOL DATASET_COLORSTRIP ────────────────────────────────────────
+    # Build category palette: prefer curated colours, generate for any unknowns.
+    cats_seen = []
+    cats_set: set = set()
+    for _, grp in rows:
+        if grp not in cats_set:
+            cats_set.add(grp)
+            cats_seen.append(grp)
+
+    cat_palette = {}
+    unknown_cats = []
+    for c in cats_seen:
+        if c in _RUMEN_FUNC_PALETTE:
+            cat_palette[c] = _RUMEN_FUNC_PALETTE[c]
+        else:
+            unknown_cats.append(c)
+    # assign distinct colours to any unrecognised groups
+    if unknown_cats:
+        extra = _make_palette_simple(unknown_cats)
+        cat_palette.update(extra)
+
+    legend_shapes = ','.join(['1'] * len(cats_seen))
+    legend_colors = ','.join(cat_palette.get(c, '#cccccc') for c in cats_seen)
+    legend_labels = ','.join(c.replace(',', ';') for c in cats_seen)
+    first_col = cat_palette.get(cats_seen[0], '#cccccc') if cats_seen else '#cccccc'
+
+    itol_lines = [
+        'DATASET_COLORSTRIP',
+        'SEPARATOR COMMA',
+        'DATASET_LABEL,Rumen Functional Group',
+        f'COLOR,{first_col}',
+        'MARGIN,5',
+        'SHOW_INTERNAL,0',
+        'LEGEND_TITLE,Rumen Functional Group legend',
+        f'LEGEND_SHAPES,{legend_shapes}',
+        f'LEGEND_COLORS,{legend_colors}',
+        f'LEGEND_LABELS,{legend_labels}',
+        'DATA',
+    ]
+    for sid, grp in rows:
+        col_hex = cat_palette.get(grp, '#cccccc')
+        itol_lines.append(f'{sid},{col_hex},{grp.replace(",", ";")}')
+
+    itol_path = out_p / 'itol_func_Rumen_Functional_Group.itol'
+    try:
+        itol_path.write_text('\n'.join(itol_lines) + '\n')
+    except Exception as e:
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "generate_rumen_function_draft: failed to write iTOL file: %s", e
+        )
+        return str(tsv_path), None
+
+    return str(tsv_path), str(itol_path)
+

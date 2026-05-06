@@ -578,6 +578,26 @@ def cmd_preload(args):
         except Exception:
             pass
 
+        # ── Draft rumen functional groups (optional) ──────────────────────────
+        if getattr(args, 'draft_rumen_functions', False):
+            try:
+                combined_tax_path = str(out_p / 'combined_taxonomy.tsv')
+                tsv_out, itol_out = itol.generate_rumen_function_draft(
+                    combined_tax_path, outdir, id_map=id_map
+                )
+                if tsv_out:
+                    logging.getLogger(__name__).info(
+                        "[PRELOAD] Draft rumen functional annotation: %s", tsv_out
+                    )
+                if itol_out:
+                    logging.getLogger(__name__).info(
+                        "[PRELOAD] Rumen functional iTOL file: %s", itol_out
+                    )
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    "[PRELOAD] Draft rumen functions generation failed: %s", e
+                )
+
         # Write a simple dataset colorstrip mapping preloaded ids to dataset color
         try:
             ds_color = getattr(args, 'dataset_color', None) if hasattr(args, 'dataset_color') else None
@@ -1049,6 +1069,18 @@ def cmd_run(args):
                 logging.getLogger(__name__).warning("[ITOL] Functional annotations generation failed: %s", e)
     except Exception:
         pass
+    # Draft rumen functional groups (auto-generated from output taxonomy)
+    if getattr(args, 'draft_rumen_functions', False):
+        try:
+            tsv_out, itol_out = itol.generate_rumen_function_draft(
+                str(combined_path), outdir, id_map=id_map_for_itol
+            )
+            if tsv_out:
+                logging.getLogger(__name__).info("[ITOL] Draft rumen functional annotation: %s", tsv_out)
+            if itol_out:
+                logging.getLogger(__name__).info("[ITOL] Rumen functional iTOL file: %s", itol_out)
+        except Exception as e:
+            logging.getLogger(__name__).warning("[ITOL] Draft rumen functions generation failed: %s", e)
     # produce dataset membership band (preload vs run)
     try:
         combined_tax = combined_path
@@ -1332,6 +1364,18 @@ def cmd_subtree(args):
                 log.warning("[SUBTREE] Functional annotations generation failed: %s", e)
     except Exception:
         pass
+    # Draft rumen functional groups
+    if getattr(args, 'draft_rumen_functions', False):
+        try:
+            tsv_out, itol_out = itol_mod.generate_rumen_function_draft(
+                str(combined_tax_path), outdir, id_map=None
+            )
+            if tsv_out:
+                log.info("[SUBTREE] Draft rumen functional annotation: %s", tsv_out)
+            if itol_out:
+                log.info("[SUBTREE] Rumen functional iTOL file: %s", itol_out)
+        except Exception as e:
+            log.warning("[SUBTREE] Draft rumen functions generation failed: %s", e)
 
     # ── Dataset membership strip ──────────────────────────────────────────────
     # One colour per dataset label so users can see which sequences came from
@@ -1586,6 +1630,16 @@ def cmd_regen_itol(args):
                 log.warning("[REGEN-ITOL] Functional annotations generation failed: %s", e)
     except Exception:
         pass
+    # Draft rumen functional groups
+    if getattr(args, 'draft_rumen_functions', False):
+        try:
+            tsv_out, itol_out = itol.generate_rumen_function_draft(str(combined_path), outdir, id_map=None)
+            if tsv_out:
+                log.info("[REGEN-ITOL] Draft rumen functional annotation: %s", tsv_out)
+            if itol_out:
+                log.info("[REGEN-ITOL] Rumen functional iTOL file: %s", itol_out)
+        except Exception as e:
+            log.warning("[REGEN-ITOL] Draft rumen functions generation failed: %s", e)
 
     # build dataset membership strip
     try:
@@ -1688,6 +1742,16 @@ def build_parser():
             'numeric → DATASET_SIMPLEBAR, categorical → DATASET_COLORSTRIP.'
         ),
     )
+    preload.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+        action='store_true', default=False,
+        help=(
+            'Auto-generate a draft rumen functional-group annotation from the output taxonomy. '
+            'Maps each sequence to a broad ruminant microbiome functional category '
+            '(e.g. Cellulolytic/Fibrolytic, Methanogenic Archaea, Butyrate Producers) '
+            'and writes rumen_functions_draft.tsv + itol_func_Rumen_Functional_Group.itol. '
+            'The draft TSV can be edited and re-supplied via --functional in future runs.'
+        ),
+    )
 
     # ── run ───────────────────────────────────────────────────────────────────
     run = sub.add_parser(
@@ -1763,6 +1827,14 @@ def build_parser():
             'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
         ),
     )
+    run.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+        action='store_true', default=False,
+        help=(
+            'Auto-generate a draft rumen functional-group annotation from the output taxonomy. '
+            'Writes rumen_functions_draft.tsv and itol_func_Rumen_Functional_Group.itol. '
+            'The draft TSV can be edited and re-supplied via --functional in later runs.'
+        ),
+    )
 
     # ── regen-itol ────────────────────────────────────────────────────────────
     regen = sub.add_parser(
@@ -1795,6 +1867,10 @@ def build_parser():
             'TSV file mapping sequence IDs to functional attributes. '
             'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
         ),
+    )
+    regen.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+        action='store_true', default=False,
+        help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
     )
 
     # ── subtree ───────────────────────────────────────────────────────────────
@@ -1857,6 +1933,10 @@ def build_parser():
             'TSV file mapping sequence IDs to functional attributes. Header row required; first column = sequence ID; subsequent columns = functional attributes. '
             'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
         ),
+    )
+    subtree.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+        action='store_true', default=False,
+        help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
     )
 
     return parser

@@ -98,6 +98,13 @@ def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
     taxa_map: dict[str, tuple[str, Optional[float]]] = {}
 
     try:
+        # Log start of taxonomy loading
+        try:
+            size_mb = os.path.getsize(taxa_tsv) / (1024 * 1024)
+            logger.info("[CLASSIFY] Loading taxonomy map from %s (%.1f MB)...", taxa_tsv, size_mb)
+        except Exception:
+            logger.info("[CLASSIFY] Loading taxonomy map from %s...", taxa_tsv)
+
         if str(taxa_tsv).endswith('.gz'):
             fh_ctx = gzip.open(taxa_tsv, 'rt')
         else:
@@ -208,10 +215,56 @@ def _ensure_uncompressed(ref_fasta: str, outdir: str) -> str:
     if not str(ref_fasta).endswith(".gz"):
         return ref_fasta
     ref_unc = os.path.join(outdir, "ref_uncompressed.fasta")
-    if not os.path.exists(ref_unc):
+    if os.path.exists(ref_unc):
+        # File already exists - check if it's non-empty
+        try:
+            size = os.path.getsize(ref_unc)
+            if size > 0:
+                logger.info("[CLASSIFY] Using existing decompressed reference: %s (%.1f MB)", ref_unc, size / (1024*1024))
+                return ref_unc
+            else:
+                logger.warning("[CLASSIFY] Existing decompressed file is empty; re-decompressing")
+                os.remove(ref_unc)
+        except Exception as e:
+            logger.warning("[CLASSIFY] Could not check existing file: %s; re-decompressing", e)
+
+    # Get compressed file size for progress estimation
+    import time
+    try:
+        compressed_size = os.path.getsize(ref_fasta)
+        logger.info("[CLASSIFY] Decompressing %s (%.1f MB compressed) → %s",
+                   ref_fasta, compressed_size / (1024*1024), ref_unc)
+        if compressed_size > 100 * 1024 * 1024:  # > 100 MB
+            logger.warning("[CLASSIFY] Large reference file detected (%.1f MB compressed). "
+                          "Decompression may take several minutes depending on disk I/O speed. "
+                          "Please be patient...", compressed_size / (1024*1024))
+    except Exception:
         logger.info("[CLASSIFY] Decompressing %s → %s", ref_fasta, ref_unc)
-        records = list(read_fasta(ref_fasta))
-        write_fasta(records, ref_unc)
+
+    import gzip as _gzip
+    import shutil as _shutil
+    # Decompress using fast byte-level streaming
+    start_time = time.time()
+
+    try:
+        with _gzip.open(ref_fasta, 'rb') as _src, open(ref_unc, 'wb') as _dst:
+            _shutil.copyfileobj(_src, _dst, length=1 << 20)  # 1 MiB buffer
+
+        elapsed = time.time() - start_time
+        final_size = os.path.getsize(ref_unc)
+        final_mb = final_size / (1024 * 1024)
+        logger.info("[CLASSIFY] Decompression complete: %.1f MB written in %.1f seconds (%.1f MB/s)",
+                    final_mb, elapsed, final_mb / elapsed if elapsed > 0 else 0)
+    except Exception as e:
+        logger.error("[CLASSIFY] Decompression failed: %s", e)
+        # Clean up partial file
+        try:
+            if os.path.exists(ref_unc):
+                os.remove(ref_unc)
+        except Exception:
+            pass
+        raise
+
     return ref_unc
 
 
@@ -232,14 +285,31 @@ def _iter_taxa_file_rows(taxa_tsv: str):
 
 
 def validate_reference_taxonomy_consistency(ref_fasta: Optional[str], taxa_tsv: Optional[str]):
-    """Return warning rows about mismatches between reference FASTA and taxonomy TSV."""
+    """Return warning rows about mismatches between reference FASTA and taxonomy TSV.
+
+    Skips validation for large reference files (>500 MB) as it's too expensive.
+    """
     warnings = []
     if not ref_fasta or not taxa_tsv:
         return warnings
 
+    # Skip validation for large reference files - too expensive to parse
+    try:
+        ref_size = os.path.getsize(ref_fasta)
+        if ref_size > 500 * 1024 * 1024:  # 500 MB threshold
+            logger.info(
+                '[CLASSIFY] Skipping reference/taxonomy consistency validation for large reference '
+                'file (%.1f MB). This check is too expensive for production databases.',
+                ref_size / (1024 * 1024)
+            )
+            return warnings
+    except Exception:
+        pass  # If we can't get file size, proceed with validation
+
     ref_ids = []
     ref_key_to_id = {}
     try:
+        logger.info('[CLASSIFY] Validating reference/taxonomy consistency (this may take a minute for large files)...')
         for header, _ in read_fasta(ref_fasta):
             ref_ids.append(header)
             for key in reference_lookup_keys(header):

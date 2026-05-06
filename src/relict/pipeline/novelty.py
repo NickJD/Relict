@@ -204,10 +204,56 @@ def _ensure_uncompressed(ref_fasta: str, outdir: str) -> str:
     if not str(ref_fasta).endswith(".gz"):
         return ref_fasta
     ref_unc = os.path.join(outdir, "ref_uncompressed.fasta")
-    if not os.path.exists(ref_unc):
-        logger.info("[NOVELTY] Decompressing reference %s → %s", ref_fasta, ref_unc)
-        records = list(read_fasta(ref_fasta))
-        write_fasta(records, ref_unc)
+    if os.path.exists(ref_unc):
+        # File already exists - check if it's non-empty
+        try:
+            size = os.path.getsize(ref_unc)
+            if size > 0:
+                logger.info("[NOVELTY] Using existing decompressed reference: %s (%.1f MB)", ref_unc, size / (1024*1024))
+                return ref_unc
+            else:
+                logger.warning("[NOVELTY] Existing decompressed file is empty; re-decompressing")
+                os.remove(ref_unc)
+        except Exception as e:
+            logger.warning("[NOVELTY] Could not check existing file: %s; re-decompressing", e)
+
+    # Get compressed file size for progress estimation
+    import time
+    try:
+        compressed_size = os.path.getsize(ref_fasta)
+        logger.info("[NOVELTY] Decompressing %s (%.1f MB compressed) → %s",
+                   ref_fasta, compressed_size / (1024*1024), ref_unc)
+        if compressed_size > 100 * 1024 * 1024:  # > 100 MB
+            logger.warning("[NOVELTY] Large reference file detected (%.1f MB compressed). "
+                          "Decompression may take several minutes depending on disk I/O speed. "
+                          "Please be patient...", compressed_size / (1024*1024))
+    except Exception:
+        logger.info("[NOVELTY] Decompressing %s → %s", ref_fasta, ref_unc)
+
+    import gzip as _gzip
+    import shutil as _shutil
+    # Decompress using fast byte-level streaming
+    start_time = time.time()
+
+    try:
+        with _gzip.open(ref_fasta, 'rb') as _src, open(ref_unc, 'wb') as _dst:
+            _shutil.copyfileobj(_src, _dst, length=1 << 20)  # 1 MiB buffer
+
+        elapsed = time.time() - start_time
+        final_size = os.path.getsize(ref_unc)
+        final_mb = final_size / (1024 * 1024)
+        logger.info("[NOVELTY] Decompression complete: %.1f MB written in %.1f seconds (%.1f MB/s)",
+                    final_mb, elapsed, final_mb / elapsed if elapsed > 0 else 0)
+    except Exception as e:
+        logger.error("[NOVELTY] Decompression failed: %s", e)
+        # Clean up partial file
+        try:
+            if os.path.exists(ref_unc):
+                os.remove(ref_unc)
+        except Exception:
+            pass
+        raise
+
     return ref_unc
 
 
