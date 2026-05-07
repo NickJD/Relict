@@ -42,8 +42,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os as _os
 import re
 import shutil
+import shutil as _shutil
+import sys as _sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
@@ -589,6 +592,106 @@ def _run_fasttree(aln_path: Path, tree_path: Path) -> bool:
         return False
 
 
+def _resolve_iqtree_binary() -> Optional[str]:
+    """Find the IQ-TREE binary, trying multiple candidate names.
+
+    Conda environments sometimes install IQ-TREE as ``iqtree`` rather than
+    ``iqtree2``, and ``/bin/sh`` may not inherit the activated conda PATH.
+    This function:
+      1. Searches all candidates via ``shutil.which`` (honours PATH).
+      2. Falls back to ``dirname(sys.executable)`` — the conda env's bin dir —
+         so the correct binary is always found when Relict is run from within
+         the conda environment.
+    """
+    candidates = ["iqtree2", "iqtree", "IQ-TREE", "iqtree-omp"]
+    for name in candidates:
+        found = _shutil.which(name)
+        if found:
+            logger.debug("[TREE] Resolved IQ-TREE binary via PATH: %s", found)
+            return found
+    # Fall back to the bin directory that contains the current Python interpreter
+    env_bin = _os.path.dirname(_sys.executable)
+    for name in candidates:
+        candidate = _os.path.join(env_bin, name)
+        if _os.path.isfile(candidate) and _os.access(candidate, _os.X_OK):
+            logger.debug("[TREE] Resolved IQ-TREE binary via env bin: %s", candidate)
+            return candidate
+    return None
+
+
+def _run_iqtree(
+    aln_path: Path,
+    tree_path: Path,
+    threads: int = 4,
+    model: str = "GTR+G+I",
+    fast: bool = False,
+) -> bool:
+    """Run IQ-TREE 2/3 on *aln_path*, write the best tree to *tree_path*.
+
+    IQ-TREE produces several output files under a common prefix; this
+    function copies the ``.treefile`` to *tree_path* so the rest of the
+    pipeline is unaffected.
+
+    Parameters
+    ----------
+    fast  : When True, pass ``-fast`` for a quicker (but still much more
+            accurate than FastTree) search.  Recommended for incremental runs.
+    """
+    binary = _resolve_iqtree_binary()
+    if not binary:
+        logger.warning(
+            "[TREE] IQ-TREE binary not found in PATH or conda env bin dir.\n"
+            "Install via: conda install -c bioconda iqtree"
+        )
+        return False
+
+    prefix = str(aln_path.parent / aln_path.stem) + "_iqtree"
+    thread_flag = f"-T {threads}" if threads and int(threads) > 0 else "-T AUTO"
+    fast_flag = "-fast" if fast else ""
+    cmd = (
+        f"{binary} -s {aln_path} -m {model} {thread_flag} "
+        f"-pre {prefix} --redo -quiet {fast_flag}"
+    ).strip()
+    logger.info("[TREE] Running IQ-TREE%s: %s", " (fast)" if fast else "", cmd)
+    try:
+        run_cmd(cmd)
+    except RuntimeError as e:
+        logger.warning(
+            "[TREE] IQ-TREE failed: %s\n"
+            "Install via: conda install -c bioconda iqtree", e,
+        )
+        return False
+
+    treefile = Path(prefix + ".treefile")
+    if not treefile.exists():
+        logger.warning("[TREE] IQ-TREE did not produce a treefile at %s", treefile)
+        return False
+
+    _shutil.copyfile(treefile, tree_path)
+    logger.info("[TREE] IQ-TREE complete → %s", tree_path)
+    return True
+
+
+def _build_tree(
+    fasta_for_tree: str,
+    tree_path: Path,
+    threads: int = 4,
+    method: str = "fasttree",
+) -> bool:
+    """Dispatch to the chosen tree-building backend.
+
+    Parameters
+    ----------
+    method : ``'fasttree'``   — approximate ML, GTR+CAT (default, fast)
+             ``'iqtree'``     — full ML, GTR+G+I, SPR+NNI (more accurate)
+             ``'iqtree-fast'``— full ML with IQ-TREE ``-fast`` flag (compromise)
+    """
+    if method in ("iqtree", "iqtree-fast"):
+        fast = method == "iqtree-fast"
+        return _run_iqtree(Path(fasta_for_tree), tree_path, threads=threads, fast=fast)
+    return _run_fasttree(Path(fasta_for_tree), tree_path)
+
+
 def _run_mafft_full(input_fasta: Path, output_fasta: Path, threads: int = 4) -> bool:
     """Full de-novo MAFFT alignment (--auto mode)."""
     thread_flag = f"--thread {threads}" if threads > 0 else ""
@@ -841,6 +944,7 @@ def initialise_or_update_tree(
     anchor_file: Optional[str] = None,
     force_rebuild: bool = False,
     preload_dir: Optional[str] = None,
+    tree_method: str = "fasttree",
 ):
     """
     Initialise or incrementally update the Relict phylogenetic tree.
@@ -855,11 +959,17 @@ def initialise_or_update_tree(
                        current_tree.nwk        — the current tree
     db             : Optional Database instance to pull existing sequences from.
     db_dataset     : If set, only pull this dataset from the DB.
-    threads        : Number of threads for MAFFT.
+    threads        : Number of threads for MAFFT and the tree builder.
     anchor_file    : Path to custom reference anchor FASTA.
                      Falls back to the bundled data/reference_anchors.fasta.
     force_rebuild  : If True, rebuild the entire tree from scratch even if
                      current_alignment.fasta already exists.
+    tree_method    : Tree-building backend to use.
+                     ``'fasttree'``    — approximate ML, GTR+CAT (default, fast).
+                     ``'iqtree'``      — full ML, GTR+G+I + SPR/NNI (more accurate,
+                                         slower; recommended for publication figures).
+                     ``'iqtree-fast'`` — IQ-TREE 2 with ``-fast`` flag; a good
+                                         compromise for incremental exploratory runs.
 
     Strategy
     --------
@@ -869,13 +979,13 @@ def initialise_or_update_tree(
       3. Load user sequences
       4. Combine all three → combined_input.fasta
       5. MAFFT --auto on combined_input.fasta → current_alignment.fasta
-      6. FastTree -nt -gtr → current_tree.nwk
+      6. Tree builder → current_tree.nwk
 
     SUBSEQUENT RUNS (current_alignment.fasta exists):
       1. Find sequences in user_fasta not yet in alignment or DB
       2. If new sequences exist:
          a. MAFFT --addfragments new_seqs onto current_alignment.fasta
-         b. FastTree rebuild → current_tree.nwk
+         b. Tree builder → current_tree.nwk
          c. Replace current_alignment.fasta with the new combined alignment
       3. If no new sequences: nothing to do (tree is already up to date)
 
@@ -930,7 +1040,7 @@ def initialise_or_update_tree(
             return
 
         fasta_for_tree, id_map = _make_unique_fasta(str(aligned_fasta), out)
-        if not _run_fasttree(Path(fasta_for_tree), current_tree):
+        if not _build_tree(fasta_for_tree, current_tree, threads=threads, method=tree_method):
             return
 
         _finalise_tree(out, id_map)
@@ -944,7 +1054,7 @@ def initialise_or_update_tree(
         if not current_tree.exists():
             logger.info("[TREE] No user sequences; building tree from existing alignment")
             fasta_for_tree, id_map = _make_unique_fasta(str(current_aln), out)
-            if _run_fasttree(Path(fasta_for_tree), current_tree):
+            if _build_tree(fasta_for_tree, current_tree, threads=threads, method=tree_method):
                 _finalise_tree(out, id_map)
         else:
             logger.info("[TREE] No new sequences and tree exists — nothing to do")
@@ -958,7 +1068,7 @@ def initialise_or_update_tree(
         logger.info("[TREE] All user sequences already in alignment — nothing to add")
         if not current_tree.exists():
             fasta_for_tree, id_map = _make_unique_fasta(str(current_aln), out)
-            if _run_fasttree(Path(fasta_for_tree), current_tree):
+            if _build_tree(fasta_for_tree, current_tree, threads=threads, method=tree_method):
                 _finalise_tree(out, id_map)
         return
 
@@ -989,7 +1099,7 @@ def initialise_or_update_tree(
         return
 
     fasta_for_tree, id_map = _make_unique_fasta(str(combined_aln), out)
-    if not _run_fasttree(Path(fasta_for_tree), current_tree):
+    if not _build_tree(fasta_for_tree, current_tree, threads=threads, method=tree_method):
         return
 
     _finalise_tree(out, id_map)

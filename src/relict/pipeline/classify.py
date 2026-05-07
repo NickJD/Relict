@@ -211,10 +211,16 @@ def _lookup_tax(sid: str, taxa_map: dict) -> tuple[Optional[str], Optional[float
 # Reference decompression
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ensure_uncompressed(ref_fasta: str, outdir: str) -> str:
+def _ensure_uncompressed(ref_fasta: str, outdir: str, out_name: str = "ref_uncompressed.fasta") -> str:
+    """Decompress *ref_fasta* to *outdir/<out_name>* if it is gzipped.
+
+    ``out_name`` is exposed so callers can give each database its own cached
+    filename and avoid different databases overwriting each other's decompressed
+    copy.
+    """
     if not str(ref_fasta).endswith(".gz"):
         return ref_fasta
-    ref_unc = os.path.join(outdir, "ref_uncompressed.fasta")
+    ref_unc = os.path.join(outdir, out_name)
     if os.path.exists(ref_unc):
         # File already exists - check if it's non-empty
         try:
@@ -500,3 +506,252 @@ def run_classification(
         written, len(all_query_ids), no_hit, output,
     )
     return output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-database classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _derive_db_name(fasta_path: str) -> str:
+    """Derive a short, filesystem-safe name from a reference FASTA path.
+
+    Strips common suffixes (_reps, _ssu, _16s, _rna, _seqs, _NR<digits>) before
+    sanitising and truncating to 24 characters.
+    """
+    import re as _re
+    base = Path(fasta_path).stem
+    base = _re.sub(r'_(reps?|ssu_?reps?|16[sS]|rna|nr\d*|seqs?)$', '', base, flags=_re.IGNORECASE)
+    safe = _re.sub(r'[^A-Za-z0-9]+', '_', base).strip('_')[:24]
+    return safe if safe else Path(fasta_path).stem[:16]
+
+
+def run_classification_single(
+    input_fasta: str,
+    outdir: str,
+    ref_fasta: str,
+    taxa_tsv: Optional[str] = None,
+    threads: Optional[int] = None,
+    db_name: str = 'main',
+) -> tuple[str, dict]:
+    """Classify *input_fasta* against a single reference database.
+
+    Parameters
+    ----------
+    db_name : Label for this database.  When ``'main'``, outputs are written
+              to ``taxonomy.tsv`` / ``matches.tsv`` (the canonical filenames
+              expected by downstream code).  Any other name uses
+              ``taxonomy_<db_name>.tsv`` / ``matches_<db_name>.tsv``.
+
+    Returns
+    -------
+    (tsv_path, results_dict) where
+    results_dict = {qid: (hit_id, pct_identity, taxon, confidence)}
+    """
+    import re as _re
+
+    if db_name == 'main':
+        tsv_name = 'taxonomy.tsv'
+        match_name = 'matches.tsv'
+    else:
+        safe = _re.sub(r'[^A-Za-z0-9]+', '_', db_name).strip('_')
+        tsv_name = f'taxonomy_{safe}.tsv'
+        match_name = f'matches_{safe}.tsv'
+
+    output = os.path.join(outdir, tsv_name)
+    matches_path = os.path.join(outdir, match_name)
+
+    # Use a db-specific decompressed filename so multiple gzipped references
+    # used in the same run do not overwrite each other's cached copy.
+    if db_name == 'main':
+        decomp_name = 'ref_uncompressed.fasta'
+    else:
+        safe_decomp = _re.sub(r'[^A-Za-z0-9]+', '_', db_name).strip('_')
+        decomp_name = f'ref_uncompressed_{safe_decomp}.fasta'
+    ref_to_use = _ensure_uncompressed(ref_fasta, outdir, out_name=decomp_name)
+
+    # Build taxa lookup map.
+    # When a --alt-taxa TSV is supplied it is used directly; otherwise taxonomy
+    # is parsed from the reference FASTA headers (GTDB-style lineage strings).
+    taxa_map: dict = {}
+    if taxa_tsv:
+        logger.info("[CLASSIFY][%s] Loading taxa map from TSV: %s", db_name, taxa_tsv)
+        taxa_map = _load_taxa_map(taxa_tsv)
+    else:
+        try:
+            taxa_map, warning_rows = _load_taxa_map_from_reference_fasta(ref_to_use)
+            if taxa_map:
+                logger.info(
+                    "[CLASSIFY][%s] Parsed taxonomy from %d reference FASTA headers",
+                    db_name, len(taxa_map) // 3,
+                )
+            if warning_rows:
+                warn_path = write_reference_taxonomy_warnings(outdir, warning_rows)
+                logger.warning("[CLASSIFY][%s] Reference-header taxonomy warnings → %s", db_name, warn_path)
+        except Exception as e:
+            logger.warning("[CLASSIFY][%s] Could not parse taxa from FASTA headers: %s", db_name, e)
+
+    # Run vsearch
+    thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
+    cmd = (
+        f"vsearch --usearch_global {input_fasta}"
+        f" --db {ref_to_use}"
+        f" --id 0.8"
+        f" --strand both"
+        f" --blast6out {matches_path}"
+        f" --maxaccepts 1 --maxhits 1"
+        f" --query_cov 0.7"
+        f"{thread_flag}"
+    )
+    logger.info("[CLASSIFY] Running vsearch for db=%s", db_name)
+    run_cmd(cmd)
+    logger.info("[CLASSIFY] vsearch done for db=%s → %s", db_name, matches_path)
+
+    all_query_ids = [h for h, _ in read_fasta(input_fasta) if not is_ref_anchor(h)]
+
+    # Parse best hits from matches file
+    best_hits: dict[str, tuple[str, float]] = {}
+    try:
+        with open(matches_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 3:
+                    continue
+                qid, sid = parts[0], parts[1]
+                try:
+                    pct = float(parts[2])
+                except ValueError:
+                    continue
+                if qid not in best_hits or pct > best_hits[qid][1]:
+                    best_hits[qid] = (sid, pct)
+    except FileNotFoundError:
+        logger.warning("[CLASSIFY][%s] matches file not found", db_name)
+
+    results: dict = {}
+    written = 0
+    no_hit = 0
+    with open(output, "w") as out_fh:
+        out_fh.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\n")
+        for qid in all_query_ids:
+            if qid not in best_hits:
+                out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\n")
+                results[qid] = ('NA', 0.0, 'NA', 'NA')
+                no_hit += 1
+                continue
+            sid, pct = best_hits[qid]
+            tax, conf = _lookup_tax(sid, taxa_map)
+            if conf is None:
+                conf = round(pct / 100.0, 4)
+            tax_str = tax if tax is not None else 'NA'
+            out_fh.write(f"{qid}\t{sid}\t{pct:.2f}\t{tax_str}\t{conf:.4f}\n")
+            results[qid] = (sid, pct, tax_str, conf)
+            written += 1
+
+    logger.info(
+        "[CLASSIFY][%s] %d/%d sequences classified, %d with no hit → %s",
+        db_name, written, len(all_query_ids), no_hit, output,
+    )
+    return output, results
+
+
+def run_all_classifications(
+    input_fasta: str,
+    outdir: str,
+    primary_ref: str,
+    primary_taxa: Optional[str] = None,
+    primary_name: str = 'main',
+    alt_refs: Optional[list] = None,
+    threads: Optional[int] = None,
+    main_db: Optional[str] = None,
+) -> tuple[str, dict]:
+    """Classify *input_fasta* against the primary and all alternative databases.
+
+    Parameters
+    ----------
+    primary_ref   : Path to the primary reference FASTA.
+    primary_taxa  : Optional taxa TSV for the primary reference.
+    primary_name  : Display name for the primary database (default ``'main'``).
+    alt_refs      : List of ``(ref_fasta, taxa_tsv_or_None, db_name)`` tuples.
+    main_db       : Which database (by name) should be written to the canonical
+                    ``taxonomy.tsv``.  Defaults to *primary_name*.
+
+    Returns
+    -------
+    (primary_taxonomy_tsv, all_results)
+    where ``all_results`` = ``{db_name: {qid: (hit, pct, tax, conf)}}``.
+
+    Side effects
+    ------------
+    * ``taxonomy.tsv``                   – main DB (backwards-compatible)
+    * ``taxonomy_<name>.tsv``            – one file per additional DB
+    * ``taxonomy_all_dbs.tsv``           – wide merged table (multi-DB only)
+    """
+    effective_main = main_db or primary_name
+
+    all_dbs = [(primary_ref, primary_taxa, primary_name)] + (alt_refs or [])
+    all_results: dict = {}
+
+    for ref, taxa, name in all_dbs:
+        # The database whose name matches effective_main writes to taxonomy.tsv
+        db_label = 'main' if name == effective_main else name
+        _, results = run_classification_single(input_fasta, outdir, ref, taxa, threads, db_label)
+        all_results[name] = results
+
+    # Write wide merged taxonomy when more than one database was used
+    if len(all_dbs) > 1:
+        all_query_ids = [h for h, _ in read_fasta(input_fasta) if not is_ref_anchor(h)]
+        _write_merged_taxonomy(outdir, all_results, effective_main, all_query_ids)
+
+    primary_tsv = os.path.join(outdir, 'taxonomy.tsv')
+    return primary_tsv, all_results
+
+
+def _write_merged_taxonomy(
+    outdir: str,
+    all_results: dict,
+    primary_name: str,
+    all_query_ids: list,
+) -> str:
+    """Write ``taxonomy_all_dbs.tsv`` — a wide table with one set of columns per DB.
+
+    The primary database's columns appear first (``BestHit``, ``Identity``,
+    ``Taxon``, ``Confidence``).  Each additional database adds a suffixed set
+    (``BestHit_<DB>``, ``Identity_<DB>``, ``Taxon_<DB>``, ``Confidence_<DB>``).
+    """
+    import re as _re
+    output = os.path.join(outdir, 'taxonomy_all_dbs.tsv')
+
+    db_names = [primary_name] + [n for n in all_results if n != primary_name]
+
+    with open(output, 'w') as fh:
+        header = ['ID', 'BestHit', 'Identity', 'Taxon', 'Confidence']
+        for name in db_names[1:]:
+            safe = _re.sub(r'[^A-Za-z0-9]+', '_', name).strip('_')
+            header += [f'BestHit_{safe}', f'Identity_{safe}', f'Taxon_{safe}', f'Confidence_{safe}']
+        fh.write('\t'.join(header) + '\n')
+
+        primary_res = all_results.get(primary_name, {})
+        for qid in all_query_ids:
+            hit, pct, tax, conf = primary_res.get(qid, ('NA', 0.0, 'NA', 'NA'))
+            row = [
+                qid,
+                str(hit),
+                f"{pct:.2f}" if isinstance(pct, float) else str(pct),
+                str(tax),
+                f"{conf:.4f}" if isinstance(conf, float) else str(conf),
+            ]
+            for name in db_names[1:]:
+                a_hit, a_pct, a_tax, a_conf = all_results.get(name, {}).get(qid, ('NA', 0.0, 'NA', 'NA'))
+                row += [
+                    str(a_hit),
+                    f"{a_pct:.2f}" if isinstance(a_pct, float) else str(a_pct),
+                    str(a_tax),
+                    f"{a_conf:.4f}" if isinstance(a_conf, float) else str(a_conf),
+                ]
+            fh.write('\t'.join(row) + '\n')
+
+    logger.info("[CLASSIFY] Wrote merged multi-db taxonomy → %s", output)
+    return output
+

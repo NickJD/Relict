@@ -21,6 +21,7 @@ except Exception:
 
 from relict.db.interface import Database
 from relict.pipeline import classify, tree, itol, qc, derep, novelty
+from relict.pipeline.classify import _derive_db_name as _classify_derive_db_name
 from relict.pipeline.collapse import collapse_fasta_within_taxa
 from relict.pipeline.workflow_helpers import (
     _assignment_source_is_fasta,
@@ -171,16 +172,20 @@ def _write_output_explanations(outdir: str):
             'DensitySource tells you which sequence pool was used for neighbourhood density.'
         )),
         ('sequence_assessment.tsv', (
-            'Unified per-sequence assessment. KEY COLUMNS: '
-            'InTree (Yes/No) — whether this sequence entered the phylogenetic tree or was replaced '
-            'by a cluster representative; '
-            'ClusterRepresentative — "self" if this sequence IS in the tree as its own entry; '
-            'the ID of another sequence if this one was collapsed into that representative; '
-            '"duplicate" if this sequence was excluded as an exact duplicate during dereplication; '
-            'ClusterSize — total sequences in this cluster (1 = singleton, >1 = collapsed group); '
-            'ClusteredMembers — IDs of other sequences collapsed under this representative (empty for singletons). '
-            'Clustering reduces tree redundancy at high identity (≥ collapse_threshold) WITHIN the '
-            'same taxonomic assignment. All sequences appear here regardless of tree inclusion.'
+            'Unified per-sequence assessment. '
+            'COLUMN GROUPS: '
+            '(1) TAXONOMY/CLASSIFICATION — Taxonomy, ClassificationHit, ClassificationIdentity, '
+            'ClassificationConfidence: derived from the primary reference database (GTDB/SILVA). '
+            'ClassificationHit is the reference accession vsearch matched. '
+            'Repeated as Taxonomy_<DB>, ClassificationHit_<DB>, Identity_<DB>, Confidence_<DB> '
+            'for each additional --alt-ref database. '
+            '(2) NOVELTY — NearestHit, NearestIdentity, MatchesGE*, NoveltyScore, Crowding, '
+            'SequencingPriority: derived from the PRELOAD sequences already in the DB. '
+            'NearestHit is the closest sequence you have previously submitted. '
+            'These columns are entirely independent of the reference database. '
+            '(3) TREE/CLUSTER — InTree, ClusterRepresentative, ClusterSize, ClusteredMembers: '
+            'records whether the sequence entered the phylogenetic tree directly or was '
+            'represented by a cluster representative after --collapse.'
         )),
         ('taxonomy_input_warnings.tsv', 'Warnings about inconsistencies between the classifier reference FASTA and taxonomy TSV.'),
         ('tree_build_warnings.tsv', 'Warnings about weak phylogenetic signal, missing anchors, or poor alignment quality.'),
@@ -284,6 +289,46 @@ def _same_path(path_a: str | None, path_b: str | None) -> bool:
             return Path(path_a).resolve() == Path(path_b).resolve()
         except Exception:
             return str(path_a) == str(path_b)
+
+
+def _build_alt_databases(args) -> list:
+    """Return a list of (ref_fasta, taxa_tsv_or_None, db_name) for alt references."""
+    alt_refs = getattr(args, 'alt_ref', None) or []
+    alt_taxa = getattr(args, 'alt_taxa', None) or []
+    alt_names = getattr(args, 'alt_ref_name', None) or []
+    result = []
+    for i, ref in enumerate(alt_refs):
+        taxa = alt_taxa[i] if i < len(alt_taxa) else None
+        raw_name = alt_names[i] if i < len(alt_names) else None
+        name = raw_name if raw_name else _classify_derive_db_name(ref)
+        result.append((ref, taxa, name))
+    return result
+
+
+def _store_alt_taxonomy_in_db(db: Database, all_results: dict, main_db_name: str):
+    """Persist alt-db classification results to taxonomy_alt table.
+
+    Iterates over *all_results* ``{db_name: {qid: (hit, pct, tax, conf)}}``,
+    skipping the primary database (its results go into the standard taxonomy table).
+    """
+    log = logging.getLogger(__name__)
+    for db_name, results in all_results.items():
+        if db_name == main_db_name:
+            continue
+        alt_entries = []
+        for qid, row in results.items():
+            if not isinstance(row, (tuple, list)) or len(row) < 4:
+                continue
+            hit, pct, tax, conf = row[:4]
+            if tax == 'NA' and hit == 'NA':
+                continue  # skip unclassified rows to keep table lean
+            alt_entries.append((qid, db_name, tax, conf, hit, pct))
+        if alt_entries:
+            try:
+                db.insert_taxonomy_alt(alt_entries)
+                log.info("[DB] Stored %d alt-db taxonomy entries for ref_db=%s", len(alt_entries), db_name)
+            except Exception as e:
+                log.warning("[DB] Failed to store alt-db taxonomy for %s: %s", db_name, e)
 
 
 def _resolve_reference_inputs(
@@ -412,7 +457,29 @@ def cmd_preload(args):
         else:
             input_for_classify = str(mapped_fasta) if mapped_fasta else args.fasta
             logging.getLogger(__name__).info("[PRELOAD] Classifying preloaded fasta %s against %s", input_for_classify, effective_ref)
-            class_out = classify.run_classification(input_for_classify, outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
+
+            alt_databases = _build_alt_databases(args)
+            ref_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
+            main_db = getattr(args, 'main_ref', None) or ref_name
+            all_results: dict = {}
+
+            if alt_databases:
+                logging.getLogger(__name__).info(
+                    "[PRELOAD] Multi-database classification: primary=%s, alt=%s, main=%s",
+                    ref_name, [n for _, _, n in alt_databases], main_db,
+                )
+                class_out, all_results = classify.run_all_classifications(
+                    input_for_classify, outdir,
+                    primary_ref=effective_ref,
+                    primary_taxa=effective_taxa_tsv,
+                    primary_name=ref_name,
+                    alt_refs=alt_databases,
+                    threads=threads,
+                    main_db=main_db,
+                )
+                _store_alt_taxonomy_in_db(db, all_results, main_db)
+            else:
+                class_out = classify.run_classification(input_for_classify, outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
 
             # parse classification output and persist taxonomy/distances only for
             # the preloaded sequence ids (short ids present in the DB)
@@ -495,6 +562,7 @@ def cmd_preload(args):
                 db=None,
                 threads=threads,
                 anchor_file=getattr(args, 'anchors', None),
+                tree_method=getattr(args, 'tree_method', 'fasttree'),
             )
             logging.getLogger(__name__).info("[PRELOAD] Baseline tree/alignment written to %s", outdir)
             try:
@@ -744,6 +812,8 @@ def cmd_run(args):
 
     # classify (or use external taxa assignments if provided)
     class_out = None
+    all_class_results: dict = {}
+    run_main_db_name: str = 'main'
     if assignment_tsv:
         taxa_file = assignment_tsv
         logging.getLogger(__name__).info("[RUN] Using taxa assignments from %s (skipping classifier)", taxa_file)
@@ -792,7 +862,27 @@ def cmd_run(args):
         if 'early_class_out' in locals() and early_class_out:
             class_out = early_class_out
         else:
-            class_out = classify.run_classification(str(mapped_derep), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
+            alt_databases = _build_alt_databases(args)
+            ref_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
+            run_main_db_name = getattr(args, 'main_ref', None) or ref_name
+
+            if alt_databases:
+                logging.getLogger(__name__).info(
+                    "[RUN] Multi-database classification: primary=%s, alt=%s, main=%s",
+                    ref_name, [n for _, _, n in alt_databases], run_main_db_name,
+                )
+                class_out, all_class_results = classify.run_all_classifications(
+                    str(mapped_derep), outdir,
+                    primary_ref=effective_ref,
+                    primary_taxa=effective_taxa_tsv,
+                    primary_name=ref_name,
+                    alt_refs=alt_databases,
+                    threads=threads,
+                    main_db=run_main_db_name,
+                )
+                _store_alt_taxonomy_in_db(db, all_class_results, run_main_db_name)
+            else:
+                class_out = classify.run_classification(str(mapped_derep), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
 
     # novelty
     target_fasta = getattr(args, 'target', None)
@@ -979,6 +1069,7 @@ def cmd_run(args):
             preload_dir=None if _force_rebuild else getattr(args, 'preload_dir', None),
             force_rebuild=_force_rebuild,
             anchor_file=getattr(args, 'anchors', None),
+            tree_method=getattr(args, 'tree_method', 'fasttree'),
         )
         try:
             warning_rows = tree.collect_tree_build_warnings(user_fasta=str(tree_fasta), anchor_file=getattr(args, 'anchors', None), db=db, db_dataset=None)
@@ -1155,6 +1246,20 @@ def cmd_run(args):
                         _tree_ids.add(_h)
                 except Exception:
                     _tree_ids = None
+
+                # Collect alt-db taxonomy from DB for the run sequences
+                alt_ref_dbs: list = []
+                alt_taxonomies: dict = {}
+                try:
+                    alt_ref_dbs = db.get_alt_ref_dbs()
+                    if alt_ref_dbs:
+                        alt_taxonomies = db.get_taxonomy_alt_for_ids(run_ids_for_assessment)
+                        logging.getLogger(__name__).info(
+                            "[RUN] Found alt-db taxonomy for ref_dbs: %s", alt_ref_dbs
+                        )
+                except Exception as e:
+                    logging.getLogger(__name__).warning("[RUN] Could not load alt-db taxonomy: %s", e)
+
                 assessment_rows = build_sequence_assessment_rows(
                     run_ids_for_assessment,
                     class_out,
@@ -1165,6 +1270,8 @@ def cmd_run(args):
                     member_to_rep=run_member_to_rep if run_member_to_rep else None,
                     rep_to_members=run_rep_to_members if run_rep_to_members else None,
                     tree_ids=_tree_ids,
+                    alt_taxonomies=alt_taxonomies,
+                    alt_ref_dbs=alt_ref_dbs,
                 )
                 assess_path = write_sequence_assessment_tsv(Path(outdir) / 'sequence_assessment.tsv', assessment_rows)
                 logging.getLogger(__name__).info("[RUN] Wrote sequence assessment to %s", assess_path)
@@ -1699,8 +1806,8 @@ def build_parser():
     preload.add_argument('--dataset', required=True,
         help='Label for this dataset stored in the DB (e.g. Hungate). Used to colour iTOL strips.')
     preload.add_argument('--shorten-ids', dest='shorten_ids',
-        action=argparse.BooleanOptionalAction, default=True,
-        help='Replace input headers with compact IDs (e.g. HUN001). Use --no-shorten-ids to keep source names.')
+        action=argparse.BooleanOptionalAction, default=False,
+        help='Replace input headers with compact IDs (e.g. HUN001). Use --no-shorten-ids to replace source names.')
     preload.add_argument('--classify', action='store_true',
         help='Classify sequences against --ref and store taxonomy in the DB. Requires --ref.')
     preload.add_argument('--build-tree', action='store_true',
@@ -1709,6 +1816,16 @@ def build_parser():
         help='Reference FASTA (GTDB/SILVA reps) for classification and tree orientation. Preferred over --taxa-assignments for externally classified inputs.')
     preload.add_argument('--taxa', required=False,
         help='Tab-separated taxonomy file matching the IDs in --ref (id<TAB>lineage). Optional when --ref FASTA headers already contain GTDB lineages.')
+    preload.add_argument('--ref-name', dest='ref_name', required=False, default=None,
+        help='Display name for the primary reference database (default: derived from --ref filename). Used to label taxonomy columns.')
+    preload.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
+        help='Additional reference FASTA to classify against (repeatable). Produces extra taxonomy columns in output files.')
+    preload.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TSV',
+        help='Taxa TSV for the corresponding --alt-ref (positionally paired; repeatable).')
+    preload.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
+        help='Display name for the corresponding --alt-ref (positionally paired; repeatable). Default: derived from filename.')
+    preload.add_argument('--main-ref', dest='main_ref', required=False, default=None,
+        help='Name of the reference database to use as the primary taxonomy source (default: primary --ref). Must match one of the --ref-name / --alt-ref-name values.')
     preload.add_argument('--taxa-assignments', '--taxa-aasignments',
         dest='taxa_assignments', required=False,
         help='Pre-computed taxonomy assignments for the INPUT sequences (TSV: query_id<TAB>lineage, or a FASTA with embedded lineages). Use this instead of --classify when you already have taxonomy.')
@@ -1722,6 +1839,17 @@ def build_parser():
         help='Custom reference anchor FASTA for tree topology scaffolding. Defaults to the 26-sequence bundled anchor set (src/relict/data/reference_anchors.fasta).')
     preload.add_argument('--threads', type=int, required=False, default=4,
         help='Number of CPU threads for MAFFT and VSEARCH (default: 4).')
+    preload.add_argument('--tree-method', dest='tree_method',
+        choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree',
+        help=(
+            'Phylogenetic tree-building backend (default: fasttree). '
+            'fasttree: approximate ML, GTR+CAT — fast. '
+            'iqtree: full ML, GTR+G+I — more accurate and stable topology (slower; '
+            'recommended for publication-quality trees or when FastTree produces unstable clades). '
+            'iqtree-fast: IQ-TREE 2 with -fast flag — good compromise for exploratory runs. '
+            'Requires iqtree2 in PATH when using iqtree/iqtree-fast.'
+        ),
+    )
     preload.add_argument('--colors', required=False,
         help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, color).')
     preload.add_argument(
@@ -1777,14 +1905,24 @@ def build_parser():
         help='Reference FASTA (GTDB/SILVA reps) used for classification and tree orientation. Same file used in preload.')
     run.add_argument('--taxa', required=False,
         help='Tab-separated taxonomy file matching the IDs in --ref (id<TAB>lineage).')
+    run.add_argument('--ref-name', dest='ref_name', required=False, default=None,
+        help='Display name for the primary reference database (default: derived from --ref filename).')
+    run.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
+        help='Additional reference FASTA to classify against (repeatable). Adds extra taxonomy columns to sequence_assessment.tsv and taxonomy_all_dbs.tsv.')
+    run.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TSV',
+        help='Taxa TSV for the corresponding --alt-ref (positionally paired; repeatable).')
+    run.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
+        help='Display name for the corresponding --alt-ref (positionally paired; repeatable).')
+    run.add_argument('--main-ref', dest='main_ref', required=False, default=None,
+        help='Name of the reference database to treat as primary (drives the main Taxonomy column). Default: primary --ref.')
     run.add_argument('--taxa-assignments', '--taxa-aasignments',
         dest='taxa_assignments', required=False,
         help='Pre-computed taxonomy for the INPUT sequences (TSV: query_id<TAB>lineage, or embedded-lineage FASTA).')
     run.add_argument('--preload-dir', dest='preload_dir', required=False,
         help='Path to the preload output directory. Used to seed the tree backbone alignment so only new sequences need aligning.')
     run.add_argument('--shorten-ids', dest='shorten_ids',
-        action=argparse.BooleanOptionalAction, default=True,
-        help='Replace input headers with compact IDs. Use --no-shorten-ids to keep source names.')
+        action=argparse.BooleanOptionalAction, default=False,
+        help='Replace input headers with compact IDs. Use --no-shorten-ids to replace source names.')
     run.add_argument('--min-len', dest='min_len', type=int, default=1200,
         help='Minimum sequence length to retain (bp, default: 1200). Shorter sequences are filtered out.')
     run.add_argument('--max-n', dest='max_n', type=int, default=5,
@@ -1811,6 +1949,15 @@ def build_parser():
         help='Custom reference anchor FASTA for tree scaffolding. Defaults to bundled anchors.')
     run.add_argument('--threads', dest='threads', type=int, default=4,
         help='CPU threads for MAFFT and VSEARCH (default: 4).')
+    run.add_argument('--tree-method', dest='tree_method',
+        choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree',
+        help=(
+            'Phylogenetic tree-building backend (default: fasttree). '
+            'fasttree: approximate ML, GTR+CAT. '
+            'iqtree: full ML, GTR+G+I (recommended for production/publication runs). '
+            'iqtree-fast: IQ-TREE 2 with -fast flag (good for exploratory incremental runs).'
+        ),
+    )
     run.add_argument('--user-colors', dest='user_colors', required=False,
         help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, color).')
     run.add_argument(

@@ -78,6 +78,25 @@ class Database:
             except Exception:
                 pass
 
+            # taxonomy_alt: create table and unique index if missing
+            cur.execute("PRAGMA table_info(taxonomy_alt)")
+            if not cur.fetchall():
+                try:
+                    cur.execute(
+                        "CREATE TABLE IF NOT EXISTS taxonomy_alt "
+                        "(id TEXT, ref_db TEXT, taxonomy TEXT, confidence REAL, best_hit TEXT, identity REAL)"
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
+            try:
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_taxonomy_alt_id_refdb ON taxonomy_alt (id, ref_db)"
+                )
+                conn.commit()
+            except Exception:
+                pass
+
 
     def get_input_ids(self, fasta):
         from relict.utils.fasta import read_fasta
@@ -103,8 +122,25 @@ class Database:
         if records:
             # assign deterministic short IDs (3 letters + 2 digits) per original header
 
+            # When not shortening IDs, only check for collisions *within* the current
+            # input batch — collisions against already-stored DB IDs are fine because
+            # INSERT OR IGNORE will silently skip them.
+            batch_ids: set = set()  # tracks IDs assigned during this preload only
             for orig_h, seq in records:
-                effective_id = self.choose_effective_sequence_id(orig_h, used_ids, shorten_ids=shorten_ids)
+                if shorten_ids:
+                    effective_id = self.choose_effective_sequence_id(orig_h, used_ids, shorten_ids=True)
+                else:
+                    cid = self._canonical_from_header(orig_h)
+                    if not cid:
+                        raise ValueError(f"Could not derive a canonical ID from header: {orig_h!r}")
+                    if cid in batch_ids:
+                        raise ValueError(
+                            f"Duplicate ID in input while --no-shorten-ids is active: {cid!r}. "
+                            "Ensure all input FASTA headers are unique."
+                        )
+                    batch_ids.add(cid)
+                    used_ids.add(cid)
+                    effective_id = cid
                 records_to_insert.append((effective_id, seq))
                 orig_to_short[orig_h] = effective_id
 
@@ -389,6 +425,59 @@ class Database:
     def _canonical_from_header(self, header: str) -> str:
         return canonicalize_sequence_id(header)
 
+
+    def insert_taxonomy_alt(self, alt_entries):
+        """Insert alternative-database taxonomy entries.
+
+        alt_entries: iterable of (id, ref_db, taxonomy, confidence, best_hit, identity)
+        Only inserts rows for sequence IDs that exist in the sequences table.
+        """
+        with self.connect() as conn:
+            cur = conn.cursor()
+            to_insert = []
+            for entry in alt_entries:
+                sid, ref_db, tax, conf, best_hit, identity = entry
+                cid = self._canonical_from_header(sid) if sid else None
+                key = cid or sid
+                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
+                if cur.fetchone():
+                    to_insert.append((key, ref_db, tax, conf, best_hit, identity))
+            if to_insert:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO taxonomy_alt "
+                    "(id, ref_db, taxonomy, confidence, best_hit, identity) VALUES (?, ?, ?, ?, ?, ?)",
+                    to_insert,
+                )
+            conn.commit()
+
+    def get_taxonomy_alt_for_ids(self, ids=None):
+        """Return alt-db taxonomy rows for given IDs (or all if ids is None).
+
+        Returns {id: {ref_db: (taxonomy, confidence, best_hit, identity)}}.
+        """
+        with self.connect() as conn:
+            cur = conn.cursor()
+            if ids:
+                placeholders = ','.join('?' for _ in ids)
+                cur.execute(
+                    f"SELECT id, ref_db, taxonomy, confidence, best_hit, identity "
+                    f"FROM taxonomy_alt WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
+            else:
+                cur.execute("SELECT id, ref_db, taxonomy, confidence, best_hit, identity FROM taxonomy_alt")
+            rows = cur.fetchall()
+        result: dict = {}
+        for rid, ref_db, tax, conf, best_hit, identity in rows:
+            result.setdefault(rid, {})[ref_db] = (tax, conf, best_hit, identity)
+        return result
+
+    def get_alt_ref_dbs(self):
+        """Return a sorted list of distinct ref_db values stored in taxonomy_alt."""
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT DISTINCT ref_db FROM taxonomy_alt ORDER BY ref_db")
+            return [r[0] for r in cur.fetchall()]
 
     def insert_sequences(self, records, dataset='user'):
         """Insert sequence records into the DB.

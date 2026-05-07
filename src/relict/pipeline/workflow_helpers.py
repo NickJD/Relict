@@ -325,6 +325,7 @@ def write_placement_warning_tsv(path: str | Path, warning_rows):
                 f"{row['classification_confidence']}\t{row['nearest_identity']}\t{row['nearest_hit']}\t{row['flags']}\n"
             )
     return str(p)
+    return str(p)
 
 
 def build_sequence_assessment_rows(
@@ -337,6 +338,8 @@ def build_sequence_assessment_rows(
     member_to_rep: Optional[Dict[str, str]] = None,
     rep_to_members: Optional[Dict[str, List[str]]] = None,
     tree_ids: Optional[set] = None,
+    alt_taxonomies: Optional[Dict[str, Dict[str, tuple]]] = None,
+    alt_ref_dbs: Optional[List[str]] = None,
 ):
     """Build per-sequence assessment rows.
 
@@ -344,6 +347,10 @@ def build_sequence_assessment_rows(
     included when ``--collapse`` was used.  Tree membership (``tree_ids``)
     records whether a sequence entered the phylogenetic tree or was filtered
     out because a cluster representative was used in its place.
+
+    ``alt_taxonomies`` is an optional dict ``{seq_id: {ref_db: (tax, conf, hit, identity)}}``
+    produced when multiple reference databases are used for classification.
+    ``alt_ref_dbs`` is the ordered list of alternative ref-db names to include.
 
     Cluster columns added to each row
     -----------------------------------
@@ -447,10 +454,12 @@ def build_sequence_assessment_rows(
 
         assessment_rows.append({
             'id': iid,
+            # ClassificationHit = best vsearch hit in the REFERENCE DB (GTDB/SILVA) → drives Taxonomy
             'taxonomy': _tax if _tax is not None else 'NA',
-            'best_hit': _best if _best is not None else 'NA',
+            'classification_hit': _best if _best is not None else 'NA',
             'classification_identity': _ident if _ident is not None else 'NA',
             'classification_confidence': _conf if _conf is not None else 'NA',
+            # NearestHit = best vsearch hit among PRELOAD sequences already in the DB → drives NoveltyScore
             'nearest_hit': n.get('nearest_hit', 'NA'),
             'nearest_identity': n.get('nearest_identity', 'NA'),
             'matches_ge_99': n.get('matches_ge_99', 'NA'),
@@ -464,29 +473,134 @@ def build_sequence_assessment_rows(
             'cluster_representative': cluster_rep,
             'cluster_size': cluster_size,
             'clustered_members': clustered_members,
+            # Alt-db taxonomy (keys: 'alt_tax_<refdb>', 'alt_class_hit_<refdb>', etc.)
+            **_build_alt_tax_cols(iid, alt_taxonomies or {}, alt_ref_dbs or []),
         })
     return assessment_rows
 
 
+def _build_alt_tax_cols(
+    seq_id: str,
+    alt_taxonomies: Dict[str, Dict[str, tuple]],
+    alt_ref_dbs: List[str],
+) -> dict:
+    """Return a flat dict of alt-db taxonomy columns for one sequence.
+
+    Keys use the prefix ``alt_`` so ``write_sequence_assessment_tsv`` can
+    auto-discover them:
+      alt_tax_<safe>       — taxonomy string from that reference DB
+      alt_class_hit_<safe> — best vsearch hit (accession) in that reference DB
+      alt_ident_<safe>     — vsearch identity to that hit
+      alt_conf_<safe>      — classification confidence score
+    """
+    import re as _re
+    cols: dict = {}
+    per_seq = alt_taxonomies.get(seq_id, {})
+    for ref_db in alt_ref_dbs:
+        safe = _re.sub(r'[^A-Za-z0-9]+', '_', ref_db).strip('_')
+        entry = per_seq.get(ref_db, (None, None, None, None))
+        tax, conf, hit, ident = entry if len(entry) == 4 else (None, None, None, None)
+        cols[f'alt_tax_{safe}'] = tax if tax is not None else 'NA'
+        cols[f'alt_class_hit_{safe}'] = hit if hit is not None else 'NA'
+        cols[f'alt_ident_{safe}'] = f"{float(ident):.2f}" if ident is not None else 'NA'
+        cols[f'alt_conf_{safe}'] = f"{float(conf):.4f}" if conf is not None else 'NA'
+    return cols
+
+
 def write_sequence_assessment_tsv(path: str | Path, rows):
+    """Write sequence_assessment.tsv.
+
+    Column groups
+    -------------
+    Taxonomy / ClassificationHit / ClassificationIdentity / ClassificationConfidence
+        — from the primary REFERENCE DATABASE (GTDB, SILVA, etc.).
+          ClassificationHit is the specific reference accession vsearch matched.
+
+    NearestHit / NearestIdentity / MatchesGE* / NoveltyScore / Crowding / SequencingPriority
+        — from the PRELOAD sequences already stored in the DB.
+          NearestHit is the closest sequence YOU have previously submitted.
+          These columns drive the novelty assessment.
+
+    Taxonomy_<DB> / ClassificationHit_<DB> / Identity_<DB> / Confidence_<DB>  (repeated per alt-ref DB)
+        — same information from each additional reference database supplied via
+          --alt-ref / --alt-taxa.  The <DB> suffix is the database name derived
+          from the filename or --alt-ref-name.
+    """
+    import re as _re
     p = Path(path)
-    with open(p, 'w') as fh:
-        fh.write(
-            'ID\tTaxonomy\tBestHit\tClassificationIdentity\tClassificationConfidence\t'
-            'NearestHit\tNearestIdentity\tMatchesGE99\tMatchesGE97\tMatchesGE95\t'
-            'NoveltyScore\tCrowding\tSequencingPriority\tInTree\tClusterRepresentative\t'
-            'ClusterSize\tClusteredMembers\tPlacementFlags\n'
+
+    # Discover alt-db column groups from the first row that contains them
+    alt_ref_safes: List[str] = []
+    for row in rows:
+        alt_ref_safes = sorted(
+            k[len('alt_tax_'):]
+            for k in row
+            if k.startswith('alt_tax_')
         )
-        for row in rows:
-            fh.write(
-                f"{row['id']}\t{row['taxonomy']}\t{row['best_hit']}\t"
-                f"{row['classification_identity']}\t{row['classification_confidence']}\t"
-                f"{row['nearest_hit']}\t{row['nearest_identity']}\t"
-                f"{row['matches_ge_99']}\t{row['matches_ge_97']}\t{row['matches_ge_95']}\t"
-                f"{row['novelty_score']}\t{row['crowding']}\t{row['sequencing_priority']}\t"
-                f"{row.get('in_tree', 'Unknown')}\t{row.get('cluster_representative', 'N/A')}\t"
-                f"{row.get('cluster_size', '1')}\t{row.get('clustered_members', '')}\t"
-                f"{row['placement_flags']}\n"
+        break
+
+    with open(p, 'w') as fh:
+        # ── Fixed columns ────────────────────────────────────────────────────
+        base_header = (
+            'ID'
+            '\tTaxonomy'                    # primary ref DB  ─┐ classification
+            '\tClassificationHit'           # ref accession    │ (reference DB)
+            '\tClassificationIdentity'      # vsearch %id      │
+            '\tClassificationConfidence'    # score 0–1       ─┘
+            '\tNearestHit'                  # preload seq ─┐ novelty
+            '\tNearestIdentity'             # %id           │ (preload DB)
+            '\tMatchesGE99'                 # density        │
+            '\tMatchesGE97'                 #               │
+            '\tMatchesGE95'                 #              ─┘
+            '\tNoveltyScore'
+            '\tCrowding'
+            '\tSequencingPriority'
+            '\tInTree'
+            '\tClusterRepresentative'
+            '\tClusterSize'
+            '\tClusteredMembers'
+            '\tPlacementFlags'
+        )
+        # ── Alt-db columns (one group per additional reference database) ─────
+        alt_header = ''
+        for safe in alt_ref_safes:
+            alt_header += (
+                f'\tTaxonomy_{safe}'
+                f'\tClassificationHit_{safe}'
+                f'\tIdentity_{safe}'
+                f'\tConfidence_{safe}'
             )
+        fh.write(base_header + alt_header + '\n')
+
+        for row in rows:
+            base = (
+                f"{row['id']}"
+                f"\t{row['taxonomy']}"
+                f"\t{row.get('classification_hit', row.get('best_hit', 'NA'))}"
+                f"\t{row['classification_identity']}"
+                f"\t{row['classification_confidence']}"
+                f"\t{row['nearest_hit']}"
+                f"\t{row['nearest_identity']}"
+                f"\t{row['matches_ge_99']}"
+                f"\t{row['matches_ge_97']}"
+                f"\t{row['matches_ge_95']}"
+                f"\t{row['novelty_score']}"
+                f"\t{row['crowding']}"
+                f"\t{row['sequencing_priority']}"
+                f"\t{row.get('in_tree', 'Unknown')}"
+                f"\t{row.get('cluster_representative', 'N/A')}"
+                f"\t{row.get('cluster_size', '1')}"
+                f"\t{row.get('clustered_members', '')}"
+                f"\t{row['placement_flags']}"
+            )
+            alt_part = ''
+            for safe in alt_ref_safes:
+                alt_part += (
+                    f"\t{row.get(f'alt_tax_{safe}', 'NA')}"
+                    f"\t{row.get(f'alt_class_hit_{safe}', 'NA')}"
+                    f"\t{row.get(f'alt_ident_{safe}', 'NA')}"
+                    f"\t{row.get(f'alt_conf_{safe}', 'NA')}"
+                )
+            fh.write(base + alt_part + '\n')
     return str(p)
 

@@ -13,6 +13,15 @@ CREATE TABLE IF NOT EXISTS taxonomy (
     dataset TEXT
 );
 
+CREATE TABLE IF NOT EXISTS taxonomy_alt (
+    id TEXT,
+    ref_db TEXT,
+    taxonomy TEXT,
+    confidence REAL,
+    best_hit TEXT,
+    identity REAL
+);
+
 CREATE TABLE IF NOT EXISTS distances (
     id TEXT,
     dataset TEXT,

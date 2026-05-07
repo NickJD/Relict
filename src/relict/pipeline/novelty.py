@@ -91,7 +91,9 @@ def run_novelty(
         try:
             with db.connect() as conn:
                 cur = conn.cursor()
-                # Get sequences from preload or other datasets (not from current run)
+                # Get sequences from ALL datasets except the current run.
+                # This intentionally includes every preload dataset so that
+                # novelty is measured against the full user-submitted baseline.
                 if run_dataset:
                     cur.execute(
                         "SELECT id, sequence FROM sequences WHERE dataset IS NOT ? OR dataset IS NULL",
@@ -100,6 +102,27 @@ def run_novelty(
                 else:
                     cur.execute("SELECT id, sequence FROM sequences")
                 rows = cur.fetchall()
+
+            # Log the distinct datasets contributing to the comparison pool
+            try:
+                with db.connect() as conn:
+                    cur = conn.cursor()
+                    if run_dataset:
+                        cur.execute(
+                            "SELECT DISTINCT dataset FROM sequences "
+                            "WHERE dataset IS NOT ? OR dataset IS NULL",
+                            (run_dataset,),
+                        )
+                    else:
+                        cur.execute("SELECT DISTINCT dataset FROM sequences")
+                    pool_datasets = [r[0] for r in cur.fetchall()]
+                logger.info(
+                    "[NOVELTY] Comparison pool contains %d distinct dataset(s): %s",
+                    len(pool_datasets),
+                    pool_datasets,
+                )
+            except Exception:
+                pass
 
             records = [(r[0], r[1]) for r in rows if r[1]]
             if records:
@@ -352,7 +375,11 @@ def build_novelty_itol(
 
 
 def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_dataset: str, threads: Optional[int] = None):
-    """Compute nearest-neighbour identities of run sequences against non-run DB sequences."""
+    """Compute nearest-neighbour identities of run sequences against all non-run DB sequences.
+
+    The comparison pool includes ALL datasets stored in the DB except *run_dataset*,
+    which means every preload dataset (no matter how many) is automatically included.
+    """
     db_preset_fasta = Path(outdir) / 'db_preload_seqs.fasta'
     try:
         with db.connect() as conn:
@@ -362,6 +389,18 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
         records = [(r[0], r[1]) for r in rows]
         if records:
             write_fasta(records, str(db_preset_fasta))
+            # Log which datasets are in the pool
+            try:
+                with db.connect() as conn2:
+                    cur2 = conn2.cursor()
+                    cur2.execute(
+                        "SELECT DISTINCT dataset FROM sequences WHERE dataset IS NOT ? OR dataset IS NULL",
+                        (run_dataset,),
+                    )
+                    pool_ds = [r[0] for r in cur2.fetchall()]
+                logger.info("[NOVELTY] Nearest-identity pool: %d seqs from datasets: %s", len(records), pool_ds)
+            except Exception:
+                pass
         else:
             return {}
     except Exception:
@@ -580,7 +619,8 @@ def build_reference_novelty_metrics(
         logger.info('[NOVELTY] Using target FASTA for density: %s', target_fasta)
 
     elif db is not None:
-        # Build density pool from previously submitted sequences
+        # Build density pool from ALL previously submitted sequences
+        # (all preload datasets + all prior run datasets, excluding current run)
         db_density_fasta = Path(outdir) / 'density_query_db.fasta'
         try:
             with db.connect() as conn:
@@ -595,13 +635,32 @@ def build_reference_novelty_metrics(
                 rows = cur.fetchall()
             records = [(r[0], r[1]) for r in rows if r[1]]
             if records:
+                # Log which datasets contribute to the density pool
+                try:
+                    with db.connect() as conn2:
+                        cur2 = conn2.cursor()
+                        if run_dataset:
+                            cur2.execute(
+                                "SELECT DISTINCT dataset FROM sequences "
+                                "WHERE dataset IS NOT ? OR dataset IS NULL",
+                                (run_dataset,),
+                            )
+                        else:
+                            cur2.execute("SELECT DISTINCT dataset FROM sequences")
+                        pool_datasets = [r[0] for r in cur2.fetchall()]
+                    logger.info(
+                        '[NOVELTY] Density pool: %d sequences from %d dataset(s): %s',
+                        len(records), len(pool_datasets), pool_datasets,
+                    )
+                except Exception:
+                    pass
                 write_fasta(records, str(db_density_fasta))
                 density_db_path = str(db_density_fasta)
                 density_source = 'submitted_sequences'
                 logger.info(
                     '[NOVELTY] Built density comparison pool from %d previously submitted sequences '
-                    '(preload + prior runs). Novelty is expressed relative to your submitted datasets, '
-                    'not the external reference.',
+                    '(all preload datasets + prior runs). Novelty is expressed relative to your '
+                    'submitted datasets, not the external reference.',
                     len(records),
                 )
             else:
