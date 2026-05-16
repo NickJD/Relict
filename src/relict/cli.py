@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-# When invoked directly (python src/relict/cli.py) the package root (src)
+# When invoked directly (python src/relict/PhenGO-Predict.py) the package root (src)
 # may not be on sys.path. Ensure the parent of this `relict` package is
 # available so absolute imports like `relict.db.interface` work.
 try:
@@ -21,6 +21,7 @@ except Exception:
 
 from relict.db.interface import Database
 from relict.pipeline import classify, tree, itol, qc, derep, novelty
+from relict.pipeline import cluster_report as _cluster_report
 from relict.pipeline.classify import _derive_db_name as _classify_derive_db_name
 from relict.pipeline.collapse import collapse_fasta_within_taxa
 from relict.pipeline.workflow_helpers import (
@@ -1275,6 +1276,29 @@ def cmd_run(args):
                 )
                 assess_path = write_sequence_assessment_tsv(Path(outdir) / 'sequence_assessment.tsv', assessment_rows)
                 logging.getLogger(__name__).info("[RUN] Wrote sequence assessment to %s", assess_path)
+
+                # ── Cluster-level reports + phylogenetic isolation ───────────
+                try:
+                    _tree_nwk = str(Path(outdir) / 'current_tree.nwk')
+                    _cluster_summary, _cluster_csvs, _backup_tsv = _cluster_report.generate_cluster_reports(
+                        outdir=outdir,
+                        assessment_rows=assessment_rows,
+                        tree_path=_tree_nwk if Path(_tree_nwk).exists() else None,
+                    )
+                    # Re-write sequence_assessment.tsv now that phylo_isolation /
+                    # investigation_score have been filled in by generate_cluster_reports
+                    write_sequence_assessment_tsv(Path(outdir) / 'sequence_assessment.tsv', assessment_rows)
+                    if _cluster_summary:
+                        logging.getLogger(__name__).info(
+                            "[CLUSTER] Wrote cluster summary → %s  (%d per-cluster CSVs in %s/clusters/)",
+                            _cluster_summary, len(_cluster_csvs), outdir,
+                        )
+                    if _backup_tsv:
+                        logging.getLogger(__name__).info(
+                            "[CLUSTER] Wrote backup candidates table → %s", _backup_tsv,
+                        )
+                except Exception as _ce:
+                    logging.getLogger(__name__).warning("[CLUSTER] Cluster report generation failed: %s", _ce)
                 # Emit a user-friendly summary of HIGH priority candidates
                 try:
                     high_priority = [r for r in assessment_rows if r.get('sequencing_priority') == 'HIGH']

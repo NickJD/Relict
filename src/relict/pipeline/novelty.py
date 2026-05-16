@@ -737,11 +737,19 @@ def build_reference_novelty_metrics(
         )
         for qid, meta in summary.items():
             counts = density_counts.get(qid, {'ge_99': 0, 'ge_97': 0, 'ge_95': 0})
-            crowding = 'crowded'
-            if counts['ge_97'] <= 3:
+            # Crowding tiers incorporate both similarity thresholds:
+            #   isolated  — ≤1 hit at 99% AND ≤1 hit at 97% (unique in both bins)
+            #   sparse    — ≤3 matches at 97% (only a handful of near-identical seqs)
+            #   moderate  — ≤10 matches at 97%
+            #   crowded   — >10 matches at 97% (well-sampled neighbourhood)
+            if counts['ge_99'] <= 1 and counts['ge_97'] <= 1:
+                crowding = 'isolated'
+            elif counts['ge_97'] <= 3:
                 crowding = 'sparse'
             elif counts['ge_97'] <= 10:
                 crowding = 'moderate'
+            else:
+                crowding = 'crowded'
             score = _novelty_score_from_metrics(meta['nearest_identity'], counts['ge_99'], counts['ge_97'], counts['ge_95'])
             priority = _novelty_priority_from_metrics(meta['nearest_identity'], counts['ge_99'], counts['ge_97'])
             fh.write(

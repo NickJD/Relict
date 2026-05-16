@@ -473,6 +473,10 @@ def build_sequence_assessment_rows(
             'cluster_representative': cluster_rep,
             'cluster_size': cluster_size,
             'clustered_members': clustered_members,
+            # Phylogenetic isolation + composite investigation score
+            # (populated by cluster_report.generate_cluster_reports; default 'NA' here)
+            'phylo_isolation': 'NA',
+            'investigation_score': 'NA',
             # Alt-db taxonomy (keys: 'alt_tax_<refdb>', 'alt_class_hit_<refdb>', etc.)
             **_build_alt_tax_cols(iid, alt_taxonomies or {}, alt_ref_dbs or []),
         })
@@ -555,6 +559,8 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
             '\tNoveltyScore'
             '\tCrowding'
             '\tSequencingPriority'
+            '\tPhyloIsolation'              # normalised leaf branch length (0–1); higher = more isolated in tree
+            '\tInvestigationScore'          # composite score (0–100) combining novelty + phylo isolation + density + taxonomy conflict
             '\tInTree'
             '\tClusterRepresentative'
             '\tClusterSize'
@@ -587,6 +593,8 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
                 f"\t{row['novelty_score']}"
                 f"\t{row['crowding']}"
                 f"\t{row['sequencing_priority']}"
+                f"\t{row.get('phylo_isolation', 'NA')}"
+                f"\t{row.get('investigation_score', 'NA')}"
                 f"\t{row.get('in_tree', 'Unknown')}"
                 f"\t{row.get('cluster_representative', 'N/A')}"
                 f"\t{row.get('cluster_size', '1')}"
