@@ -1795,12 +1795,14 @@ def build_parser():
         description=(
             'Relict — reference-aware 16S novelty and phylogenetic context tool.\n\n'
             'Subcommands:\n'
+            '  preclassify Pre-classify reference FASTA collections (Hungate, SILVA …) once and reuse.\n'
             '  preload     Load a baseline dataset (e.g. Hungate) and build the backbone tree.\n'
             '  run         Process new sequences against the baseline; score novelty and update the tree.\n'
             '  subtree     Extract a focused tree and iTOL files for a specific taxon from an existing DB.\n'
             '  regen-itol  Regenerate iTOL colour files from an existing DB without re-running analysis.\n\n'
             'Typical workflow:\n'
-            '  1. relict preload  --fasta baseline.fasta --db project.db --dataset Hungate --ref gtdb.fna --classify --build-tree -o preload_out\n'
+            '  0. relict preclassify --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o preclassify_out\n'
+            '  1. relict preload  --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments preclassify_out/pipeline_taxonomy.tsv --build-tree -o preload_out\n'
             '  2. relict run      --input new_seqs.fasta --db project.db --dataset Batch1  --ref gtdb.fna --preload-dir preload_out -o run_out\n'
             '  3. relict subtree  --db project.db --taxon archaea --from-dir preload_out -o archaea_out\n'
         ),
@@ -2110,7 +2112,184 @@ def build_parser():
         help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
     )
 
+    # ── preclassify ───────────────────────────────────────────────────────────
+    preclassify = sub.add_parser(
+        'preclassify',
+        help='Pre-classify reference FASTA collections (Hungate, SILVA, RDP …) so on-the-fly classification is not needed at run time.',
+        description=(
+            'Classify one or more reference FASTA collections against a reference database\n'
+            'using vsearch and save the results so the main pipeline can reuse them without\n'
+            're-classifying on every run.\n\n'
+            'Known dataset names (use with --dataset NAME=FASTA):\n'
+            '  hungate16s / hungate   Hungate1000 curated rumen 16S sequences\n'
+            '  silva                  SILVA ribosomal RNA database\n'
+            '  rdp                    Ribosomal Database Project\n'
+            '  homd                   Human Oral Microbiome Database\n'
+            '  greengenes2 / gg2      GreenGenes2 16S reference\n'
+            '  ncbi16s                NCBI 16S rRNA RefSeq collection\n'
+            '  gtdb                   GTDB 16S representative sequences\n'
+            '  (any other name)       Treated as a custom dataset\n\n'
+            'Outputs written to --out:\n'
+            '  {name}_classification.tsv   Full classification (human-readable)\n'
+            '  {name}_taxonomy.tsv         Condensed per-dataset taxonomy\n'
+            '  combined_taxonomy.tsv       All datasets merged (with Dataset column)\n'
+            '  pipeline_taxonomy.tsv       All datasets merged; pass to --taxa-assignments\n'
+            '  preclassify_summary.txt     Plain-text summary with usage examples\n\n'
+            'Example:\n'
+            '  relict preclassify \\\n'
+            '    --dataset hungate16s=/data/hungate.fasta \\\n'
+            '    --dataset silva=/data/silva_16s.fasta \\\n'
+            '    --ref /data/gtdb_ssu_reps.fna \\\n'
+            '    --taxa /data/gtdb_taxonomy.tsv \\\n'
+            '    --threads 8 -o preclassify_out/\n\n'
+            'Then use the output in a preload:\n'
+            '  relict preload --fasta hungate.fasta \\\n'
+            '    --taxa-assignments preclassify_out/pipeline_taxonomy.tsv \\\n'
+            '    --db project.db --dataset Hungate -o preload_out/'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    preclassify.add_argument(
+        '--dataset', dest='datasets', nargs='+', metavar='NAME FASTA',
+        required=True,
+        help=(
+            'One or more NAME FASTA pairs, e.g.: '
+            '--dataset Hungate /data/hun.fasta QUB /data/qub.fasta. '
+            'Alternatively use NAME=FASTA pairs (repeatable): '
+            '--dataset Hungate=/data/hun.fasta --dataset QUB=/data/qub.fasta. '
+            'Known names: hungate16s, silva, rdp, homd, greengenes2, ncbi16s, gtdb. '
+            'Any other name is treated as a custom dataset.'
+        ),
+    )
+    preclassify.add_argument(
+        '--ref', required=True,
+        help='Reference FASTA (e.g. GTDB/SILVA reps) used by vsearch for classification.',
+    )
+    preclassify.add_argument(
+        '--taxa', required=False, default=None,
+        help='Tab-separated taxonomy file matching the IDs in --ref (id<TAB>lineage). '
+             'If omitted, taxonomy is parsed directly from reference FASTA headers.',
+    )
+    preclassify.add_argument(
+        '-o', '--out', required=True,
+        help='Output directory where all classification files will be written.',
+    )
+    preclassify.add_argument(
+        '--threads', type=int, default=4,
+        help='CPU threads for vsearch (default: 4).',
+    )
+    preclassify.add_argument(
+        '--min-identity', dest='min_identity', type=float, default=0.80,
+        help='Minimum vsearch alignment identity threshold 0–1 (default: 0.80 = 80%%).',
+    )
+    preclassify.add_argument(
+        '--max-hits', dest='max_hits', type=int, default=10,
+        help=(
+            'Number of candidate hits vsearch collects per query '
+            '(--maxaccepts / --maxhits).  The best hit by %% identity is '
+            'selected after collection.  Higher values are more thorough but '
+            'slower (default: 10).'
+        ),
+    )
+    preclassify.add_argument(
+        '--max-rejects', dest='max_rejects', type=int, default=256,
+        help=(
+            'vsearch --maxrejects: maximum number of non-matching candidate '
+            'sequences examined before giving up on a query.  Raising this '
+            'above vsearch\'s default of 32 helps classify ambiguous sequences '
+            '(e.g. those with many N\'s) (default: 256).'
+        ),
+    )
+    preclassify.add_argument(
+        '--low-confidence-threshold', dest='low_confidence_threshold',
+        type=float, default=0.97,
+        help=(
+            'Identity threshold below which a classified hit is flagged as low-confidence '
+            'and written to *_low_confidence.tsv for manual review. '
+            '0–1 (default: 0.97 = 97%%, the traditional species-level cutoff).'
+        ),
+    )
+
     return parser
+
+
+def cmd_preclassify(args):
+    """Handler for the ``preclassify`` subcommand."""
+    from relict.pipeline import preclassify as _preclassify_mod
+
+    outdir = args.out
+    os.makedirs(outdir, exist_ok=True)
+    _configure_logging(outdir)
+    log = logging.getLogger(__name__)
+
+    # Parse datasets — supports two input styles:
+    #   Style A (flat pairs):  --dataset Name1 /path1 Name2 /path2 ...
+    #   Style B (NAME=FASTA):  --dataset Name1=/path1 --dataset Name2=/path2
+    #   Style C (mixed):       --dataset Name1=/path1 Name2 /path2 ...
+    raw = args.datasets or []
+    # Flatten in case we ever switch back to action='append'
+    flat: list = []
+    for item in raw:
+        if isinstance(item, list):
+            flat.extend(item)
+        else:
+            flat.append(item)
+
+    datasets = []
+    i = 0
+    while i < len(flat):
+        token = flat[i]
+        if '=' in token:
+            # NAME=FASTA form
+            name, _, fasta = token.partition('=')
+            datasets.append((name.strip(), fasta.strip()))
+            i += 1
+        elif i + 1 < len(flat) and not flat[i + 1].startswith('-'):
+            # NAME FASTA pair (next token is not a flag)
+            datasets.append((token.strip(), flat[i + 1].strip()))
+            i += 2
+        else:
+            raise SystemExit(
+                f"[PRECLASSIFY] Cannot parse dataset spec at position {i}: '{token}'. "
+                "Expected 'NAME FASTA' pairs or 'NAME=FASTA' pairs."
+            )
+
+    if not datasets:
+        raise SystemExit("[PRECLASSIFY] At least one dataset is required. "
+                         "Use: --dataset NAME /path/to/file.fasta")
+
+    # Validate FASTA paths exist
+    for name, fasta in datasets:
+        if not os.path.exists(fasta):
+            raise SystemExit(
+                f"[PRECLASSIFY] FASTA file not found for dataset '{name}': {fasta}"
+            )
+
+    log.info("[PRECLASSIFY] Starting pre-classification for %d dataset(s)", len(datasets))
+
+    pipeline_tsv = _preclassify_mod.run_preclassify(
+        datasets=datasets,
+        ref_fasta=args.ref,
+        outdir=outdir,
+        taxa_tsv=getattr(args, 'taxa', None),
+        threads=int(getattr(args, 'threads', 4) or 4),
+        min_identity=float(getattr(args, 'min_identity', 0.80) or 0.80),
+        low_confidence_threshold=float(
+            getattr(args, 'low_confidence_threshold', 0.97) or 0.97
+        ),
+        max_hits=int(getattr(args, 'max_hits', 10) or 10),
+        max_rejects=int(getattr(args, 'max_rejects', 256) or 256),
+    )
+
+    log.info("[PRECLASSIFY] Done. Pipeline-ready taxonomy → %s", pipeline_tsv)
+    print(
+        f"[preclassify] Done.\n"
+        f"  Pipeline taxonomy : {pipeline_tsv}\n"
+        f"  Summary           : {os.path.join(outdir, 'preclassify_summary.txt')}\n\n"
+        f"Use in preload:\n"
+        f"  relict preload --fasta <fasta> --taxa-assignments {pipeline_tsv} "
+        f"--db project.db --dataset <name> -o preload_out/"
+    )
 
 
 def main(argv=None):
@@ -2124,6 +2303,8 @@ def main(argv=None):
         cmd_regen_itol(args)
     elif args.command == 'subtree':
         cmd_subtree(args)
+    elif args.command == 'preclassify':
+        cmd_preclassify(args)
     else:
         parser.print_help()
 
