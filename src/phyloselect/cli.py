@@ -1,16 +1,17 @@
-"""Relict CLI — lightweight entrypoint for the relict package.
+"""PhyloSelect CLI — lightweight entrypoint for the phyloselect package.
 
-Implements the `preload`, `run`, and `regen-itol` commands for the src/ layout.
+Implements the `preload`, `run`/`evaluate`, and `regen-itol` commands for the src/ layout.
 """
 import argparse
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
-# When invoked directly (python src/relict/PhenGO-Predict.py) the package root (src)
-# may not be on sys.path. Ensure the parent of this `relict` package is
-# available so absolute imports like `relict.db.interface` work.
+# When invoked directly (python src/phyloselect/PhenGO-Predict.py) the package root (src)
+# may not be on sys.path. Ensure the parent of this `phyloselect` package is
+# available so absolute imports like `phyloselect.db.interface` work.
 try:
     here = Path(__file__).resolve().parent
     src_root = str(here.parent)
@@ -19,12 +20,13 @@ try:
 except Exception:
     pass
 
-from relict.db.interface import Database
-from relict.pipeline import classify, tree, itol, qc, derep, novelty
-from relict.pipeline import cluster_report as _cluster_report
-from relict.pipeline.classify import _derive_db_name as _classify_derive_db_name
-from relict.pipeline.collapse import collapse_fasta_within_taxa
-from relict.pipeline.workflow_helpers import (
+from phyloselect.db.interface import Database
+from phyloselect.pipeline import classify, tree, itol, qc, derep, novelty
+from phyloselect.pipeline import cluster_report as _cluster_report
+from phyloselect.pipeline import mwl as _mwl
+from phyloselect.pipeline.classify import _derive_db_name as _classify_derive_db_name
+from phyloselect.pipeline.collapse import collapse_fasta_within_taxa
+from phyloselect.pipeline.workflow_helpers import (
     _assignment_source_is_fasta,
     build_orig_to_short_map as _build_orig_to_short_map_helper,
     build_placement_warning_rows,
@@ -38,21 +40,36 @@ from relict.pipeline.workflow_helpers import (
     prune_dataset_by_kingdom as _prune_dataset_by_kingdom_helper,
     read_combined_taxonomy_ids,
     write_combined_taxonomy_tsv,
+    write_baseline_hits_tsv,
     write_placement_warning_tsv,
+    write_selection_summary_tsv,
     write_sequence_assessment_tsv,
 )
-from relict.taxonomy import canonicalize_sequence_id, taxonomy_matches_kingdom
+from phyloselect.taxonomy import canonicalize_sequence_id, normalize_domain_query, taxonomy_matches_kingdom
+from phyloselect.partner_metadata import load_partner_sequencing_metadata
+
+
+SEQUENCE_DOMAIN_CHOICES = (
+    'bacteria', 'bacterial',
+    'archaea', 'archaeal',
+    'fungi', 'fungal',
+    'eukaryota', 'eukarya',
+    'mixed', 'all', 'none',
+)
+
+
 def _find_tree_file_in_dir(d: str):
     """Return path to a tree file in directory d if present, preferring current_tree.nwk."""
     p = Path(d)
-    cand = p / 'current_tree.nwk'
-    if cand.exists():
-        return str(cand)
-    # otherwise search for any .nwk or .tree file
-    for ext in ('*.nwk', '*.tree', '*.tre'):
-        found = next(p.glob(ext), None)
-        if found:
-            return str(found)
+    for cand in (p / 'current_tree.nwk', p / 'tree' / 'current_tree.nwk'):
+        if cand.exists():
+            return str(cand)
+    # otherwise search for any .nwk or .tree file in the root or organised tree dir
+    for base in (p, p / 'tree'):
+        for ext in ('*.nwk', '*.tree', '*.tre'):
+            found = next(base.glob(ext), None)
+            if found:
+                return str(found)
     return None
 
 
@@ -76,7 +93,7 @@ def _configure_logging(outdir: str):
     ch.setFormatter(fmt)
     logger.addHandler(ch)
     try:
-        fh = logging.FileHandler(os.path.join(outdir, 'relict.log'))
+        fh = logging.FileHandler(os.path.join(outdir, 'phyloselect.log'))
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -96,6 +113,104 @@ def _write_id_map_tsv(path: str | Path, entries, *, short_header: str = 'short_i
         for short, original in entries:
             handle.write(f'{short}\t{original}\n')
     return str(p)
+
+
+def _dataset_sequence_ids(db: Database, dataset: str) -> set[str]:
+    with db.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM sequences WHERE dataset = ?", (dataset,))
+        return {str(iid) for (iid,) in cur.fetchall()}
+
+
+def _filter_fasta_to_ids(src: str | Path, dst: str | Path, allowed_ids: set[str]) -> int:
+    from phyloselect.utils.fasta import read_fasta, write_fasta
+    records = [(h, s) for h, s in read_fasta(str(src)) if str(h) in allowed_ids]
+    write_fasta(records, str(dst))
+    return len(records)
+
+
+def _write_partner_metadata_warnings(path: str | Path, warning_rows):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, 'w') as handle:
+        handle.write('SourceID\tReason\n')
+        for source_id, reason in warning_rows:
+            handle.write(f'{source_id}\t{reason}\n')
+    return str(p)
+
+
+def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_short: dict, run_ids):
+    metadata_path = getattr(args, 'partner_metadata', None)
+    command = getattr(args, 'command', None)
+    if not metadata_path:
+        if command in ('evaluate', 'eval'):
+            raise SystemExit(
+                '[RUN] evaluate requires --partner-metadata / --sequencing-metadata: '
+                'a CSV/TSV sidecar table with sequence IDs, partner IDs, and WGS-selected status.'
+            )
+        return {}
+
+    log = logging.getLogger(__name__)
+    try:
+        metadata_rows = load_partner_sequencing_metadata(metadata_path)
+    except Exception as e:
+        raise SystemExit(f'[RUN] Failed to read partner metadata {metadata_path}: {e}')
+
+    run_id_set = {str(x) for x in run_ids}
+    resolved_rows = []
+    warnings = []
+    matched_sources = set()
+    for row in metadata_rows:
+        source_id = str(row.get('source_id') or '').strip()
+        if not source_id:
+            continue
+        mapped = orig_to_short.get(source_id)
+        if not mapped:
+            try:
+                cid = canonicalize_sequence_id(source_id)
+            except Exception:
+                cid = None
+            if cid:
+                mapped = orig_to_short.get(cid)
+        if not mapped and source_id in run_id_set:
+            mapped = source_id
+        if not mapped:
+            existing = db.resolve_sequence_id(source_id)
+            if existing in run_id_set:
+                mapped = existing
+        if not mapped:
+            warnings.append((source_id, 'metadata_id_not_found_in_current_run'))
+            continue
+
+        matched_sources.add(str(mapped))
+        resolved_rows.append({
+            'id': mapped,
+            'partner_id': row.get('partner_id') or source_id,
+            'dataset': getattr(args, 'dataset', ''),
+            'selected_for_wgs': bool(row.get('selected_for_wgs')),
+            'source_id': source_id,
+            'source_file': str(metadata_path),
+            'raw_selected_value': row.get('raw_selected_value', ''),
+        })
+
+    for run_id in sorted(run_id_set - matched_sources):
+        warnings.append((run_id, 'run_sequence_missing_from_partner_metadata'))
+
+    inserted = db.upsert_sequencing_metadata(resolved_rows)
+    log.info(
+        '[RUN] Loaded partner sequencing metadata from %s: %d matched rows, %d warning(s)',
+        metadata_path,
+        inserted,
+        len(warnings),
+    )
+    if warnings:
+        warn_path = _write_partner_metadata_warnings(
+            Path(outdir) / 'partner_metadata_warnings.tsv',
+            warnings,
+        )
+        log.warning('[RUN] Partner metadata warnings written to %s', warn_path)
+
+    return db.get_sequencing_metadata_for_ids(run_ids)
 
 
 def _load_id_map_from_tsv(path: str | Path, db: Database | None = None):
@@ -127,17 +242,210 @@ def _find_preferred_id_map(directory: str | Path):
         p / 'preload_id_map.tsv',
         p / 'user_id_map.tsv',
         p / 'user_id_map.csv',
+        p / 'ids' / 'preload_id_map.tsv',
+        p / 'ids' / 'user_id_map.tsv',
+        p / 'ids' / 'user_id_map.csv',
+        p / 'ids' / 'baseline_id_map.tsv',
     ]
     for cand in preferred:
         if cand.exists():
             return cand
     try:
-        for cand in p.glob('*_id_map.tsv'):
-            if cand.name != 'id_map.tsv':
-                return cand
+        for base in (p, p / 'ids'):
+            for cand in base.glob('*_id_map.tsv'):
+                if cand.name != 'id_map.tsv':
+                    return cand
     except Exception:
         pass
     return None
+
+
+def _combined_taxonomy_candidates(directory: str | Path):
+    p = Path(directory)
+    return [
+        p / 'preload_combined_taxonomy.tsv',
+        p / 'combined_taxonomy.tsv',
+        p / 'taxonomy' / 'tree_taxonomy.tsv',
+        p / 'baseline' / 'loaded_baseline_taxonomy.tsv',
+    ]
+
+
+def _read_qc_stats(outdir: Path) -> dict:
+    stats = {}
+    for cand in (outdir / 'assessment' / 'qc.stats', outdir / 'qc.stats'):
+        if not cand.exists():
+            continue
+        try:
+            with open(cand) as handle:
+                for line in handle:
+                    line = line.rstrip('\n')
+                    if not line or '\t' not in line:
+                        continue
+                    key, value = line.split('\t', 1)
+                    stats[key] = value
+            stats['_path'] = str(cand)
+            return stats
+        except Exception:
+            return {}
+    return {}
+
+
+def _rel_output_path(root: Path, path: str | Path) -> str:
+    try:
+        return str(Path(path).relative_to(root))
+    except Exception:
+        return str(path)
+
+
+def _write_detailed_output_guide(outdir: Path, rows):
+    """Write a detailed Markdown guide for files and core metrics."""
+    guide = outdir / 'OUTPUT_GUIDE.md'
+    qc_stats = _read_qc_stats(outdir)
+    qc_rejections = outdir / 'assessment' / 'qc_rejections.tsv'
+    if not qc_rejections.exists():
+        qc_rejections = outdir / 'qc_rejections.tsv'
+
+    def stat(name: str, default: str = 'NA') -> str:
+        return qc_stats.get(name, default)
+
+    file_rows = []
+    for name, path, expl in rows:
+        rel = _rel_output_path(outdir, path)
+        if rel in ('OUTPUT_GUIDE.md',):
+            continue
+        safe_expl = str(expl).replace('|', '/').replace('\t', ' ')
+        file_rows.append(f"| `{rel}` | {safe_expl} |")
+
+    qc_section = [
+        "## QC Filtering",
+        "",
+        "QC happens before dereplication, classification, novelty scoring, and tree building. "
+        "Sequences that fail QC are not included in downstream reports because they are too short "
+        "for reliable 16S placement or contain too many ambiguous bases.",
+        "",
+        "Filtering rules:",
+        "",
+        f"- `too_short`: sequence length is less than `min_len` (`{stat('min_len')}` bp for this run).",
+        f"- `too_many_n`: sequence has more than `max_n` ambiguous `N` bases (`{stat('max_n')}` for this run).",
+        "- A sequence can have more than one reason in `qc_rejections.tsv`.",
+        "",
+    ]
+    if qc_stats:
+        qc_section.extend([
+            "This run:",
+            "",
+            f"- Input sequences: `{stat('total_input')}`",
+            f"- Kept after QC: `{stat('kept')}`",
+            f"- Rejected total: `{stat('rejected_total', str(max(0, int(stat('total_input', '0')) - int(stat('kept', '0'))) if stat('total_input', '0').isdigit() and stat('kept', '0').isdigit() else 'NA'))}`",
+            f"- Rejected as too short: `{stat('rejected_too_short')}`",
+            f"- Rejected for too many `N` bases: `{stat('rejected_too_many_n')}`",
+            "",
+        ])
+        if qc_rejections.exists():
+            qc_section.append(f"See `{_rel_output_path(outdir, qc_rejections)}` for every rejected sequence, its length, N count, and exact reason.")
+        else:
+            qc_section.append("Older runs may only include the summary file `qc.stats`; rerun to generate per-sequence `qc_rejections.tsv`.")
+        qc_section.append("")
+    else:
+        qc_section.extend([
+            "No `qc.stats` file was found in this output directory. If this was a preload-only or partially completed run, QC may not have been executed.",
+            "",
+        ])
+
+    lines = [
+        "# PhyloSelect Output Guide",
+        "",
+        "This guide explains the output files and the main metrics produced by `phyloselect run` / `phyloselect evaluate`.",
+        "",
+        "## Recommended Reading Order",
+        "",
+        "1. `assessment/sequence_assessment.tsv` - primary per-sequence decision table.",
+        "2. `baseline/baseline_hits.tsv` - closest cultured/baseline hits such as Hungate.",
+        "3. `taxonomy/` - taxonomy assignments for each configured reference database.",
+        "4. `tree/current_tree.nwk` plus `tree/current_alignment.fasta` and `itol/*.itol` - upload to iTOL for visual inspection.",
+        "5. `assessment/novelty_metrics.tsv` - detailed novelty calculations behind the assessment table.",
+        "",
+        "## Directory Overview",
+        "",
+        "- `assessment/`: primary reports, novelty metrics, cluster reports, warnings, and raw all-known nearest-hit table.",
+        "- `baseline/`: nearest-hit reports and loaded baseline taxonomy/sequences.",
+        "- `taxonomy/`: per-database classification outputs and combined taxonomy used for tree metadata.",
+        "- `tree/`: MSA, Newick tree, and tree/alignment warning files.",
+        "- `itol/`: one iTOL metadata dataset per metadata type, usually colorstrip files.",
+        "- `ids/`: short ID to original FASTA header maps.",
+        "- `intermediate/`: QC/dereplication/collapse/debug FASTA files and scratch pools.",
+        "- `logs/`: pipeline log.",
+        "",
+        *qc_section,
+        "## Main Assessment Metrics",
+        "",
+        "`assessment/sequence_assessment.tsv` is the main table. Important column groups:",
+        "",
+        "- `Taxonomy`, `ClassificationHit`, `ClassificationIdentity`, `ClassificationConfidence`: primary reference-database assignment, usually GTDB when `--main-ref GTDB` is used.",
+        "- `Taxonomy_<DB>`, `ClassificationHit_<DB>`, `Identity_<DB>`, `Confidence_<DB>`: assignment from additional databases such as GG2, SILVA, or NCBI.",
+        "- `NearestHit`, `NearestHitDataset`, `NearestHitTaxonomy`, `NearestIdentity`: closest sequence in the baseline/cultured pool, for example Hungate.",
+        "- `AllKnownNearestHit`, `AllKnownNearestIdentity`, `AllKnownNoveltyScore`: same idea, but against all non-current datasets in the project DB.",
+        "- `ReferenceNearestHit`, `ReferenceNearestIdentity`, `ReferenceNoveltyScore`: nearest hit and novelty score against the selected external reference FASTA, usually GTDB.",
+        "- `PartnerID`, `SelectedForGenomeSequencing`, `CladeAlreadySelectedForGenomeSequencing`, `GenomeSequencingAdjustedPriority`: rolling partner/WGS-selection context from `--partner-metadata`.",
+        "- `InTree`, `ClusterRepresentative`, `ClusterSize`, `ClusteredMembers`: whether the sequence itself entered the tree or was represented by another clustered sequence.",
+        "- `PlacementFlags`: warnings such as low classification identity, low nearest identity, or novelty/classification disagreement.",
+        "",
+        "## Novelty Metrics",
+        "",
+        "`assessment/novelty_metrics.tsv` contains cultured-baseline novelty, all-known novelty, and external reference novelty.",
+        "",
+        "- Leading `Nearest*`, `NoveltyScore`, `Crowding`, and `SequencingPriority` columns mirror the baseline/cultured comparison when a baseline pool exists; otherwise they mirror all-known novelty.",
+        "- `Baseline*` columns compare only against explicit baseline datasets such as Hungate or datasets supplied with `--novelty-baseline-dataset`.",
+        "- `AllKnown*` columns compare against every DB dataset except the current run. This includes Hungate plus non-Hungate/prior partner datasets.",
+        "- `Reference*` columns compare against the chosen external reference FASTA supplied with `--ref`, usually GTDB. These are separate from the baseline/project novelty scores.",
+        "- `SelectedGenome*` and `GenomeSequencing*` columns use the rolling sequencing metadata table in the SQLite DB. A selected neighbour at >=97 percent identity marks the local 16S clade as already represented for genome sequencing.",
+        "- `NearestIdentity`: vsearch global-alignment percent identity to the nearest sequence in that pool.",
+        "- `Novel`: `True` when nearest identity is below 97 percent.",
+        "- `MatchesGE99`, `MatchesGE97`, `MatchesGE95`: number of pool sequences at or above 99, 97, and 95 percent identity. These describe how busy the local neighbourhood is.",
+        "- `Crowding`: `isolated` when there is at most one hit at both 99 and 97 percent; `sparse` when <=3 hits at 97 percent; `moderate` when <=10 hits at 97 percent; otherwise `crowded`.",
+        "- `NoveltyScore`: 0-100 score where higher means more novel and less crowded. It combines distance from the nearest hit with density bonuses for sparse neighbourhoods.",
+        "- `SequencingPriority`: `HIGH` for <97 percent identity with few close neighbours, `MEDIUM` for moderately novel/sparse cases, otherwise `LOW`.",
+        "- `DensitySource`: names the pool used, for example `baseline:Hungate`, `all_known`, `target_fasta`, or `reference_fasta` fallback.",
+        "",
+        "Interpretation: a sequence far from Hungate but close to non-Hungate isolates is likely novel relative to cultured rumen isolate collections, but not necessarily novel relative to everything already supplied to the project.",
+        "",
+        "## Taxonomy Metrics",
+        "",
+        "- `ClassificationIdentity` is the vsearch percent identity to the best reference hit used for taxonomy assignment.",
+        "- `ClassificationConfidence` is derived from the assignment parser/classifier output; higher means stronger taxonomy support.",
+        "- `taxonomy/all_databases.tsv` shows assignments across all configured databases in one place.",
+        "- `taxonomy/input_warnings.tsv` flags mismatches between reference FASTA IDs and supplied taxonomy tables.",
+        "",
+        "## MWL Metrics",
+        "",
+        "When `--mwl` is supplied, MWL columns are added to `sequence_assessment.tsv` and `assessment/mwl_matches.tsv` is written.",
+        "",
+        "- `MWLMatch`: whether the GTDB-derived taxonomy matched a Most Wanted List taxon.",
+        "- `MWLMatchedRank` and `MWLMatchedTaxon`: deepest rank/taxon that matched the MWL entry.",
+        "- `MWLTaxonomicScore`, `MWLIdentity`, `MWLScore`: taxonomic and identity contributions to MWL priority.",
+        "- `EvaluationScore`: combined candidate score after MWL contribution is considered.",
+        "",
+        "## Tree And iTOL Files",
+        "",
+        "- `tree/current_alignment.fasta`: MSA used to build the tree.",
+        "- `tree/current_tree.nwk`: tree to upload to iTOL.",
+        "- `itol/phylum.itol`, `itol/family.itol`, `itol/genus.itol`: taxonomy colorstrips.",
+        "- `itol/dataset_membership.itol`: dataset-of-origin colorstrip.",
+        "- `itol/novelty.itol`: novelty/nearest-identity colorstrip.",
+        "",
+        "PhyloSelect keeps iTOL `DATASET_COLORSTRIP` files only. Older branch `TREE_COLORS` and symbol-strip variants duplicated the same metadata and are removed to keep outputs readable.",
+        "",
+        "## File Catalogue",
+        "",
+        "| File | Explanation |",
+        "|---|---|",
+        *file_rows,
+        "",
+    ]
+    try:
+        guide.write_text('\n'.join(lines))
+    except Exception:
+        pass
 
 
 def _write_output_explanations(outdir: str):
@@ -152,25 +460,34 @@ def _write_output_explanations(outdir: str):
         return
     # mapping of filename substrings (lowercase) to explanation text
     patterns = [
+        ('tree_taxonomy.tsv', 'Combined taxonomy TSV used for tree/iTOL metadata. Columns: ID\tTaxon\tConfidence.'),
         ('combined_taxonomy.tsv', 'Combined taxonomy TSV. Columns: ID\tTaxon\tConfidence. Used to generate iTOL color/legend files.'),
+        ('loaded_baseline_taxonomy.tsv', 'Combined taxonomy TSV for baseline/provided datasets loaded before evaluate. Columns: ID\tTaxon\tConfidence.'),
         ('preload_combined_taxonomy.tsv', 'Combined taxonomy TSV for preload dataset. Columns: ID\tTaxon\tConfidence.'),
-        ('user_id_map.tsv', 'Mapping of short_id to original header produced when inserting user sequences into the DB.'),
-        ('preload_id_map.tsv', 'Mapping of preload short IDs back to original FASTA headers. Use this to trace tree labels such as QUE06 back to source records.'),
-        ('*_id_map.tsv', 'ID map mapping original headers to short (DB) ids. Useful for iTOL to display short ids.'),
+        ('all_databases.tsv', 'Per-sequence taxonomic assignments from every configured reference database.'),
+        ('baseline_hits.tsv', 'Nearest-hit report against baseline/provided datasets such as Hungate.'),
+        ('nearest_all_known_hits_raw.tsv', 'Raw nearest-hit novelty table against all non-current DB datasets; baseline-specific hits are summarised in baseline_hits.tsv and novelty_metrics.tsv.'),
+        ('qc_rejections.tsv', 'Per-sequence QC rejection table. Columns: ID, Length, NCount, Reasons, MinLength, MaxN. Reasons explain exactly why each sequence was filtered before downstream analysis.'),
+        ('partner_metadata_warnings.tsv', 'Warnings from --partner-metadata mapping. Rows indicate metadata IDs not found in the current run, or run sequences missing from the partner metadata table.'),
+        ('qc.stats', 'QC summary with total input, kept count, rejection counts, min_len, max_n, and pointer to qc_rejections.tsv when available.'),
+        ('user_id_map.tsv', 'Mapping of runtime sequence IDs to original headers produced when inserting user sequences into the DB. When shortening is disabled these usually match.'),
+        ('preload_id_map.tsv', 'Mapping of preload runtime IDs back to original FASTA headers. Use this to trace tree labels back to source records.'),
+        ('*_id_map.tsv', 'ID map mapping original headers to runtime DB ids. Useful for iTOL and metadata tracing.'),
         ('collapsed_map.tsv', 'Cluster map for collapsed sequences: rep_id\ttaxonomy\tcount.'),
         ('preload_collapsed_map.tsv', 'Cluster map for preload collapsed sequences: rep_id\ttaxonomy\tcount.'),
         ('collapsed_members.tsv', 'Member->representative mapping (member\trep) for collapsed clusters.'),
         ('preload_collapsed_members.tsv', 'Member->representative mapping for preload collapsed clusters.'),
-        ('derep_short.fasta', 'Dereplicated FASTA where sequence headers are short ids assigned by the DB.'),
-        ('derep_short_collapsed.fasta', 'Dereplicated FASTA after collapse; representatives for clusters kept with short ids.'),
+        ('derep_short.fasta', 'Dereplicated FASTA where sequence headers are the runtime IDs used by the DB. These are preserved source IDs unless --shorten-ids was requested.'),
+        ('derep_short_collapsed.fasta', 'Dereplicated FASTA after collapse; representatives for clusters kept with runtime IDs.'),
         ('preload_short_collapsed.fasta', 'Collapsed preload FASTA; representatives retained for tree building.'),
         ('novelty_matches.tsv', 'vsearch BLAST-like output used to compute nearest-neighbour novelty identities.'),
         ('novelty_metrics.tsv', (
-            'Per-sequence novelty metrics. Novelty and density are measured against YOUR previously '
-            'submitted sequences (preload database + all prior run datasets), NOT against the global '
-            'reference. Columns: ID, NearestIdentity, NearestHit, Novel, MatchesGE99, MatchesGE97, '
-            'MatchesGE95, NoveltyScore, Crowding, SequencingPriority, DensitySource. '
-            'DensitySource tells you which sequence pool was used for neighbourhood density.'
+            'Per-sequence novelty metrics. The leading Nearest*/NoveltyScore columns mirror the '
+            'baseline/cultured comparison when available; explicit Baseline* columns compare against '
+            'datasets such as Hungate, and AllKnown* columns compare against every non-current dataset '
+            'stored in the DB. Reference* columns compare against the external reference FASTA, usually '
+            'GTDB. PartnerID/SelectedForGenomeSequencing and SelectedGenome*/GenomeSequencing* columns '
+            'add rolling WGS-selection context. DensitySource columns name the comparison pool.'
         )),
         ('sequence_assessment.tsv', (
             'Unified per-sequence assessment. '
@@ -181,24 +498,39 @@ def _write_output_explanations(outdir: str):
             'Repeated as Taxonomy_<DB>, ClassificationHit_<DB>, Identity_<DB>, Confidence_<DB> '
             'for each additional --alt-ref database. '
             '(2) NOVELTY — NearestHit, NearestIdentity, MatchesGE*, NoveltyScore, Crowding, '
-            'SequencingPriority: derived from the PRELOAD sequences already in the DB. '
-            'NearestHit is the closest sequence you have previously submitted. '
-            'These columns are entirely independent of the reference database. '
+            'SequencingPriority: baseline/cultured novelty when a baseline pool exists. '
+            'AllKnown* columns repeat the same metrics against all non-current DB datasets. '
+            'Reference* columns repeat the same metrics against the external taxonomy reference '
+            'FASTA, usually GTDB. PartnerID/SelectedForGenomeSequencing and GenomeSequencing* '
+            'columns report whether this isolate or a nearby 16S clade has already been selected '
+            'for WGS and provide a WGS-aware adjusted priority. '
             '(3) TREE/CLUSTER — InTree, ClusterRepresentative, ClusterSize, ClusteredMembers: '
             'records whether the sequence entered the phylogenetic tree directly or was '
-            'represented by a cluster representative after --collapse.'
+            'represented by a cluster representative after --collapse. '
+            '(4) MWL — when --mwl is supplied, EvaluationScore and MWL* columns describe '
+            'GTDB-based Most Wanted List matches and MWL priority contribution.'
         )),
-        ('taxonomy_input_warnings.tsv', 'Warnings about inconsistencies between the classifier reference FASTA and taxonomy TSV.'),
+        ('selection_summary.tsv', (
+            'Concise scientific-advisory-board selection table. Contains one row per evaluated '
+            'sequence with partner acronym, recommendation, WGS-adjusted priority, key novelty '
+            'identities, taxonomy/MWL evidence, selected-clade status, and a short rationale. '
+            'Use sequence_assessment.tsv for the full audit trail.'
+        )),
+        ('mwl_matches.tsv', 'Most Wanted List match report. Contains sequences whose GTDB taxonomy matched an MWL taxon, with matched rank, MWL score, evaluation score, and functional role.'),
+        ('taxonomy_input_warnings.tsv', 'Warnings about inconsistencies between the classifier reference FASTA and supplied taxonomy table.'),
         ('tree_build_warnings.tsv', 'Warnings about weak phylogenetic signal, missing anchors, or poor alignment quality.'),
         ('tree_orientation_summary.tsv', 'Sequence-level audit of tree-input orientation checks. Reports which sequences were kept forward, reverse-complemented, or lacked orientation evidence before alignment.'),
         ('placement_warnings.tsv', 'Warnings about low-support placements, low identity matches, or potentially artefactual novelty assignments.'),
         ('taxa_assignments_classout.tsv', 'Synthetic classification-like TSV created when --taxa-assignments provided. Columns: id\tbest\tidentity\ttaxon\tconfidence.'),
+        ('dataset_membership.itol', 'iTOL DATASET_COLORSTRIP mapping sequence IDs to dataset colors (membership).'),
+        ('novelty.itol', 'iTOL colorstrip showing novelty (nearest identity) for run sequences.'),
+        ('preload_dataset.itol', 'iTOL colorstrip for the preload dataset; maps preload ids to the dataset color.'),
         ('itol_dataset_membership.itol', 'iTOL DATASET_COLORSTRIP mapping sequence IDs to dataset colors (membership).'),
         ('itol_novelty.itol', 'iTOL colorstrip showing novelty (nearest identity) for run sequences.'),
         ('itol_dataset_preload.itol', 'iTOL colorstrip for the preload dataset; maps preload ids to the dataset color.'),
         ('.nwk', 'Newick tree file (phylogenetic tree). Commonly named current_tree.nwk.'),
         ('.itol', 'iTOL dataset file (text format) describing colors/strips/legends for visualization in iTOL.'),
-        ('.log', 'Log file produced by the pipeline (relict.log) containing debug/info messages')
+        ('.log', 'Log file produced by the pipeline (phyloselect.log) containing debug/info messages')
     ]
 
     rows = []
@@ -261,10 +593,224 @@ def _write_output_explanations(outdir: str):
                 ef.write(f"{name}\t{path}\t{expl}\n")
     except Exception:
         pass
+    _write_detailed_output_guide(p, rows)
+
+
+def _replace_path(src: Path, dst: Path):
+    if not src.exists():
+        return None
+    try:
+        if src.resolve() == dst.resolve():
+            return str(dst)
+    except Exception:
+        pass
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        if dst.is_dir():
+            shutil.rmtree(dst)
+        else:
+            dst.unlink()
+    shutil.move(str(src), str(dst))
+    return str(dst)
+
+
+def _move_if_exists(outdir: Path, name: str, target_dir: str, target_name: str | None = None):
+    return _replace_path(outdir / name, outdir / target_dir / (target_name or name))
+
+
+def _move_glob(outdir: Path, pattern: str, target_dir: str, rename=None):
+    moved = []
+    for src in sorted(outdir.glob(pattern)):
+        if not src.exists() or src.is_dir():
+            continue
+        target_name = rename(src) if rename else src.name
+        dst = outdir / target_dir / target_name
+        got = _replace_path(src, dst)
+        if got:
+            moved.append(got)
+    return moved
+
+
+def _unlink_glob(outdir: Path, pattern: str):
+    for src in sorted(outdir.glob(pattern)):
+        try:
+            if src.is_dir():
+                shutil.rmtree(src)
+            else:
+                src.unlink()
+        except Exception:
+            pass
+
+
+def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
+    """Clean and organise evaluate/run outputs into high-level report folders."""
+    out = Path(outdir)
+    if not out.exists():
+        return
+
+    # Remove redundant iTOL representations and bulky/raw classifier caches.
+    for patt in (
+        'itol_*_symbols.itol',
+        'itol_*_tree_colors.txt',
+        'tree_colors_with_clades.txt',
+        'itol_combined_colors.csv',
+        'matches*.tsv',
+        'novelty_matches.tsv',
+        'novelty_density_matches.tsv',
+        'novelty_*_matches.tsv',
+        'ref_uncompressed*.fasta',
+    ):
+        _unlink_glob(out, patt)
+
+    # Overall assessment and prioritisation reports.
+    for name in (
+        'sequence_assessment.tsv',
+        'cluster_summary.tsv',
+        'backup_candidates.tsv',
+        'placement_warnings.tsv',
+        'novelty_metrics.tsv',
+        'selection_summary.tsv',
+        'rumen_functions_draft.tsv',
+        'qc.stats',
+        'qc_rejections.tsv',
+        'partner_metadata_warnings.tsv',
+    ):
+        _move_if_exists(out, name, 'assessment')
+    _replace_path(out / 'clusters', out / 'assessment' / 'clusters')
+    _move_if_exists(out, 'mwl_matches.tsv', 'assessment')
+
+    # Direct baseline/provided-dataset nearest-hit reports.
+    _move_if_exists(out, 'baseline_hits.tsv', 'baseline')
+    _move_if_exists(out, 'novelty.tsv', 'assessment', 'nearest_all_known_hits_raw.tsv')
+
+    # Taxonomy assignment reports.
+    primary_name = primary_db_name or 'primary'
+    safe_primary = ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in str(primary_name)).strip('_') or 'primary'
+    _move_if_exists(out, 'taxonomy.tsv', 'taxonomy', f'{safe_primary}.tsv')
+    _move_if_exists(out, 'taxonomy_all_dbs.tsv', 'taxonomy', 'all_databases.tsv')
+    _move_if_exists(out, 'combined_taxonomy.tsv', 'taxonomy', 'tree_taxonomy.tsv')
+    _move_if_exists(out, 'taxonomy_input_warnings.tsv', 'taxonomy', 'input_warnings.tsv')
+    _move_if_exists(out, 'taxa_assignments_classout.tsv', 'taxonomy', 'input_assignments.tsv')
+
+    def _rename_taxonomy(src: Path):
+        stem = src.stem
+        if stem.startswith('taxonomy_'):
+            stem = stem[len('taxonomy_'):]
+        return f'{stem}.tsv'
+
+    _move_glob(out, 'taxonomy_*.tsv', 'taxonomy', rename=_rename_taxonomy)
+
+    # Tree/MSA deliverables for iTOL upload.
+    for name in (
+        'current_tree.nwk',
+        'current_tree_labeled.nwk',
+        'current_alignment.fasta',
+        'tree_build_warnings.tsv',
+        'tree_orientation_summary.tsv',
+    ):
+        _move_if_exists(out, name, 'tree')
+    _move_glob(out, 'tree_sequences_phylum_*.fasta', 'tree')
+
+    # One iTOL metadata dataset per metadata type.
+    itol_renames = {
+        'itol_phylum_colors.itol': 'phylum.itol',
+        'itol_family_colors.itol': 'family.itol',
+        'itol_genus_colors.itol': 'genus.itol',
+        'itol_dataset_membership.itol': 'dataset_membership.itol',
+        'itol_novelty.itol': 'novelty.itol',
+        'itol_user_colors.itol': 'user_colors.itol',
+        'itol_dataset_preload.itol': 'preload_dataset.itol',
+    }
+    for src_name, dst_name in itol_renames.items():
+        _move_if_exists(out, src_name, 'itol', dst_name)
+
+    def _rename_function_itol(src: Path):
+        stem = src.stem
+        if stem.startswith('itol_func_'):
+            stem = 'function_' + stem[len('itol_func_'):]
+        return stem + src.suffix
+
+    _move_glob(out, 'itol_func_*.itol', 'itol', rename=_rename_function_itol)
+
+    # Stable ID maps and run-sequence processing artefacts.
+    for name in ('user_id_map.tsv', 'preload_id_map.tsv'):
+        _move_if_exists(out, name, 'ids')
+
+    # Baseline preload internals: keep useful reports, drop raw matches/ref cache.
+    baseline_preload = out / 'baseline_preload'
+    if baseline_preload.exists():
+        _replace_path(baseline_preload / 'baseline_id_map.tsv', out / 'ids' / 'baseline_id_map.tsv')
+        _replace_path(
+            baseline_preload / 'baseline_combined_taxonomy.tsv',
+            out / 'baseline' / 'loaded_baseline_taxonomy.tsv',
+        )
+        _replace_path(
+            baseline_preload / 'taxonomy.tsv',
+            out / 'baseline' / 'loaded_baseline_classification.tsv',
+        )
+        for src in sorted(baseline_preload.glob('preload_*_seqs.fasta')):
+            _replace_path(src, out / 'baseline' / src.name)
+        try:
+            shutil.rmtree(baseline_preload)
+        except Exception:
+            pass
+
+    for name in (
+        'qc.fasta',
+        'derep.fasta',
+        'derep_short.fasta',
+        'derep_short_collapsed.fasta',
+        'collapsed_map.tsv',
+        'collapsed_members.tsv',
+        'submitted_sequences.fasta',
+        'db_preload_seqs.fasta',
+        'density_query_db.fasta',
+        'db_sequences.fasta',
+        'combined_input.fasta',
+        'new_sequences.fasta',
+        'combined_aln.fasta',
+        'tree_orientation_ref.fasta',
+        'id_map.tsv',
+    ):
+        _move_if_exists(out, name, 'intermediate')
+    _move_glob(out, '*_oriented.fasta', 'intermediate')
+    _move_glob(out, '*_unique.fasta', 'intermediate')
+    _move_glob(out, 'novelty_*_pool.fasta', 'intermediate')
+    _move_glob(out, '*.uc', 'intermediate')
+
+    _move_if_exists(out, 'phyloselect.log', 'logs')
 
 
 def _classification_ids_matching_kingdom(classification_tsv: str, kingdom: str):
     return _classification_ids_matching_kingdom_helper(classification_tsv, kingdom)
+
+
+def _normalise_sequence_domain(value: str | None) -> str | None:
+    if value is None:
+        return None
+    got = normalize_domain_query(str(value))
+    if got in ('', 'none', 'all', 'mixed'):
+        return None
+    return got
+
+
+def _sequence_domain_filter(args, *, default: str | None = 'bacteria') -> str | None:
+    """Return the domain/kingdom filter implied by CLI flags.
+
+    ``--kingdom`` is retained for backwards compatibility and wins when
+    explicitly supplied. New commands should prefer ``--sequence-domain``.
+    """
+    explicit_kingdom = getattr(args, 'kingdom', None)
+    if explicit_kingdom:
+        return _normalise_sequence_domain(explicit_kingdom)
+    profile = getattr(args, 'sequence_domain', None)
+    if profile:
+        return _normalise_sequence_domain(profile)
+    return _normalise_sequence_domain(default)
+
+
+def _sequence_domain_label(domain_filter: str | None) -> str:
+    return domain_filter if domain_filter else 'mixed'
 
 
 def _prune_dataset_by_kingdom(db: Database, dataset: str, kingdom: str | None, log_prefix: str):
@@ -278,6 +824,138 @@ def _prune_dataset_by_kingdom(db: Database, dataset: str, kingdom: str | None, l
             kingdom,
         )
     return deleted
+
+
+def _load_evaluate_baseline(
+    args,
+    db: Database,
+    outdir: str,
+    effective_ref: str | None,
+    effective_taxa_tsv: str | None,
+    threads: int,
+):
+    """Load an optional baseline FASTA before evaluating the current run."""
+    baseline_fasta = getattr(args, 'baseline_fasta', None)
+    if not baseline_fasta:
+        return None
+
+    baseline_dataset = getattr(args, 'baseline_dataset', None) or 'Baseline'
+    run_dataset = getattr(args, 'dataset', None)
+    if run_dataset and str(baseline_dataset) == str(run_dataset):
+        raise SystemExit(
+            "[BASELINE] --baseline-dataset must differ from --dataset so novelty can exclude the current run correctly."
+        )
+
+    log = logging.getLogger(__name__)
+    baseline_out = Path(outdir) / 'baseline_preload'
+    baseline_out.mkdir(parents=True, exist_ok=True)
+
+    log.info(
+        "[BASELINE] Loading baseline FASTA %s into dataset=%s before evaluating %s",
+        baseline_fasta,
+        baseline_dataset,
+        run_dataset or '(current run)',
+    )
+    alias_entries, mapped_fasta = db.preload_from_files(
+        baseline_fasta,
+        taxa_tsv=None,
+        color_csv=getattr(args, 'baseline_colors', None),
+        source='baseline',
+        dataset=baseline_dataset,
+        outdir=str(baseline_out),
+        shorten_ids=bool(getattr(args, 'baseline_shorten_ids', False)),
+    )
+
+    try:
+        if alias_entries:
+            map_path = _write_id_map_tsv(baseline_out / 'baseline_id_map.tsv', alias_entries)
+            log.info("[BASELINE] Wrote baseline id mapping to %s", map_path)
+    except Exception as e:
+        log.warning("[BASELINE] Could not write baseline id mapping file: %s", e)
+
+    orig_to_short = _build_orig_to_short(alias_entries)
+    for short, _orig in alias_entries or []:
+        orig_to_short[short] = short
+
+    baseline_ref, baseline_taxa_tsv, baseline_assignment_tsv = _resolve_reference_inputs(
+        effective_ref,
+        effective_taxa_tsv,
+        getattr(args, 'baseline_taxa_assignments', None),
+        source_fasta_path=baseline_fasta,
+        log_prefix='[BASELINE]',
+    )
+
+    if baseline_assignment_tsv:
+        log.info("[BASELINE] Using baseline taxonomy assignments from %s", baseline_assignment_tsv)
+        try:
+            tax_entries = load_taxonomy_entries_from_assignments(
+                baseline_assignment_tsv,
+                orig_to_short,
+                db,
+                baseline_dataset,
+                source_fasta_path=baseline_fasta,
+            )
+        except Exception as e:
+            log.warning("[BASELINE] Failed to read baseline taxonomy assignments %s: %s", baseline_assignment_tsv, e)
+            tax_entries = []
+        if tax_entries:
+            db.insert_taxonomy(tax_entries)
+            log.info("[BASELINE] Inserted/updated taxonomy for %d baseline ids", len(tax_entries))
+    elif not bool(getattr(args, 'baseline_skip_classify', False)):
+        if not baseline_ref:
+            log.warning("[BASELINE] No reference FASTA available; baseline loaded without taxonomy classification")
+        else:
+            input_for_classify = str(mapped_fasta) if mapped_fasta else baseline_fasta
+            log.info("[BASELINE] Classifying baseline %s against %s", input_for_classify, baseline_ref)
+            try:
+                class_out = classify.run_classification(
+                    input_for_classify,
+                    str(baseline_out),
+                    ref_fasta=baseline_ref,
+                    taxa_tsv=baseline_taxa_tsv,
+                    threads=threads,
+                )
+                tax_entries, dist_entries = load_classification_results_for_dataset(
+                    class_out,
+                    orig_to_short,
+                    db,
+                    baseline_dataset,
+                )
+                if tax_entries:
+                    db.insert_taxonomy(tax_entries)
+                    log.info("[BASELINE] Inserted/updated taxonomy for %d baseline ids", len(tax_entries))
+                if dist_entries:
+                    db.insert_distances(dist_entries)
+                    log.info("[BASELINE] Inserted/updated nearest-reference distances for %d baseline ids", len(dist_entries))
+            except Exception as e:
+                log.warning("[BASELINE] Baseline classification failed: %s", e)
+    else:
+        log.info("[BASELINE] --baseline-skip-classify set; baseline loaded without taxonomy classification")
+
+    baseline_domain = _sequence_domain_filter(args)
+    if baseline_domain:
+        try:
+            _prune_dataset_by_kingdom(db, baseline_dataset, baseline_domain, '[BASELINE]')
+        except Exception as e:
+            log.warning("[BASELINE] Domain-based pruning failed: %s", e)
+
+    try:
+        combined_tax = baseline_out / 'baseline_combined_taxonomy.tsv'
+        with db.connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT s.id, t.taxonomy, t.confidence "
+                "FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id "
+                "WHERE s.dataset = ?",
+                (baseline_dataset,),
+            )
+            rows = cur.fetchall()
+        write_combined_taxonomy_tsv(combined_tax, rows)
+        log.info("[BASELINE] Wrote baseline combined taxonomy for %d ids to %s", len(rows), combined_tax)
+    except Exception as e:
+        log.warning("[BASELINE] Failed to write baseline combined taxonomy: %s", e)
+
+    return str(baseline_out)
 
 
 def _same_path(path_a: str | None, path_b: str | None) -> bool:
@@ -380,7 +1058,7 @@ def _resolve_reference_inputs(
             )
         if not effective_taxa:
             log.info(
-                "%s No --taxa TSV provided; taxonomy will be parsed directly from reference FASTA headers",
+                "%s No --taxa TSV/CSV provided; taxonomy will be parsed directly from reference FASTA headers",
                 log_prefix,
             )
         effective_ref = taxa_assignments
@@ -395,11 +1073,14 @@ def cmd_preload(args):
     db.initialise()
     outdir = args.out or '.'
     threads = int(getattr(args, 'threads', 4) or 4)
-    requested_kingdom = getattr(args, 'kingdom', None)
-    requested_kingdom = str(requested_kingdom) if requested_kingdom else None
+    requested_kingdom = _sequence_domain_filter(args)
     os.makedirs(outdir, exist_ok=True)
     _configure_logging(outdir)
     logging.getLogger(__name__).info("[PRELOAD] Starting preload into %s", args.db)
+    logging.getLogger(__name__).info(
+        "[PRELOAD] Sequence-domain profile: %s",
+        _sequence_domain_label(requested_kingdom),
+    )
 
     alias_entries, mapped_fasta = db.preload_from_files(
         args.fasta,
@@ -408,7 +1089,7 @@ def cmd_preload(args):
         source='preload',
         dataset=getattr(args, 'dataset', 'preload'),
         outdir=outdir,
-        shorten_ids=bool(getattr(args, 'shorten_ids', True)),
+        shorten_ids=bool(getattr(args, 'shorten_ids', False)),
     )
     try:
         if alias_entries:
@@ -425,9 +1106,9 @@ def cmd_preload(args):
     )
     classification_requested = bool(getattr(args, 'classify', False) or (getattr(args, 'taxa_assignments', None) and not assignment_tsv))
 
-    # If the user provided a TSV of predetermined taxa assignments, use it
-    # instead of running the classifier. The TSV should be tab-separated with
-    # at least two columns: sequence_header<TAB>taxonomy[<TAB>confidence]
+    # If the user provided a table of predetermined taxa assignments, use it
+    # instead of running the classifier. The table should have at least ID and
+    # taxonomy columns; TSV, CSV, and .gz variants are supported.
     if assignment_tsv:
         taxa_file = assignment_tsv
         logging.getLogger(__name__).info("[PRELOAD] Using taxa assignments from %s (skipping classifier)", taxa_file)
@@ -450,7 +1131,7 @@ def cmd_preload(args):
             logging.getLogger(__name__).info("[PRELOAD] Inserted/updated taxonomy for %d preloaded ids from taxa_assignments", len(tax_entries))
 
     # If classification requested, run classifier on the mapped fasta (short ids)
-    # unless the user supplied a taxa assignments TSV, in which case use that
+    # unless the user supplied a taxa assignments table, in which case use that
     # instead and skip running the external classifier.
     if classification_requested and not assignment_tsv:
         if not effective_ref:
@@ -502,11 +1183,43 @@ def cmd_preload(args):
             except Exception as e:
                 logging.getLogger(__name__).warning("[PRELOAD] Failed to parse classification output: %s", e)
 
+    # Apply the active sequence-domain profile before tree building so the
+    # backbone tree is domain-specific.
+    try:
+        _prune_dataset_by_kingdom(
+            db,
+            getattr(args, 'dataset', 'preload'),
+            requested_kingdom,
+            '[PRELOAD]',
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning("[PRELOAD] Domain-based pruning failed: %s", e)
+
     # Optionally build a baseline tree/alignment from the preloaded sequences
     if getattr(args, 'build_tree', False):
         try:
             # prefer mapped fasta (short ids) if present
             user_fasta = str(mapped_fasta) if mapped_fasta else args.fasta
+            if requested_kingdom:
+                try:
+                    allowed_ids = _dataset_sequence_ids(db, getattr(args, 'dataset', 'preload'))
+                    domain_fasta = Path(outdir) / f'preload_{requested_kingdom}_seqs.fasta'
+                    kept = _filter_fasta_to_ids(user_fasta, domain_fasta, allowed_ids)
+                    if kept:
+                        logging.getLogger(__name__).info(
+                            "[PRELOAD] Filtered preload tree FASTA to %d %s sequence(s): %s",
+                            kept,
+                            requested_kingdom,
+                            domain_fasta,
+                        )
+                        user_fasta = str(domain_fasta)
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "[PRELOAD] Domain filter %s left no FASTA records for tree building; using unfiltered FASTA",
+                            requested_kingdom,
+                        )
+                except Exception as e:
+                    logging.getLogger(__name__).warning("[PRELOAD] Failed to filter tree FASTA by domain: %s", e)
 
             # optionally collapse preloaded sequences before building tree
             if getattr(args, 'collapse', False):
@@ -531,7 +1244,7 @@ def cmd_preload(args):
                         qid_to_tax = {}
 
                     # group records by tax and cluster within groups
-                    from relict.utils.fasta import read_fasta
+                    from phyloselect.utils.fasta import read_fasta
                     taxa_groups = {}
                     try:
                         for h, s in read_fasta(user_fasta):
@@ -701,6 +1414,11 @@ def cmd_run(args):
     os.makedirs(outdir, exist_ok=True)
     _configure_logging(outdir)
     logging.getLogger(__name__).info("[RUN] Starting run pipeline (input=%s)", args.input)
+    domain_filter = _sequence_domain_filter(args)
+    logging.getLogger(__name__).info(
+        "[RUN] Sequence-domain profile: %s",
+        _sequence_domain_label(domain_filter),
+    )
     effective_ref, effective_taxa_tsv, assignment_tsv = _resolve_reference_inputs(
         getattr(args, 'ref', None),
         getattr(args, 'taxa', None),
@@ -709,16 +1427,23 @@ def cmd_run(args):
         log_prefix='[RUN]',
     )
     if not effective_ref:
-        raise SystemExit("[RUN] A reference FASTA is required via --ref, or `--taxa-assignments` must point to a GTDB/reference FASTA rather than a TSV assignments file.")
+        raise SystemExit("[RUN] A reference FASTA is required via --ref, or `--taxa-assignments` must point to a GTDB/reference FASTA rather than a taxonomy assignment table.")
+    if getattr(args, 'command', None) in ('evaluate', 'eval') and not getattr(args, 'partner_metadata', None):
+        raise SystemExit(
+            '[RUN] evaluate requires --partner-metadata / --sequencing-metadata: '
+            'a CSV/TSV sidecar table with sequence IDs, partner IDs, and WGS-selected status.'
+        )
+
+    _load_evaluate_baseline(args, db, outdir, effective_ref, effective_taxa_tsv, threads)
 
     # QC
-    qc_out = qc.run_qc(args.input, outdir, min_len=getattr(args, 'min_len', 1200), max_n=getattr(args, 'max_n', 5))
+    qc_out = qc.run_qc(args.input, outdir, min_len=getattr(args, 'min_len', 800), max_n=getattr(args, 'max_n', 5))
 
     # derep
     derep_out = derep.run_derep(qc_out, outdir)
 
-    # map user-provided dereplicated IDs to short IDs and insert into DB
-    from relict.utils.fasta import read_fasta, write_fasta
+    # map user-provided dereplicated IDs to runtime IDs and insert into DB
+    from phyloselect.utils.fasta import read_fasta, write_fasta
     mapped_derep = Path(outdir) / 'derep_short.fasta'
     used_ids = set(db.get_all_ids())
     orig_to_short = {}
@@ -730,7 +1455,7 @@ def cmd_run(args):
     # kingdom. This avoids inserting unwanted sequences into the DB.
     early_class_out = None
     allowed_qids = None
-    kingdom = getattr(args, 'kingdom', None)
+    kingdom = domain_filter
     if kingdom:
         kingdom_text = str(kingdom)
         if not effective_ref:
@@ -759,19 +1484,21 @@ def cmd_run(args):
             if not hit:
                 continue
 
-        # If DB already contains this canonical sequence, we still want to include it
-        # in the tree (for visualization), but we'll use its existing short ID.
+        # If DB already contains this sequence ID (or a legacy alias), we still
+        # want to include it in the tree for visualization, but we use the
+        # existing DB ID so downstream taxonomy/metadata resolve consistently.
         # The "INSERT OR IGNORE" during insert_sequences will prevent DB duplicates.
-        try:
-            cid = db._canonical_from_header(h)
-        except Exception:
-            cid = None
-        if cid and cid in used_ids:
+        existing_id = db.resolve_sequence_id(h)
+        if existing_id and existing_id in used_ids:
             skipped_existing += 1
-            # Use the existing canonical ID as the short ID
-            short = cid
+            short = existing_id
             orig_to_short[h] = short
-            orig_to_short[cid] = short
+            try:
+                cid = canonicalize_sequence_id(h)
+                if cid:
+                    orig_to_short[cid] = short
+            except Exception:
+                pass
             # Still add to mapped_records so it appears in the tree
             mapped_records.append((short, s))
         else:
@@ -779,7 +1506,7 @@ def cmd_run(args):
                 short = db.choose_effective_sequence_id(
                     h,
                     used_ids,
-                    shorten_ids=bool(getattr(args, 'shorten_ids', True)),
+                    shorten_ids=bool(getattr(args, 'shorten_ids', False)),
                 )
             except ValueError as e:
                 raise SystemExit(f"[RUN] {e}")
@@ -792,9 +1519,9 @@ def cmd_run(args):
             except Exception:
                 pass
     if skipped_existing:
-        logging.getLogger(__name__).info("[DB] Found %d sequences already in DB (by canonical id); keeping them for tree inclusion", skipped_existing)
+        logging.getLogger(__name__).info("[DB] Found %d sequences already in DB; keeping them for tree inclusion", skipped_existing)
     write_fasta(mapped_records, str(mapped_derep))
-    logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to short IDs and wrote %s", len(mapped_records), mapped_derep)
+    logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to runtime IDs and wrote %s", len(mapped_records), mapped_derep)
     if not mapped_records:
         logging.getLogger(__name__).warning("[DB] No sequences were mapped — check if input sequences were filtered")
     # insert mapped records into DB (dataset provided by user)
@@ -811,14 +1538,27 @@ def cmd_run(args):
     for short, _seq in mapped_records:
         orig_to_short[short] = short
 
+    run_metadata = _load_partner_metadata_for_run(
+        args,
+        db,
+        outdir,
+        orig_to_short,
+        [short for short, _seq in mapped_records],
+    )
+
     # classify (or use external taxa assignments if provided)
     class_out = None
     all_class_results: dict = {}
-    run_main_db_name: str = 'main'
+    run_main_db_name: str = (
+        getattr(args, 'main_ref', None)
+        or getattr(args, 'ref_name', None)
+        or _classify_derive_db_name(effective_ref)
+        or 'main'
+    )
     if assignment_tsv:
         taxa_file = assignment_tsv
         logging.getLogger(__name__).info("[RUN] Using taxa assignments from %s (skipping classifier)", taxa_file)
-        # parse provided TSV and insert taxonomy for mapped short ids
+        # parse provided taxonomy assignment table and insert taxonomy for mapped runtime ids
         try:
             tax_entries_local = load_taxonomy_entries_from_assignments(
                 taxa_file,
@@ -889,6 +1629,10 @@ def cmd_run(args):
     target_fasta = getattr(args, 'target', None)
     novelty_out = novelty.run_novelty(str(mapped_derep), effective_ref, outdir, db=db, run_dataset=run_dataset, threads=threads, target_fasta=target_fasta)
     try:
+        novelty_baseline_datasets = []
+        if getattr(args, 'baseline_dataset', None):
+            novelty_baseline_datasets.append(getattr(args, 'baseline_dataset'))
+        novelty_baseline_datasets.extend(getattr(args, 'novelty_baseline_datasets', None) or [])
         novelty_metrics_out = novelty.build_reference_novelty_metrics(
             str(mapped_derep),
             effective_ref,
@@ -898,6 +1642,7 @@ def cmd_run(args):
             db=db,
             run_dataset=run_dataset,
             target_fasta=target_fasta,
+            baseline_datasets=novelty_baseline_datasets,
         )
         logging.getLogger(__name__).info("[NOVELTY] Wrote novelty metrics to %s", novelty_metrics_out)
     except Exception as e:
@@ -1093,11 +1838,11 @@ def cmd_run(args):
         preload_ids = None
         if preload_dir:
             try:
-                p = Path(str(preload_dir))
-                cand = p / 'preload_combined_taxonomy.tsv'
-                if not cand.exists():
-                    cand = p / 'combined_taxonomy.tsv'
-                if cand.exists():
+                cand = next(
+                    (path for path in _combined_taxonomy_candidates(preload_dir) if path.exists()),
+                    None,
+                )
+                if cand is not None:
                     preload_ids = read_combined_taxonomy_ids(cand)
             except Exception:
                 preload_ids = None
@@ -1274,8 +2019,38 @@ def cmd_run(args):
                     alt_taxonomies=alt_taxonomies,
                     alt_ref_dbs=alt_ref_dbs,
                 )
+                mwl_path = getattr(args, 'mwl', None)
+                mwl_entries = []
+                if mwl_path:
+                    try:
+                        logging.getLogger(__name__).info(
+                            "[MWL] Matching the primary Taxonomy column against MWL. For multi-db runs, set --main-ref to your GTDB reference name."
+                        )
+                        mwl_entries = _mwl.load_mwl_entries(
+                            str(mwl_path),
+                            sheet_name=getattr(args, 'mwl_sheet', 'MWL_V1') or 'MWL_V1',
+                        )
+                        _mwl.annotate_assessment_rows(
+                            assessment_rows,
+                            mwl_entries,
+                            min_rank=getattr(args, 'mwl_min_rank', 'p') or 'p',
+                        )
+                        mwl_report = _mwl.write_mwl_matches_tsv(
+                            Path(outdir) / 'mwl_matches.tsv',
+                            assessment_rows,
+                        )
+                        logging.getLogger(__name__).info(
+                            "[MWL] Annotated %d assessment rows with %d MWL entries → %s",
+                            len(assessment_rows), len(mwl_entries), mwl_report,
+                        )
+                    except Exception as e:
+                        logging.getLogger(__name__).warning("[MWL] Failed to annotate assessment rows: %s", e)
                 assess_path = write_sequence_assessment_tsv(Path(outdir) / 'sequence_assessment.tsv', assessment_rows)
+                selection_summary_path = write_selection_summary_tsv(Path(outdir) / 'selection_summary.tsv', assessment_rows)
+                baseline_hits_path = write_baseline_hits_tsv(Path(outdir) / 'baseline_hits.tsv', assessment_rows)
                 logging.getLogger(__name__).info("[RUN] Wrote sequence assessment to %s", assess_path)
+                logging.getLogger(__name__).info("[RUN] Wrote SAB selection summary to %s", selection_summary_path)
+                logging.getLogger(__name__).info("[RUN] Wrote nearest baseline hit report to %s", baseline_hits_path)
 
                 # ── Cluster-level reports + phylogenetic isolation ───────────
                 try:
@@ -1287,7 +2062,15 @@ def cmd_run(args):
                     )
                     # Re-write sequence_assessment.tsv now that phylo_isolation /
                     # investigation_score have been filled in by generate_cluster_reports
+                    if mwl_entries:
+                        try:
+                            _mwl.add_evaluation_scores(assessment_rows)
+                            _mwl.write_mwl_matches_tsv(Path(outdir) / 'mwl_matches.tsv', assessment_rows)
+                        except Exception as _mwe:
+                            logging.getLogger(__name__).warning("[MWL] Failed to refresh MWL evaluation scores: %s", _mwe)
                     write_sequence_assessment_tsv(Path(outdir) / 'sequence_assessment.tsv', assessment_rows)
+                    write_selection_summary_tsv(Path(outdir) / 'selection_summary.tsv', assessment_rows)
+                    write_baseline_hits_tsv(Path(outdir) / 'baseline_hits.tsv', assessment_rows)
                     if _cluster_summary:
                         logging.getLogger(__name__).info(
                             "[CLUSTER] Wrote cluster summary → %s  (%d per-cluster CSVs in %s/clusters/)",
@@ -1301,15 +2084,27 @@ def cmd_run(args):
                     logging.getLogger(__name__).warning("[CLUSTER] Cluster report generation failed: %s", _ce)
                 # Emit a user-friendly summary of HIGH priority candidates
                 try:
-                    high_priority = [r for r in assessment_rows if r.get('sequencing_priority') == 'HIGH']
-                    medium_priority = [r for r in assessment_rows if r.get('sequencing_priority') == 'MEDIUM']
+                    def _effective_priority(row):
+                        return row.get('genome_sequencing_adjusted_priority') or row.get('sequencing_priority')
+
+                    high_priority = [r for r in assessment_rows if _effective_priority(r) == 'HIGH']
+                    medium_priority = [r for r in assessment_rows if _effective_priority(r) == 'MEDIUM']
+                    selected_clades = [
+                        r for r in assessment_rows
+                        if r.get('clade_already_selected_for_genome_sequencing') == 'True'
+                    ]
                     collapsed_away = [r for r in assessment_rows if r.get('in_tree') == 'No']
                     logging.getLogger(__name__).info(
                         "[ASSESSMENT SUMMARY] %d sequences assessed: %d HIGH priority for sequencing, "
-                        "%d MEDIUM priority. %d sequences were clustered and excluded from tree "
+                        "%d MEDIUM priority. %d have a >=97%% selected-genome neighbour. "
+                        "%d sequences were clustered and excluded from tree "
                         "(their representatives are in the tree). "
-                        "See sequence_assessment.tsv for full details.",
-                        len(assessment_rows), len(high_priority), len(medium_priority), len(collapsed_away),
+                        "See assessment/sequence_assessment.tsv for full details.",
+                        len(assessment_rows),
+                        len(high_priority),
+                        len(medium_priority),
+                        len(selected_clades),
+                        len(collapsed_away),
                     )
                 except Exception:
                     pass
@@ -1318,7 +2113,14 @@ def cmd_run(args):
     except Exception as e:
         logging.getLogger(__name__).warning("[RUN] Failed to build placement warnings: %s", e)
 
-    # At end of run, write plain-text explanation files for outputs in outdir
+    # At end of run, keep the externally useful deliverables and organise them
+    # into high-level folders.
+    try:
+        _organize_run_outputs(outdir, primary_db_name=run_main_db_name)
+    except Exception as e:
+        logging.getLogger(__name__).warning("[RUN] Failed to organise output files: %s", e)
+
+    # Write a manifest after files have been organised.
     try:
         _write_output_explanations(outdir)
     except Exception:
@@ -1334,7 +2136,7 @@ def _detect_taxon_rank(taxon_query: str, rank_arg: str) -> str:
       3. Known domain keywords: ``archaea`` / ``bacteria`` → 'd'
       4. Fallback: 'p' (phylum)
     """
-    from relict.taxonomy import RANK_ALIASES
+    from phyloselect.taxonomy import RANK_ALIASES
     if rank_arg and rank_arg.lower() != 'auto':
         return RANK_ALIASES.get(rank_arg.lower(), rank_arg.lower()[:1])
     if '__' in taxon_query:
@@ -1372,11 +2174,11 @@ def cmd_subtree(args):
     sequences are exported from the DB and a full MAFFT + FastTree build
     is performed (same as a normal run).
     """
-    from relict.pipeline import itol as itol_mod
-    from relict.pipeline import tree as tree_mod  # noqa: F401 (used in _build_subtree)
-    from relict.pipeline.workflow_helpers import write_combined_taxonomy_tsv
-    from relict.taxonomy import parse_taxon_string
-    from relict.utils.fasta import read_fasta, write_fasta  # noqa: F401
+    from phyloselect.pipeline import itol as itol_mod
+    from phyloselect.pipeline import tree as tree_mod  # noqa: F401 (used in _build_subtree)
+    from phyloselect.pipeline.workflow_helpers import write_combined_taxonomy_tsv
+    from phyloselect.taxonomy import parse_taxon_string
+    from phyloselect.utils.fasta import read_fasta, write_fasta  # noqa: F401
 
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
@@ -1548,12 +2350,12 @@ def _build_subtree(
     Slow path: write the raw sequences as a FASTA and run the full
     ``initialise_or_update_tree`` pipeline (MAFFT → FastTree).
     """
-    from relict.pipeline.tree import (
+    from phyloselect.pipeline.tree import (
         _run_fasttree, _make_unique_fasta,
         is_ref_anchor, get_anchor_file,
     )
-    from relict.utils.fasta import read_fasta, write_fasta
-    from relict.pipeline import tree as tree_mod
+    from phyloselect.utils.fasta import read_fasta, write_fasta
+    from phyloselect.pipeline import tree as tree_mod
     import re
 
     out = Path(outdir)
@@ -1563,7 +2365,9 @@ def _build_subtree(
     # Look for an existing alignment in from_dir (or outdir)
     aln_candidates = [
         Path(from_dir) / 'current_alignment.fasta',
+        Path(from_dir) / 'tree' / 'current_alignment.fasta',
         Path(outdir) / 'current_alignment.fasta',
+        Path(outdir) / 'tree' / 'current_alignment.fasta',
     ]
     existing_aln = next((p for p in aln_candidates if p.exists()), None)
 
@@ -1640,7 +2444,7 @@ def _build_subtree(
 
 def _finalise_tree_subtree(out: Path, id_map: dict, tree_path: Path, log) -> None:
     """Remap IDs, prune anchors, and label internal nodes for subtree output."""
-    from relict.pipeline.tree import (
+    from phyloselect.pipeline.tree import (
         _repair_legacy_internal_node_labels, _label_internal_nodes,
         _prune_anchor_leaves, REF_ANCHOR_PREFIX,
     )
@@ -1683,8 +2487,7 @@ def cmd_regen_itol(args):
                 # to the DB-wide query otherwise to avoid regenerating empty
                 # iTOL outputs when a stub file exists.
                 preload_file = None
-                for cand_name in ('preload_combined_taxonomy.tsv', 'combined_taxonomy.tsv'):
-                    cand = p / cand_name
+                for cand in _combined_taxonomy_candidates(p):
                     if not cand.exists():
                         continue
                     try:
@@ -1725,7 +2528,7 @@ def cmd_regen_itol(args):
         return
 
     try:
-        kingdom = getattr(args, 'kingdom', None)
+        kingdom = _sequence_domain_filter(args, default=None)
         if kingdom:
             kingdom_text = str(kingdom)
             rows = [row for row in rows if row[1] and taxonomy_matches_kingdom(str(row[1]), kingdom_text)]
@@ -1791,20 +2594,21 @@ def cmd_regen_itol(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog='relict',
+        prog='phyloselect',
         description=(
-            'Relict — reference-aware 16S novelty and phylogenetic context tool.\n\n'
+            'PhyloSelect — marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation toolkit.\n\n'
             'Subcommands:\n'
             '  preclassify Pre-classify reference FASTA collections (Hungate, SILVA …) once and reuse.\n'
             '  preload     Load a baseline dataset (e.g. Hungate) and build the backbone tree.\n'
+            '  evaluate    Core partner-sequence evaluation workflow (alias: run/eval).\n'
             '  run         Process new sequences against the baseline; score novelty and update the tree.\n'
             '  subtree     Extract a focused tree and iTOL files for a specific taxon from an existing DB.\n'
             '  regen-itol  Regenerate iTOL colour files from an existing DB without re-running analysis.\n\n'
             'Typical workflow:\n'
-            '  0. relict preclassify --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o preclassify_out\n'
-            '  1. relict preload  --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments preclassify_out/pipeline_taxonomy.tsv --build-tree -o preload_out\n'
-            '  2. relict run      --input new_seqs.fasta --db project.db --dataset Batch1  --ref gtdb.fna --preload-dir preload_out -o run_out\n'
-            '  3. relict subtree  --db project.db --taxon archaea --from-dir preload_out -o archaea_out\n'
+            '  0. phyloselect preclassify --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o preclassify_out\n'
+            '  1. phyloselect preload  --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments preclassify_out/pipeline_taxonomy.tsv --build-tree -o preload_out\n'
+            '  2. phyloselect evaluate --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1  --ref gtdb.fna --baseline-fasta hungate.fasta --baseline-dataset Hungate --mwl MWL.xlsx -o eval_out\n'
+            '  3. phyloselect subtree  --db project.db --taxon archaea --from-dir preload_out -o archaea_out\n'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1826,14 +2630,14 @@ def build_parser():
     preload.add_argument('--fasta', required=True,
         help='Input FASTA file containing the baseline sequences to load.')
     preload.add_argument('--db', required=True,
-        help='Path to the Relict SQLite database (created if it does not exist).')
+        help='Path to the PhyloSelect SQLite database (created if it does not exist).')
     preload.add_argument('-o', '--out', required=False, default='.',
         help='Output directory for tree, iTOL files, and reports (default: current directory).')
     preload.add_argument('--dataset', required=True,
         help='Label for this dataset stored in the DB (e.g. Hungate). Used to colour iTOL strips.')
     preload.add_argument('--shorten-ids', dest='shorten_ids',
         action=argparse.BooleanOptionalAction, default=False,
-        help='Replace input headers with compact IDs (e.g. HUN001). Use --no-shorten-ids to replace source names.')
+        help='Replace input headers with compact IDs (e.g. HUN001). Default is to preserve the IDs exactly as supplied.')
     preload.add_argument('--classify', action='store_true',
         help='Classify sequences against --ref and store taxonomy in the DB. Requires --ref.')
     preload.add_argument('--build-tree', action='store_true',
@@ -1841,28 +2645,35 @@ def build_parser():
     preload.add_argument('--ref', required=False,
         help='Reference FASTA (GTDB/SILVA reps) for classification and tree orientation. Preferred over --taxa-assignments for externally classified inputs.')
     preload.add_argument('--taxa', required=False,
-        help='Tab-separated taxonomy file matching the IDs in --ref (id<TAB>lineage). Optional when --ref FASTA headers already contain GTDB lineages.')
+        help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage). Optional when --ref FASTA headers already contain lineages.')
     preload.add_argument('--ref-name', dest='ref_name', required=False, default=None,
         help='Display name for the primary reference database (default: derived from --ref filename). Used to label taxonomy columns.')
     preload.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
         help='Additional reference FASTA to classify against (repeatable). Produces extra taxonomy columns in output files.')
-    preload.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TSV',
-        help='Taxa TSV for the corresponding --alt-ref (positionally paired; repeatable).')
+    preload.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
+        help='Taxonomy TSV/CSV for the corresponding --alt-ref (positionally paired; repeatable; .gz accepted).')
     preload.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
         help='Display name for the corresponding --alt-ref (positionally paired; repeatable). Default: derived from filename.')
     preload.add_argument('--main-ref', dest='main_ref', required=False, default=None,
         help='Name of the reference database to use as the primary taxonomy source (default: primary --ref). Must match one of the --ref-name / --alt-ref-name values.')
     preload.add_argument('--taxa-assignments', '--taxa-aasignments',
         dest='taxa_assignments', required=False,
-        help='Pre-computed taxonomy assignments for the INPUT sequences (TSV: query_id<TAB>lineage, or a FASTA with embedded lineages). Use this instead of --classify when you already have taxonomy.')
+        help='Pre-computed taxonomy assignments for the INPUT sequences (TSV/CSV, optionally .gz: query_id + lineage, or a FASTA with embedded lineages). Use this instead of --classify when you already have taxonomy.')
     preload.add_argument('--collapse', action='store_true',
         help='Collapse sequences that share ≥ --collapse-threshold identity AND the same taxonomy into a single representative for the tree. Saves time and reduces visual clutter.')
     preload.add_argument('--collapse-threshold', type=float, default=99.8,
         help='Identity threshold (percent) for collapsing duplicate-like sequences (default: 99.8).')
+    preload.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
+        choices=SEQUENCE_DOMAIN_CHOICES, default=None,
+        help=(
+            'Sequence/domain profile for this preload. Default behavior is bacteria. '
+            'Use archaea for archaeal 16S, fungi for fungal/eukaryotic runs with suitable refs/anchors, '
+            'or mixed/all/none to disable domain filtering.'
+        ))
     preload.add_argument('--kingdom', required=False,
-        help='Keep only sequences belonging to this kingdom/domain (case-insensitive). E.g. "bacteria" to drop archaeal sequences.')
+        help='Backward-compatible explicit domain/kingdom filter. Overrides --sequence-domain when supplied.')
     preload.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA for tree topology scaffolding. Defaults to the 26-sequence bundled anchor set (src/relict/data/reference_anchors.fasta).')
+        help='Custom reference anchor FASTA for tree topology scaffolding. Defaults to the 26-sequence bundled anchor set (src/phyloselect/data/reference_anchors.fasta).')
     preload.add_argument('--threads', type=int, required=False, default=4,
         help='Number of CPU threads for MAFFT and VSEARCH (default: 4).')
     preload.add_argument('--tree-method', dest='tree_method',
@@ -1910,19 +2721,25 @@ def build_parser():
     # ── run ───────────────────────────────────────────────────────────────────
     run = sub.add_parser(
         'run',
+        aliases=['evaluate', 'eval'],
         help='Process new sequences against the baseline; score novelty and update the tree.',
         description=(
-            'Classify new sequences, score their novelty and neighbourhood density against the\n'
-            'baseline (preload + all prior run datasets stored in the DB), and update the tree.\n\n'
-            'Novelty is always relative to YOUR submitted data, not the full external reference.\n'
-            'Each successive run extends the baseline, so scores become increasingly precise.'
+            'Evaluate new partner 16S isolate sequences against the project baseline.\n\n'
+            'The workflow classifies against GTDB (primary), optionally cross-checks NCBI/GG2/SILVA\n'
+            'as --alt-ref databases, scores novelty and neighbourhood density against prior partner\n'
+            'and preload/baseline sequences, updates the tree, and optionally matches GTDB taxonomy against\n'
+            'the Most Wanted List via --mwl.\n\n'
+            'Provide --baseline-fasta for context datasets such as Hungate when they have not already\n'
+            'been loaded with `phyloselect preload`. Novelty is always relative to YOUR submitted data,\n'
+            'not the full external reference. Each successive run extends the baseline, so scores\n'
+            'become increasingly precise.'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     run.add_argument('--input', required=True,
         help='FASTA file of new sequences to analyse.')
     run.add_argument('--db', required=True,
-        help='Path to the Relict SQLite database (must have been initialised with `relict preload`).')
+        help='Path to the PhyloSelect SQLite database (must have been initialised with `phyloselect preload`).')
     run.add_argument('-o', '--out', required=True,
         help='Output directory for this run (sequence_assessment.tsv, novelty_metrics.tsv, tree, iTOL files, etc.).')
     run.add_argument('--dataset', required=True,
@@ -1930,35 +2747,67 @@ def build_parser():
     run.add_argument('--ref', required=False,
         help='Reference FASTA (GTDB/SILVA reps) used for classification and tree orientation. Same file used in preload.')
     run.add_argument('--taxa', required=False,
-        help='Tab-separated taxonomy file matching the IDs in --ref (id<TAB>lineage).')
+        help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage).')
     run.add_argument('--ref-name', dest='ref_name', required=False, default=None,
         help='Display name for the primary reference database (default: derived from --ref filename).')
     run.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
         help='Additional reference FASTA to classify against (repeatable). Adds extra taxonomy columns to sequence_assessment.tsv and taxonomy_all_dbs.tsv.')
-    run.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TSV',
-        help='Taxa TSV for the corresponding --alt-ref (positionally paired; repeatable).')
+    run.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
+        help='Taxonomy TSV/CSV for the corresponding --alt-ref (positionally paired; repeatable; .gz accepted).')
     run.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
         help='Display name for the corresponding --alt-ref (positionally paired; repeatable).')
     run.add_argument('--main-ref', dest='main_ref', required=False, default=None,
         help='Name of the reference database to treat as primary (drives the main Taxonomy column). Default: primary --ref.')
+    run.add_argument('--mwl', dest='mwl', required=False, default=None,
+        help='Most Wanted List workbook/TSV/CSV. GTDB taxonomy is matched against this list and MWL columns are added to sequence_assessment.tsv.')
+    run.add_argument('--mwl-sheet', dest='mwl_sheet', required=False, default='MWL_V1',
+        help='Sheet name to read from an MWL .xlsx workbook (default: MWL_V1).')
+    run.add_argument('--mwl-min-rank', dest='mwl_min_rank', required=False, default='p',
+        choices=['domain', 'd', 'phylum', 'p', 'class', 'c', 'order', 'o', 'family', 'f', 'genus', 'g', 'species', 's'],
+        help='Minimum matched rank required for an MWL hit (default: phylum). Domain-only MWL entries still match at domain.')
+    run.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', required=False, default=None,
+        help='CSV/TSV sidecar table for this run with sequence IDs, partner IDs, and whether each isolate was selected for full-genome sequencing. .gz is accepted. Required when using the evaluate/eval alias.')
+    run.add_argument('--baseline-fasta', dest='baseline_fasta', required=False, default=None,
+        help='Optional baseline/context FASTA to load before evaluating the new sequences (e.g. Hungate 16S).')
+    run.add_argument('--baseline-dataset', dest='baseline_dataset', required=False, default='Baseline',
+        help='Dataset label for --baseline-fasta in the DB and default cultured-baseline novelty pool (default: Baseline). Must differ from --dataset.')
+    run.add_argument('--novelty-baseline-dataset', dest='novelty_baseline_datasets', action='append', default=[],
+        help='Existing DB dataset label to include in the baseline/cultured novelty pool (repeatable; useful for Hungate plus other cultured isolate sets).')
+    run.add_argument('--baseline-taxa-assignments', dest='baseline_taxa_assignments', required=False, default=None,
+        help='Pre-computed taxonomy for --baseline-fasta (TSV/CSV, optionally .gz: sequence_id + lineage + optional confidence, or embedded-lineage FASTA). Skips baseline classification.')
+    run.add_argument('--baseline-skip-classify', dest='baseline_skip_classify', action='store_true', default=False,
+        help='Load --baseline-fasta into the DB without classifying it. Novelty still uses the baseline sequences, but taxonomy/iTOL context may be sparse.')
+    run.add_argument('--baseline-colors', dest='baseline_colors', required=False, default=None,
+        help='Optional CSV with baseline sequence colors, same format as preload --colors.')
+    run.add_argument('--baseline-shorten-ids', dest='baseline_shorten_ids',
+        action=argparse.BooleanOptionalAction, default=False,
+        help='Replace baseline FASTA headers with compact IDs. Default is to preserve the IDs exactly as supplied.')
     run.add_argument('--taxa-assignments', '--taxa-aasignments',
         dest='taxa_assignments', required=False,
-        help='Pre-computed taxonomy for the INPUT sequences (TSV: query_id<TAB>lineage, or embedded-lineage FASTA).')
+        help='Pre-computed taxonomy for the INPUT sequences (TSV/CSV, optionally .gz: query_id + lineage, or embedded-lineage FASTA).')
     run.add_argument('--preload-dir', dest='preload_dir', required=False,
         help='Path to the preload output directory. Used to seed the tree backbone alignment so only new sequences need aligning.')
     run.add_argument('--shorten-ids', dest='shorten_ids',
         action=argparse.BooleanOptionalAction, default=False,
-        help='Replace input headers with compact IDs. Use --no-shorten-ids to replace source names.')
-    run.add_argument('--min-len', dest='min_len', type=int, default=1200,
-        help='Minimum sequence length to retain (bp, default: 1200). Shorter sequences are filtered out.')
+        help='Replace input headers with compact IDs. Default is to preserve the IDs exactly as supplied.')
+    run.add_argument('--min-len', dest='min_len', type=int, default=800,
+        help='Minimum sequence length to retain (bp, default: 800). Shorter sequences are filtered out.')
     run.add_argument('--max-n', dest='max_n', type=int, default=5,
         help='Maximum number of ambiguous (N) bases allowed (default: 5).')
     run.add_argument('--collapse', action='store_true',
         help='Collapse near-identical same-taxonomy sequences into representatives for the tree.')
     run.add_argument('--collapse-threshold', type=float, default=99.8,
         help='Identity threshold (percent) for collapsing (default: 99.8).')
+    run.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
+        choices=SEQUENCE_DOMAIN_CHOICES, default=None,
+        help=(
+            'Sequence/domain profile for this evaluate/run. Omitted means bacteria. '
+            'Use archaea for archaeal runs, fungi for fungal/eukaryotic runs with suitable references, '
+            'or mixed/all/none to disable domain filtering. Provide domain-specific --ref/--alt-ref, '
+            '--baseline-fasta, --preload-dir, and --anchors as needed.'
+        ))
     run.add_argument('--kingdom', required=False,
-        help='Keep only sequences belonging to this kingdom/domain (e.g. bacteria).')
+        help='Backward-compatible explicit domain/kingdom filter. Overrides --sequence-domain when supplied.')
     run.add_argument('--phylum', required=False,
         help='Filter iTOL output to sequences assigned to this phylum (e.g. Bacillota). Does not affect novelty scoring.')
     run.add_argument('--target', required=False, default=None,
@@ -2021,13 +2870,16 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     regen.add_argument('--db', required=True,
-        help='Path to the Relict SQLite database.')
+        help='Path to the PhyloSelect SQLite database.')
     regen.add_argument('-o', '--out', required=True,
         help='Output directory where iTOL files will be written (should be the preload or run output dir).')
     regen.add_argument('--include-datasets', required=False,
         help='Comma-separated list of dataset names to include (default: all datasets in the DB).')
     regen.add_argument('--kingdom', required=False,
         help='Include only sequences whose taxonomy contains this kingdom string (e.g. bacteria).')
+    regen.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
+        choices=SEQUENCE_DOMAIN_CHOICES, default=None,
+        help='Optional domain profile filter for regenerated outputs: bacteria, archaea, fungi, or mixed/all/none.')
     regen.add_argument(
         '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
         help=(
@@ -2067,7 +2919,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subtree.add_argument('--db', required=True,
-        help='Path to the Relict SQLite database.')
+        help='Path to the PhyloSelect SQLite database.')
     subtree.add_argument('-o', '--out', required=True,
         help='Output directory for the subtree results.')
     subtree.add_argument('--taxon', required=True,
@@ -2087,7 +2939,7 @@ def build_parser():
     subtree.add_argument('--ref', required=False,
         help='Reference FASTA for orientation correction (slow-path full build only).')
     subtree.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA. Defaults to bundled anchors (26 type-strain sequences).')
+        help='Custom reference anchor FASTA. Defaults to bundled anchors (26 NCBI RefSeq sequences).')
     subtree.add_argument('--threads', type=int, default=4,
         help='CPU threads for FastTree / MAFFT (default: 4).')
     subtree.add_argument('--min-seqs', dest='min_seqs', type=int, default=3,
@@ -2112,6 +2964,86 @@ def build_parser():
         help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
     )
 
+    # ── sanger / AB1 processing ───────────────────────────────────────────────
+    sanger = sub.add_parser(
+        'sanger',
+        aliases=['ab1', 'ab1-to-fasta'],
+        help='Convert Sanger AB1/sequence reads to trimmed FASTA and assemble primer reads per isolate.',
+        description=(
+            'Process Sanger chromatogram reads before evaluate.\n\n'
+            'Inputs may be AB1/ABI files, FASTA, or FASTQ. AB1 files are base-called from '
+            'PBAS/PCON tags, quality-trimmed, oriented by primer direction, and optionally '
+            'assembled into one consensus 16S sequence per isolate. For example, 27F reads '
+            'are kept forward and 907R reads are reverse-complemented before overlap assembly.\n\n'
+            'If --sample-map/--read-metadata are omitted, sequence IDs and primer names are '
+            'inferred from filenames such as Iso001_27F.ab1 and Iso001_907R.ab1.'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sanger.add_argument(
+        '--input', nargs='+', required=False, default=[],
+        help='AB1/ABI/FASTA/FASTQ files or directories to process. Directories are searched recursively by default. Optional when --sample-map lists the read files.',
+    )
+    sanger.add_argument('-o', '--out', required=True,
+        help='Output directory for assembled.fasta, read_qc.tsv, visual reports, and assembly_report.tsv.')
+    sanger.add_argument(
+        '--sample-map', required=False, default=None,
+        help=(
+            'Optional CSV/TSV one row per isolate/sample. Use sequence_id/isolate_id/sample_id plus '
+            'an ab1_files/read_files column containing ; separated files, or separate primer columns '
+            'such as 27F and 907R. Add processing_mode/tags=assemble or best_read to override '
+            'per-isolate handling. Relative paths are resolved next to the mapping file.'
+        ),
+    )
+    sanger.add_argument(
+        '--read-metadata', required=False, default=None,
+        help=(
+            'Optional CSV/TSV mapping read files to sequence_id, primer, and direction. '
+            'Columns: file/read_file, sequence_id, primer, direction. Also accepts the same sample-level format as --sample-map.'
+        ),
+    )
+    sanger.add_argument(
+        '--primer', dest='primers', action='append', default=None,
+        help='Primer name to recognise in filenames (repeatable). Defaults include common 16S primers such as 27F, 907R, and 1492R.',
+    )
+    sanger.add_argument('--min-quality', dest='min_quality', type=int, default=20,
+        help='Phred cutoff for Mott-style end trimming (default: 20).')
+    sanger.add_argument('--window', type=int, default=20,
+        help='Compatibility option retained for older commands; rigorous trimming uses the Phred cutoff directly.')
+    sanger.add_argument('--min-length', dest='min_length', type=int, default=800,
+        help='Minimum final sequence length to write to assembled.fasta (default: 800 bp).')
+    sanger.add_argument('--min-read-length', dest='min_read_length', type=int, default=None,
+        help='Minimum trimmed read length to retain before assembly/best-read selection. Defaults to --min-length.')
+    sanger.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=25.0,
+        help='Minimum mean Phred score after trimming/masking for read and final QC (default: 25).')
+    sanger.add_argument('--mask-quality', dest='mask_quality', type=int, default=20,
+        help='Mask internal bases below this Phred score to N before assembly (default: 20).')
+    sanger.add_argument('--max-read-expected-errors', dest='max_read_expected_errors', type=float, default=8.0,
+        help='Maximum expected base-call errors allowed per retained read (default: 8).')
+    sanger.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=5.0,
+        help='Maximum expected base-call errors allowed in the final isolate sequence (default: 5).')
+    sanger.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=1.0,
+        help='Maximum percent N allowed after masking for reads and final output (default: 1.0).')
+    sanger.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=20,
+        help='Maximum internal low-quality/ambiguous run length before read failure (default: 20 bp).')
+    sanger.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=1.0,
+        help='Maximum overlap conflicts per 100 final bases before final QC failure (default: 1.0).')
+    sanger.add_argument('--quality-difference', dest='quality_difference', type=int, default=10,
+        help='Minimum Phred difference required to choose one conflicting overlap base over another (default: 10).')
+    sanger.add_argument('--allow-missing-quality', dest='allow_missing_quality',
+        action='store_true', default=False,
+        help='Allow AB1 reads missing PCON quality scores to pass with warnings. By default they fail QC.')
+    sanger.add_argument('--min-overlap', dest='min_overlap', type=int, default=40,
+        help='Minimum overlap length for assembling multiple primer reads (default: 40 bp).')
+    sanger.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=0.85,
+        help='Minimum overlap identity for assembly, 0-1 (default: 0.85).')
+    sanger.add_argument('--assemble', dest='assemble',
+        action=argparse.BooleanOptionalAction, default=True,
+        help='Assemble multiple reads per sequence_id when possible (default). Use --no-assemble to keep the best read.')
+    sanger.add_argument('--recursive', dest='recursive',
+        action=argparse.BooleanOptionalAction, default=True,
+        help='Search input directories recursively (default).')
+
     # ── preclassify ───────────────────────────────────────────────────────────
     preclassify = sub.add_parser(
         'preclassify',
@@ -2132,18 +3064,19 @@ def build_parser():
             'Outputs written to --out:\n'
             '  {name}_classification.tsv   Full classification (human-readable)\n'
             '  {name}_taxonomy.tsv         Condensed per-dataset taxonomy\n'
+            '  {name}_taxonomic_disagreement.tsv  High-quality hits with conflicting taxa\n'
             '  combined_taxonomy.tsv       All datasets merged (with Dataset column)\n'
             '  pipeline_taxonomy.tsv       All datasets merged; pass to --taxa-assignments\n'
             '  preclassify_summary.txt     Plain-text summary with usage examples\n\n'
             'Example:\n'
-            '  relict preclassify \\\n'
+            '  phyloselect preclassify \\\n'
             '    --dataset hungate16s=/data/hungate.fasta \\\n'
             '    --dataset silva=/data/silva_16s.fasta \\\n'
             '    --ref /data/gtdb_ssu_reps.fna \\\n'
-            '    --taxa /data/gtdb_taxonomy.tsv \\\n'
+            '    --taxa /data/gtdb_taxonomy.tsv.gz \\\n'
             '    --threads 8 -o preclassify_out/\n\n'
             'Then use the output in a preload:\n'
-            '  relict preload --fasta hungate.fasta \\\n'
+            '  phyloselect preload --fasta hungate.fasta \\\n'
             '    --taxa-assignments preclassify_out/pipeline_taxonomy.tsv \\\n'
             '    --db project.db --dataset Hungate -o preload_out/'
         ),
@@ -2167,7 +3100,7 @@ def build_parser():
     )
     preclassify.add_argument(
         '--taxa', required=False, default=None,
-        help='Tab-separated taxonomy file matching the IDs in --ref (id<TAB>lineage). '
+        help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage). '
              'If omitted, taxonomy is parsed directly from reference FASTA headers.',
     )
     preclassify.add_argument(
@@ -2215,7 +3148,7 @@ def build_parser():
 
 def cmd_preclassify(args):
     """Handler for the ``preclassify`` subcommand."""
-    from relict.pipeline import preclassify as _preclassify_mod
+    from phyloselect.pipeline import preclassify as _preclassify_mod
 
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
@@ -2287,8 +3220,62 @@ def cmd_preclassify(args):
         f"  Pipeline taxonomy : {pipeline_tsv}\n"
         f"  Summary           : {os.path.join(outdir, 'preclassify_summary.txt')}\n\n"
         f"Use in preload:\n"
-        f"  relict preload --fasta <fasta> --taxa-assignments {pipeline_tsv} "
+        f"  phyloselect preload --fasta <fasta> --taxa-assignments {pipeline_tsv} "
         f"--db project.db --dataset <name> -o preload_out/"
+    )
+
+
+def cmd_sanger(args):
+    """Handler for the ``sanger`` / ``ab1`` subcommand."""
+    from phyloselect.pipeline import sanger as _sanger_mod
+
+    outdir = args.out
+    os.makedirs(outdir, exist_ok=True)
+    _configure_logging(outdir)
+    primers = getattr(args, 'primers', None) or _sanger_mod.DEFAULT_PRIMERS
+    inputs = getattr(args, 'input', None) or []
+    sample_map = getattr(args, 'sample_map', None)
+    read_metadata = getattr(args, 'read_metadata', None)
+    if not inputs and not sample_map and not read_metadata:
+        raise SystemExit('[sanger] Provide --input and/or --sample-map/--read-metadata.')
+    outputs = _sanger_mod.run_sanger(
+        inputs,
+        outdir,
+        read_metadata=read_metadata,
+        sample_map=sample_map,
+        primers=primers,
+        min_quality=int(getattr(args, 'min_quality', 20) or 20),
+        window=int(getattr(args, 'window', 20) or 20),
+        min_length=int(getattr(args, 'min_length', 800) or 800),
+        min_read_length=getattr(args, 'min_read_length', None),
+        min_mean_quality=float(getattr(args, 'min_mean_quality', 25.0) or 25.0),
+        mask_quality=int(getattr(args, 'mask_quality', 20) or 20),
+        max_read_expected_errors=float(getattr(args, 'max_read_expected_errors', 8.0) or 8.0),
+        max_output_expected_errors=float(getattr(args, 'max_output_expected_errors', 5.0) or 5.0),
+        max_n_percent=float(getattr(args, 'max_n_percent', 1.0) or 1.0),
+        max_internal_low_quality_run=int(getattr(args, 'max_internal_low_quality_run', 20) or 20),
+        max_conflict_density=float(getattr(args, 'max_conflict_density', 1.0) or 1.0),
+        quality_difference=int(getattr(args, 'quality_difference', 10) or 10),
+        allow_missing_quality=bool(getattr(args, 'allow_missing_quality', False)),
+        min_overlap=int(getattr(args, 'min_overlap', 40) or 40),
+        min_overlap_identity=float(getattr(args, 'min_overlap_identity', 0.85) or 0.85),
+        assemble=bool(getattr(args, 'assemble', True)),
+        recursive=bool(getattr(args, 'recursive', True)),
+    )
+    logging.getLogger(__name__).info("[SANGER] Final assembled FASTA: %s", outputs['assembled_fasta'])
+    print(
+        "[sanger] Done.\n"
+        f"  Assembled FASTA : {outputs['assembled_fasta']}\n"
+        f"  Trimmed reads   : {outputs['trimmed_fasta']}\n"
+        f"  Read QC         : {outputs['read_qc_tsv']}\n"
+        f"  Per-base errors : {outputs['per_base_error_tsv']}\n"
+        f"  Assembly report : {outputs['assembly_tsv']}\n\n"
+        f"  Resequence list : {outputs['recommendations_tsv']}\n"
+        f"  QC policy       : {outputs['qc_policy_tsv']}\n\n"
+        f"  Read visual     : {outputs['read_error_svg']}\n"
+        f"  Assembly visual : {outputs['assembly_svg']}\n\n"
+        "Use in evaluate:\n"
+        f"  phyloselect evaluate --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
     )
 
 
@@ -2297,7 +3284,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == 'preload':
         cmd_preload(args)
-    elif args.command == 'run':
+    elif args.command in ('run', 'evaluate', 'eval'):
         cmd_run(args)
     elif args.command == 'regen-itol':
         cmd_regen_itol(args)
@@ -2305,10 +3292,11 @@ def main(argv=None):
         cmd_subtree(args)
     elif args.command == 'preclassify':
         cmd_preclassify(args)
+    elif args.command in ('sanger', 'ab1', 'ab1-to-fasta'):
+        cmd_sanger(args)
     else:
         parser.print_help()
 
 
 if __name__ == '__main__':
     main()
-

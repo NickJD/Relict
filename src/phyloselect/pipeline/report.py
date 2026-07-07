@@ -1,5 +1,5 @@
 """
-report.py — Final summary report generation for Relict.
+report.py — Final summary report generation for PhyloSelect.
 """
 import logging
 

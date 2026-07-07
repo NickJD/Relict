@@ -1,10 +1,10 @@
 import sqlite3
-from relict.db.schema import SCHEMA
+from phyloselect.db.schema import SCHEMA
 from pathlib import Path
-from relict.utils.fasta import write_fasta
+from phyloselect.utils.fasta import write_fasta
 import hashlib
 import logging
-from relict.taxonomy import canonicalize_sequence_id, parse_taxon_string
+from phyloselect.taxonomy import canonicalize_sequence_id, parse_taxon_string
 
 
 class Database:
@@ -14,6 +14,12 @@ class Database:
         self.path = path
 
     def connect(self):
+        if self.path != ':memory:':
+            db_path = Path(self.path).expanduser()
+            parent = db_path.parent
+            if parent and str(parent) not in ('', '.'):
+                parent.mkdir(parents=True, exist_ok=True)
+            return sqlite3.connect(str(db_path))
         return sqlite3.connect(self.path)
 
     def initialise(self):
@@ -97,20 +103,34 @@ class Database:
             except Exception:
                 pass
 
+            # sequencing_metadata: rolling per-sequence status for WGS/full-genome selection
+            cur.execute("PRAGMA table_info(sequencing_metadata)")
+            if not cur.fetchall():
+                try:
+                    cur.execute(
+                        "CREATE TABLE IF NOT EXISTS sequencing_metadata "
+                        "(id TEXT PRIMARY KEY, partner_id TEXT, dataset TEXT, "
+                        "selected_for_wgs INTEGER DEFAULT 0, source_id TEXT, "
+                        "source_file TEXT, raw_selected_value TEXT)"
+                    )
+                    conn.commit()
+                except Exception:
+                    pass
+
 
     def get_input_ids(self, fasta):
-        from relict.utils.fasta import read_fasta
+        from phyloselect.utils.fasta import read_fasta
         return [h for h, _ in read_fasta(fasta)]
 
-    def preload_from_files(self, fasta_path, taxa_tsv=None, color_csv=None, source='preload', dataset='preload', outdir=None, shorten_ids=True):
+    def preload_from_files(self, fasta_path, taxa_tsv=None, color_csv=None, source='preload', dataset='preload', outdir=None, shorten_ids=False):
         """Preload sequences (and optionally taxonomy/colors) into the DB.
 
         - fasta_path: FASTA file of reference sequences to add
-        - taxa_tsv: optional TSV mapping FeatureID -> Taxon -> Confidence
+        - taxa_tsv: optional TSV/CSV mapping FeatureID -> Taxon -> Confidence
         - color_csv: optional CSV with id,color to set explicit colors
         - source: string to record as the source for inserted colors
         """
-        from relict.utils.fasta import read_fasta
+        from phyloselect.utils.fasta import read_fasta
         self.logger.info("[DB][PRELOAD] Reading fasta %s", fasta_path)
         records = [(h, s) for h, s in read_fasta(fasta_path)]
         self.logger.info("[DB][PRELOAD] Read %d records from %s", len(records), fasta_path)
@@ -120,7 +140,8 @@ class Database:
         orig_to_short = {}
         records_to_insert = []
         if records:
-            # assign deterministic short IDs (3 letters + 2 digits) per original header
+            # assign runtime IDs. By default these are the supplied headers;
+            # --shorten-ids requests deterministic compact IDs.
 
             # When not shortening IDs, only check for collisions *within* the current
             # input batch — collisions against already-stored DB IDs are fine because
@@ -130,17 +151,17 @@ class Database:
                 if shorten_ids:
                     effective_id = self.choose_effective_sequence_id(orig_h, used_ids, shorten_ids=True)
                 else:
-                    cid = self._canonical_from_header(orig_h)
-                    if not cid:
-                        raise ValueError(f"Could not derive a canonical ID from header: {orig_h!r}")
-                    if cid in batch_ids:
+                    provided_id = self._provided_id_from_header(orig_h)
+                    if not provided_id:
+                        raise ValueError(f"Could not derive an ID from header: {orig_h!r}")
+                    if provided_id in batch_ids:
                         raise ValueError(
-                            f"Duplicate ID in input while --no-shorten-ids is active: {cid!r}. "
+                            f"Duplicate ID in input while ID shortening is disabled: {provided_id!r}. "
                             "Ensure all input FASTA headers are unique."
                         )
-                    batch_ids.add(cid)
-                    used_ids.add(cid)
-                    effective_id = cid
+                    batch_ids.add(provided_id)
+                    used_ids.add(provided_id)
+                    effective_id = provided_id
                 records_to_insert.append((effective_id, seq))
                 orig_to_short[orig_h] = effective_id
 
@@ -152,10 +173,10 @@ class Database:
                     self.logger.info("[DB][PRELOAD] Inserting %d sequences into DB (dataset=%s)", len(records_to_insert), dataset)
                     seq_rows = []
                     for sid, seq in records_to_insert:
-                        cid = self._canonical_from_header(sid)
-                        if cid is None:
+                        rid = self._provided_id_from_header(sid)
+                        if rid is None:
                             continue
-                        seq_rows.append((cid, seq, len(seq), dataset))
+                        seq_rows.append((rid, seq, len(seq), dataset))
                     cur.executemany("INSERT OR IGNORE INTO sequences (id, sequence, length, dataset) VALUES (?, ?, ?, ?)", seq_rows)
                     if alias_entries:
                         cur.executemany("INSERT OR REPLACE INTO seq_aliases (canonical_id, original_header) VALUES (?, ?)", alias_entries)
@@ -167,28 +188,13 @@ class Database:
                 if alias_entries:
                     self.insert_aliases(alias_entries)
 
-        # load taxonomy TSV if provided
+        # load taxonomy TSV/CSV if provided
         if taxa_tsv:
-            self.logger.info("[DB][PRELOAD] Loading taxa TSV %s", taxa_tsv)
+            self.logger.info("[DB][PRELOAD] Loading taxa table %s", taxa_tsv)
             tax_entries = []
-            import gzip
-            open_fn = gzip.open if str(taxa_tsv).endswith('.gz') else open
-            with open_fn(taxa_tsv, 'rt') as t:
-                # skip header if present
-                first = t.readline()
-                if 'Feature' in first or 'Taxon' in first:
-                    pass
-                else:
-                    parts = first.strip().split('\t')
-                    if len(parts) >= 2:
-                        tax_entries.append((parts[0], parts[1], float(parts[2]) if len(parts) > 2 else None))
-                for line in t:
-                    parts = line.strip().split('\t')
-                    if len(parts) < 2:
-                        continue
-                    conf = float(parts[2]) if len(parts) > 2 else None
-                    fid = parts[0]
-                    tax_entries.append((fid, parts[1], conf))
+            from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
+            for row in iter_taxonomy_assignment_rows(taxa_tsv):
+                tax_entries.append((row.get('id'), row.get('taxonomy'), row.get('confidence')))
             if tax_entries:
                 # We only want taxonomy rows for sequences present in the provided FASTA
                 # Build a canonical->short map for the records we just loaded so we only
@@ -224,7 +230,7 @@ class Database:
 
                     mapped.append((sid, tax, conf, dataset))
 
-                self.logger.info("[DB][PRELOAD] Taxa TSV contained %d rows; %d mapped to this dataset, %d skipped", len(tax_entries), len(mapped), skipped)
+                self.logger.info("[DB][PRELOAD] Taxa table contained %d rows; %d mapped to this dataset, %d skipped", len(tax_entries), len(mapped), skipped)
 
                 if mapped:
                     try:
@@ -258,7 +264,7 @@ class Database:
         # if no color entries, derive colors from taxonomy/genus
         if not color_entries:
             try:
-                from relict.pipeline.itol import _name_to_color
+                from phyloselect.pipeline.itol import _name_to_color
                 with self.connect() as conn:
                     cur = conn.cursor()
                     # restrict color derivation to taxonomy rows for this dataset only
@@ -297,7 +303,7 @@ class Database:
                 self.logger.warning("[DB][PRELOAD] Bulk color insert failed: %s; falling back", e)
                 self.insert_colors(color_entries)
 
-        # write mapped fasta (short IDs) to outdir if requested so callers can avoid exporting from DB
+        # write mapped FASTA with runtime IDs to outdir if requested so callers can avoid exporting from DB
         mapped_fasta_path = None
         if outdir and records_to_insert:
             try:
@@ -305,7 +311,7 @@ class Database:
                 p.mkdir(parents=True, exist_ok=True)
                 mapped_fasta_path = str(p / f"preload_{dataset}_seqs.fasta")
                 write_fasta([(short, seq) for short, seq in records_to_insert], mapped_fasta_path)
-                self.logger.info("[DB][PRELOAD] Wrote mapped fasta with short IDs to %s", mapped_fasta_path)
+                self.logger.info("[DB][PRELOAD] Wrote mapped fasta with runtime IDs to %s", mapped_fasta_path)
             except Exception as e:
                 self.logger.warning("[DB][PRELOAD] Failed to write mapped fasta to outdir: %s", e)
 
@@ -402,28 +408,89 @@ class Database:
                 return sid
             i += 1
 
-    def choose_effective_sequence_id(self, header: str, used_set: set, shorten_ids: bool = True):
+    def choose_effective_sequence_id(self, header: str, used_set: set, shorten_ids: bool = False):
         """Return the runtime ID to use for a sequence.
 
         When `shorten_ids` is True, generate a deterministic compact ID.
-        Otherwise, use the canonicalized source ID directly and fail fast on
-        collisions so users do not silently merge distinct records.
+        Otherwise, use the source FASTA header exactly as supplied (trimmed)
+        and fail fast on exact collisions so users do not silently merge
+        distinct records.
         """
         if shorten_ids:
             return self.generate_short_id(header, used_set)
-        cid = self._canonical_from_header(header)
-        if not cid:
-            raise ValueError(f"Could not derive a canonical ID from header: {header!r}")
-        if cid in used_set:
+        provided_id = self._provided_id_from_header(header)
+        if not provided_id:
+            raise ValueError(f"Could not derive an ID from header: {header!r}")
+        if provided_id in used_set:
             raise ValueError(
-                f"Canonical ID collision while --no-shorten-ids is active: {cid!r}. "
-                "Use unique input IDs or re-run with ID shortening enabled."
+                f"ID collision while ID shortening is disabled: {provided_id!r}. "
+                "Use unique input IDs or re-run with --shorten-ids."
             )
-        used_set.add(cid)
-        return cid
+        used_set.add(provided_id)
+        return provided_id
+
+    def _provided_id_from_header(self, header: str) -> str:
+        if header is None:
+            return None
+        value = str(header).strip()
+        return value or None
 
     def _canonical_from_header(self, header: str) -> str:
         return canonicalize_sequence_id(header)
+
+    def _candidate_ids_for_lookup(self, sid):
+        candidates = []
+        raw = self._provided_id_from_header(sid)
+        if raw:
+            candidates.append(raw)
+        try:
+            cid = self._canonical_from_header(sid)
+        except Exception:
+            cid = None
+        if cid and cid not in candidates:
+            candidates.append(cid)
+        return candidates
+
+    def resolve_sequence_id(self, sid):
+        """Resolve a user/reference identifier to an existing sequence-table ID."""
+        candidates = self._candidate_ids_for_lookup(sid)
+        if not candidates:
+            return None
+        with self.connect() as conn:
+            cur = conn.cursor()
+            for cand in candidates:
+                cur.execute("SELECT id FROM sequences WHERE id = ? LIMIT 1", (cand,))
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+            for cand in candidates:
+                cur.execute(
+                    "SELECT canonical_id FROM seq_aliases WHERE original_header = ? OR canonical_id = ? LIMIT 1",
+                    (cand, cand),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+        return None
+
+    def _resolve_sequence_id_with_cursor(self, cur, sid):
+        candidates = self._candidate_ids_for_lookup(sid)
+        if not candidates:
+            return None
+        for cand in candidates:
+            cur.execute("SELECT id FROM sequences WHERE id = ? LIMIT 1", (cand,))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+        for cand in candidates:
+            cur.execute(
+                "SELECT canonical_id FROM seq_aliases WHERE original_header = ? OR canonical_id = ? LIMIT 1",
+                (cand, cand),
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0]
+        return None
 
 
     def insert_taxonomy_alt(self, alt_entries):
@@ -437,10 +504,8 @@ class Database:
             to_insert = []
             for entry in alt_entries:
                 sid, ref_db, tax, conf, best_hit, identity = entry
-                cid = self._canonical_from_header(sid) if sid else None
-                key = cid or sid
-                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
-                if cur.fetchone():
+                key = self._resolve_sequence_id_with_cursor(cur, sid)
+                if key:
                     to_insert.append((key, ref_db, tax, conf, best_hit, identity))
             if to_insert:
                 cur.executemany(
@@ -489,12 +554,12 @@ class Database:
         with self.connect() as conn:
             cur = conn.cursor()
             for sid, seq in records:
-                cid = self._canonical_from_header(sid)
-                if cid is None:
+                rid = self._provided_id_from_header(sid)
+                if rid is None:
                     continue
                 cur.execute("INSERT OR IGNORE INTO sequences (id, sequence, length, dataset) VALUES (?, ?, ?, ?)",
-                            (cid, seq, len(seq), dataset))
-                alias_entries.append((cid, sid))
+                            (rid, seq, len(seq), dataset))
+                alias_entries.append((rid, sid))
             conn.commit()
         if alias_entries:
             # store alias mappings
@@ -519,11 +584,9 @@ class Database:
                 else:
                     sid, tax, conf, ds = entry
                     ds = ds or ''
-                cid = self._canonical_from_header(sid) if sid is not None else None
-                key = cid or sid
+                key = self._resolve_sequence_id_with_cursor(cur, sid)
                 # ensure this id was provided by the user (exists in sequences)
-                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
-                if cur.fetchone():
+                if key:
                     to_insert.append((key, tax, conf, ds))
                 else:
                     skipped += 1
@@ -552,17 +615,13 @@ class Database:
                 else:
                     sid, ds, nearest, identity = entry
                     ds = ds or ''
-                cid = self._canonical_from_header(sid) if sid is not None else None
-                key = cid or sid
+                key = self._resolve_sequence_id_with_cursor(cur, sid)
                 # Only insert if the id exists in sequences
-                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
-                if not cur.fetchone():
+                if not key:
                     skipped += 1
                     continue
-                n_cid = None
-                if nearest is not None:
-                    n_cid = self._canonical_from_header(nearest)
-                to_insert.append((key, ds, n_cid or nearest, identity))
+                nearest_key = self._resolve_sequence_id_with_cursor(cur, nearest) if nearest is not None else None
+                to_insert.append((key, ds, nearest_key or nearest, identity))
             if to_insert:
                 cur.executemany("INSERT OR REPLACE INTO distances (id, dataset, nearest, identity) VALUES (?, ?, ?, ?)", to_insert)
             conn.commit()
@@ -587,10 +646,8 @@ class Database:
                 else:
                     sid, color, source, ds = entry
                     ds = ds or ''
-                cid = self._canonical_from_header(sid) if sid is not None else None
-                key = cid or sid
-                cur.execute("SELECT 1 FROM sequences WHERE id = ? LIMIT 1", (key,))
-                if cur.fetchone():
+                key = self._resolve_sequence_id_with_cursor(cur, sid)
+                if key:
                     to_insert.append((key, color, source, ds))
                 else:
                     skipped += 1
@@ -612,4 +669,70 @@ class Database:
             rows = cur.fetchall()
         return {r[0]: r[1] for r in rows}
 
+    def upsert_sequencing_metadata(self, metadata_rows):
+        """Insert/update rolling partner WGS-selection metadata.
 
+        Each row can be a dict with keys: id, partner_id, dataset,
+        selected_for_wgs, source_id, source_file, raw_selected_value.
+        """
+        rows = []
+        with self.connect() as conn:
+            cur = conn.cursor()
+            for row in metadata_rows:
+                sid = row.get('id') if isinstance(row, dict) else None
+                key = self._resolve_sequence_id_with_cursor(cur, sid) or self._provided_id_from_header(sid)
+                if not key:
+                    continue
+                rows.append((
+                    key,
+                    row.get('partner_id') or key,
+                    row.get('dataset') or '',
+                    1 if bool(row.get('selected_for_wgs')) else 0,
+                    row.get('source_id') or sid,
+                    row.get('source_file') or '',
+                    row.get('raw_selected_value') if row.get('raw_selected_value') is not None else '',
+                ))
+            if rows:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO sequencing_metadata "
+                    "(id, partner_id, dataset, selected_for_wgs, source_id, source_file, raw_selected_value) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+            conn.commit()
+        return len(rows)
+
+    def get_sequencing_metadata_for_ids(self, ids=None):
+        with self.connect() as conn:
+            cur = conn.cursor()
+            if ids:
+                resolved = []
+                for sid in ids:
+                    key = self._resolve_sequence_id_with_cursor(cur, sid)
+                    if key and key not in resolved:
+                        resolved.append(key)
+                if not resolved:
+                    return {}
+                placeholders = ','.join('?' for _ in resolved)
+                cur.execute(
+                    f"SELECT id, partner_id, dataset, selected_for_wgs, source_id, source_file, raw_selected_value "
+                    f"FROM sequencing_metadata WHERE id IN ({placeholders})",
+                    tuple(resolved),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, partner_id, dataset, selected_for_wgs, source_id, source_file, raw_selected_value "
+                    "FROM sequencing_metadata"
+                )
+            rows = cur.fetchall()
+        return {
+            rid: {
+                'partner_id': partner_id or rid,
+                'dataset': dataset or '',
+                'selected_for_wgs': bool(selected_for_wgs),
+                'source_id': source_id or rid,
+                'source_file': source_file or '',
+                'raw_selected_value': raw_selected_value or '',
+            }
+            for rid, partner_id, dataset, selected_for_wgs, source_id, source_file, raw_selected_value in rows
+        }

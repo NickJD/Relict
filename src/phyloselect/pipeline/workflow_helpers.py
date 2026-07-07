@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import gzip
 import os
+import csv
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-from relict.taxonomy import parse_reference_header_taxonomy, taxonomy_matches_kingdom
-from relict.utils.fasta import read_fasta
+from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
+from phyloselect.taxonomy import parse_reference_header_taxonomy, taxonomy_matches_kingdom
+from phyloselect.utils.fasta import read_fasta
 
 
 ClassificationRow = Dict[str, object]
@@ -95,10 +97,11 @@ def iter_classification_rows(classification_tsv: str) -> Iterator[Classification
 
 
 def iter_assignment_rows(assignments_path: str, source_fasta_path: Optional[str] = None) -> Iterator[dict[str, object]]:
-    """Yield normalized taxonomy-assignment rows from TSV or FASTA headers.
+    """Yield normalized taxonomy-assignment rows from table files or FASTA headers.
 
     If `assignments_path` is the same file as `source_fasta_path`, taxonomy is
-    parsed from GTDB-style FASTA headers.
+    parsed from GTDB-style FASTA headers. Otherwise TSV/CSV and .gz variants are
+    parsed as ID-to-taxonomy assignment tables.
     """
     use_fasta_headers = _assignment_source_is_fasta(assignments_path, source_fasta_path=source_fasta_path)
 
@@ -112,22 +115,12 @@ def iter_assignment_rows(assignments_path: str, source_fasta_path: Optional[str]
             }
         return
 
-    with open(assignments_path) as tf:
-        for line in tf:
-            if not line.strip():
-                continue
-            parts = line.rstrip('\n').split('\t')
-            if not parts:
-                continue
-            try:
-                conf = float(parts[2]) if len(parts) > 2 and parts[2] not in ('', 'NA') else None
-            except Exception:
-                conf = None
-            yield {
-                'qid': parts[0],
-                'tax': parts[1] if len(parts) > 1 else None,
-                'confidence': conf,
-            }
+    for row in iter_taxonomy_assignment_rows(assignments_path):
+        yield {
+            'qid': row.get('id'),
+            'tax': row.get('taxonomy'),
+            'confidence': row.get('confidence'),
+        }
 
 
 def load_taxonomy_entries_from_assignments(taxa_file: str, orig_to_short: Dict[str, str], db, dataset: str, source_fasta_path: Optional[str] = None):
@@ -362,31 +355,84 @@ def build_sequence_assessment_rows(
     ClusterSize         : number of sequences in this cluster (1 if singleton).
     ClusteredMembers    : semi-colon-separated list of member IDs (empty for singletons).
     """
+    run_id_set = {str(iid) for iid in run_ids}
     class_by_id = {}
     for row in iter_classification_rows(class_out):
-        mapped = resolve_short_id(str(row['qid']), orig_to_short, db)
+        qid = str(row['qid'])
+        mapped = resolve_short_id(qid, orig_to_short, db)
+        if not mapped and qid in run_id_set:
+            mapped = qid
         if mapped:
             class_by_id[mapped] = row
 
     novelty_by_id = {}
     try:
         with open(novelty_metrics_tsv) as fh:
-            next(fh, None)
-            for line in fh:
-                parts = line.rstrip('\n').split('\t')
-                if len(parts) < 10:
+            reader = csv.DictReader(fh, delimiter='\t')
+            for row in reader:
+                qid = row.get('ID') or row.get('id')
+                if not qid:
                     continue
-                novelty_by_id[parts[0]] = {
-                    'nearest_identity': parts[1],
-                    'nearest_hit': parts[2],
-                    'novel': parts[3],
-                    'matches_ge_99': parts[4],
-                    'matches_ge_97': parts[5],
-                    'matches_ge_95': parts[6],
-                    'novelty_score': parts[7],
-                    'crowding': parts[8],
-                    'sequencing_priority': parts[9],
-                    'density_source': parts[10] if len(parts) > 10 else 'NA',
+
+                def val(*names, default='NA'):
+                    for name in names:
+                        got = row.get(name)
+                        if got not in (None, ''):
+                            return got
+                    return default
+
+                baseline_source = row.get('BaselineDensitySource') or ''
+                baseline_available = baseline_source not in ('', 'none', 'NA')
+
+                def primary_val(baseline_name, fallback_name, default='NA'):
+                    if baseline_available:
+                        got = row.get(baseline_name)
+                        if got not in (None, ''):
+                            return got
+                    return val(fallback_name, default=default)
+
+                novelty_by_id[qid] = {
+                    'nearest_identity': primary_val('BaselineNearestIdentity', 'NearestIdentity'),
+                    'nearest_hit': primary_val('BaselineNearestHit', 'NearestHit'),
+                    'novel': primary_val('BaselineNovel', 'Novel'),
+                    'matches_ge_99': primary_val('BaselineMatchesGE99', 'MatchesGE99'),
+                    'matches_ge_97': primary_val('BaselineMatchesGE97', 'MatchesGE97'),
+                    'matches_ge_95': primary_val('BaselineMatchesGE95', 'MatchesGE95'),
+                    'novelty_score': primary_val('BaselineNoveltyScore', 'NoveltyScore'),
+                    'crowding': primary_val('BaselineCrowding', 'Crowding'),
+                    'sequencing_priority': primary_val('BaselineSequencingPriority', 'SequencingPriority'),
+                    'density_source': primary_val('BaselineDensitySource', 'DensitySource'),
+                    'all_known_nearest_identity': val('AllKnownNearestIdentity', 'NearestIdentity'),
+                    'all_known_nearest_hit': val('AllKnownNearestHit', 'NearestHit'),
+                    'all_known_novel': val('AllKnownNovel', 'Novel'),
+                    'all_known_matches_ge_99': val('AllKnownMatchesGE99', 'MatchesGE99'),
+                    'all_known_matches_ge_97': val('AllKnownMatchesGE97', 'MatchesGE97'),
+                    'all_known_matches_ge_95': val('AllKnownMatchesGE95', 'MatchesGE95'),
+                    'all_known_novelty_score': val('AllKnownNoveltyScore', 'NoveltyScore'),
+                    'all_known_crowding': val('AllKnownCrowding', 'Crowding'),
+                    'all_known_sequencing_priority': val('AllKnownSequencingPriority', 'SequencingPriority'),
+                    'all_known_density_source': val('AllKnownDensitySource', 'DensitySource'),
+                    'reference_nearest_identity': val('ReferenceNearestIdentity'),
+                    'reference_nearest_hit': val('ReferenceNearestHit'),
+                    'reference_novel': val('ReferenceNovel'),
+                    'reference_matches_ge_99': val('ReferenceMatchesGE99'),
+                    'reference_matches_ge_97': val('ReferenceMatchesGE97'),
+                    'reference_matches_ge_95': val('ReferenceMatchesGE95'),
+                    'reference_novelty_score': val('ReferenceNoveltyScore'),
+                    'reference_crowding': val('ReferenceCrowding'),
+                    'reference_sequencing_priority': val('ReferenceSequencingPriority'),
+                    'reference_density_source': val('ReferenceDensitySource'),
+                    'partner_id': val('PartnerID'),
+                    'selected_for_genome_sequencing': val('SelectedForGenomeSequencing'),
+                    'nearest_selected_genome_hit': val('NearestSelectedGenomeHit'),
+                    'nearest_selected_genome_identity': val('NearestSelectedGenomeIdentity'),
+                    'selected_genome_matches_ge_99': val('SelectedGenomeMatchesGE99'),
+                    'selected_genome_matches_ge_97': val('SelectedGenomeMatchesGE97'),
+                    'selected_genome_matches_ge_95': val('SelectedGenomeMatchesGE95'),
+                    'clade_already_selected_for_genome_sequencing': val('CladeAlreadySelectedForGenomeSequencing'),
+                    'genome_sequencing_adjusted_novelty_score': val('GenomeSequencingAdjustedNoveltyScore'),
+                    'genome_sequencing_adjusted_priority': val('GenomeSequencingAdjustedPriority'),
+                    'genome_sequencing_metadata_source': val('GenomeSequencingMetadataSource'),
                 }
     except FileNotFoundError:
         import logging as _logging
@@ -394,6 +440,39 @@ def build_sequence_assessment_rows(
             "[ASSESSMENT] Novelty metrics file not found: %s — novelty columns will be NA",
             novelty_metrics_tsv,
         )
+
+    nearest_meta = {}
+    nearest_ids = sorted({
+        str(row.get('nearest_hit'))
+        for row in novelty_by_id.values()
+        if row.get('nearest_hit') not in (None, '', 'NA')
+    } | {
+        str(row.get('all_known_nearest_hit'))
+        for row in novelty_by_id.values()
+        if row.get('all_known_nearest_hit') not in (None, '', 'NA')
+    } | {
+        str(row.get('reference_nearest_hit'))
+        for row in novelty_by_id.values()
+        if row.get('reference_nearest_hit') not in (None, '', 'NA')
+    })
+    if nearest_ids:
+        try:
+            with db.connect() as conn:
+                cur = conn.cursor()
+                placeholders = ','.join('?' for _ in nearest_ids)
+                cur.execute(
+                    "SELECT s.id, s.dataset, t.taxonomy "
+                    "FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id "
+                    f"WHERE s.id IN ({placeholders})",
+                    tuple(nearest_ids),
+                )
+                for hit_id, dataset, taxonomy in cur.fetchall():
+                    nearest_meta[str(hit_id)] = {
+                        'dataset': dataset or 'NA',
+                        'taxonomy': taxonomy or 'NA',
+                    }
+        except Exception:
+            nearest_meta = {}
 
     warnings_by_id = {row['id']: row for row in placement_warning_rows}
 
@@ -446,6 +525,10 @@ def build_sequence_assessment_rows(
         _ident = c.get('identity')
         _best = c.get('best')
         _tax = c.get('tax')
+        reference_hit = n.get('reference_nearest_hit', 'NA')
+        reference_hit_taxonomy = nearest_meta.get(str(reference_hit), {}).get('taxonomy', 'NA')
+        if reference_hit not in (None, '', 'NA', 'None') and _best is not None and str(reference_hit) == str(_best):
+            reference_hit_taxonomy = _tax if _tax is not None else 'NA'
 
         # If a sequence is not in the tree and was not collapsed, it was
         # removed as an exact duplicate during the dereplication step.
@@ -461,6 +544,8 @@ def build_sequence_assessment_rows(
             'classification_confidence': _conf if _conf is not None else 'NA',
             # NearestHit = best vsearch hit among PRELOAD sequences already in the DB → drives NoveltyScore
             'nearest_hit': n.get('nearest_hit', 'NA'),
+            'nearest_hit_dataset': nearest_meta.get(str(n.get('nearest_hit')), {}).get('dataset', 'NA'),
+            'nearest_hit_taxonomy': nearest_meta.get(str(n.get('nearest_hit')), {}).get('taxonomy', 'NA'),
             'nearest_identity': n.get('nearest_identity', 'NA'),
             'matches_ge_99': n.get('matches_ge_99', 'NA'),
             'matches_ge_97': n.get('matches_ge_97', 'NA'),
@@ -468,6 +553,39 @@ def build_sequence_assessment_rows(
             'novelty_score': n.get('novelty_score', 'NA'),
             'crowding': n.get('crowding', 'NA'),
             'sequencing_priority': n.get('sequencing_priority', 'NA'),
+            'density_source': n.get('density_source', 'NA'),
+            'all_known_nearest_hit': n.get('all_known_nearest_hit', 'NA'),
+            'all_known_nearest_hit_dataset': nearest_meta.get(str(n.get('all_known_nearest_hit')), {}).get('dataset', 'NA'),
+            'all_known_nearest_hit_taxonomy': nearest_meta.get(str(n.get('all_known_nearest_hit')), {}).get('taxonomy', 'NA'),
+            'all_known_nearest_identity': n.get('all_known_nearest_identity', 'NA'),
+            'all_known_matches_ge_99': n.get('all_known_matches_ge_99', 'NA'),
+            'all_known_matches_ge_97': n.get('all_known_matches_ge_97', 'NA'),
+            'all_known_matches_ge_95': n.get('all_known_matches_ge_95', 'NA'),
+            'all_known_novelty_score': n.get('all_known_novelty_score', 'NA'),
+            'all_known_crowding': n.get('all_known_crowding', 'NA'),
+            'all_known_sequencing_priority': n.get('all_known_sequencing_priority', 'NA'),
+            'all_known_density_source': n.get('all_known_density_source', 'NA'),
+            'reference_nearest_hit': reference_hit,
+            'reference_nearest_hit_taxonomy': reference_hit_taxonomy,
+            'reference_nearest_identity': n.get('reference_nearest_identity', 'NA'),
+            'reference_matches_ge_99': n.get('reference_matches_ge_99', 'NA'),
+            'reference_matches_ge_97': n.get('reference_matches_ge_97', 'NA'),
+            'reference_matches_ge_95': n.get('reference_matches_ge_95', 'NA'),
+            'reference_novelty_score': n.get('reference_novelty_score', 'NA'),
+            'reference_crowding': n.get('reference_crowding', 'NA'),
+            'reference_sequencing_priority': n.get('reference_sequencing_priority', 'NA'),
+            'reference_density_source': n.get('reference_density_source', 'NA'),
+            'partner_id': n.get('partner_id', 'NA'),
+            'selected_for_genome_sequencing': n.get('selected_for_genome_sequencing', 'NA'),
+            'nearest_selected_genome_hit': n.get('nearest_selected_genome_hit', 'NA'),
+            'nearest_selected_genome_identity': n.get('nearest_selected_genome_identity', 'NA'),
+            'selected_genome_matches_ge_99': n.get('selected_genome_matches_ge_99', 'NA'),
+            'selected_genome_matches_ge_97': n.get('selected_genome_matches_ge_97', 'NA'),
+            'selected_genome_matches_ge_95': n.get('selected_genome_matches_ge_95', 'NA'),
+            'clade_already_selected_for_genome_sequencing': n.get('clade_already_selected_for_genome_sequencing', 'NA'),
+            'genome_sequencing_adjusted_novelty_score': n.get('genome_sequencing_adjusted_novelty_score', 'NA'),
+            'genome_sequencing_adjusted_priority': n.get('genome_sequencing_adjusted_priority', 'NA'),
+            'genome_sequencing_metadata_source': n.get('genome_sequencing_metadata_source', 'NA'),
             'placement_flags': w.get('flags', ''),
             'in_tree': in_tree,
             'cluster_representative': cluster_rep,
@@ -520,10 +638,27 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
         — from the primary REFERENCE DATABASE (GTDB, SILVA, etc.).
           ClassificationHit is the specific reference accession vsearch matched.
 
-    NearestHit / NearestIdentity / MatchesGE* / NoveltyScore / Crowding / SequencingPriority
-        — from the PRELOAD sequences already stored in the DB.
+    NearestHit / NearestHitDataset / NearestHitTaxonomy / NearestIdentity / MatchesGE* / NoveltyScore / Crowding / SequencingPriority
+        — from the baseline/cultured sequences already stored in the DB
+          when a baseline pool is configured, otherwise from the all-known pool.
           NearestHit is the closest sequence YOU have previously submitted.
           These columns drive the novelty assessment.
+
+    AllKnownNearestHit / AllKnownNearestIdentity / AllKnownNoveltyScore / ...
+        — same novelty metrics against all non-current datasets stored in
+          the DB, so cultured-baseline novelty can be compared to wider
+          project-level novelty.
+
+    ReferenceNearestHit / ReferenceNearestIdentity / ReferenceNoveltyScore / ...
+        — same nearest-hit and density metrics against the selected external
+          reference FASTA, usually the main GTDB reference supplied with --ref.
+          This separates "closest cultured/project isolate" from "closest
+          taxonomic reference sequence".
+
+    PartnerID / SelectedForGenomeSequencing / NearestSelectedGenomeHit / ...
+        — rolling partner metadata and selected-for-WGS neighbourhood metrics.
+          If a nearby sequence at >=97% identity has already been selected for
+          WGS, the clade is marked as already represented.
 
     Taxonomy_<DB> / ClassificationHit_<DB> / Identity_<DB> / Confidence_<DB>  (repeated per alt-ref DB)
         — same information from each additional reference database supplied via
@@ -535,16 +670,31 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
 
     # Discover alt-db column groups from the first row that contains them
     alt_ref_safes: List[str] = []
+    include_mwl = False
     for row in rows:
         alt_ref_safes = sorted(
             k[len('alt_tax_'):]
             for k in row
             if k.startswith('alt_tax_')
         )
+        include_mwl = any(k.startswith('mwl_') or k == 'evaluation_score' for k in row)
         break
 
     with open(p, 'w') as fh:
         # ── Fixed columns ────────────────────────────────────────────────────
+        mwl_header = ''
+        if include_mwl:
+            mwl_header = (
+                '\tEvaluationScore'          # optional MWL-aware score; InvestigationScore blended with MWLScore
+                '\tMWLMatch'
+                '\tMWLID'
+                '\tMWLMatchedRank'
+                '\tMWLMatchedTaxon'
+                '\tMWLTaxonomicScore'
+                '\tMWLIdentity'
+                '\tMWLScore'
+                '\tMWLRole'
+            )
         base_header = (
             'ID'
             '\tTaxonomy'                    # primary ref DB  ─┐ classification
@@ -552,6 +702,8 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
             '\tClassificationIdentity'      # vsearch %id      │
             '\tClassificationConfidence'    # score 0–1       ─┘
             '\tNearestHit'                  # preload seq ─┐ novelty
+            '\tNearestHitDataset'           # dataset label │
+            '\tNearestHitTaxonomy'          # taxonomy      │
             '\tNearestIdentity'             # %id           │ (preload DB)
             '\tMatchesGE99'                 # density        │
             '\tMatchesGE97'                 #               │
@@ -559,8 +711,42 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
             '\tNoveltyScore'
             '\tCrowding'
             '\tSequencingPriority'
+            '\tDensitySource'
+            '\tAllKnownNearestHit'
+            '\tAllKnownNearestHitDataset'
+            '\tAllKnownNearestHitTaxonomy'
+            '\tAllKnownNearestIdentity'
+            '\tAllKnownMatchesGE99'
+            '\tAllKnownMatchesGE97'
+            '\tAllKnownMatchesGE95'
+            '\tAllKnownNoveltyScore'
+            '\tAllKnownCrowding'
+            '\tAllKnownSequencingPriority'
+            '\tAllKnownDensitySource'
+            '\tReferenceNearestHit'
+            '\tReferenceNearestHitTaxonomy'
+            '\tReferenceNearestIdentity'
+            '\tReferenceMatchesGE99'
+            '\tReferenceMatchesGE97'
+            '\tReferenceMatchesGE95'
+            '\tReferenceNoveltyScore'
+            '\tReferenceCrowding'
+            '\tReferenceSequencingPriority'
+            '\tReferenceDensitySource'
+            '\tPartnerID'
+            '\tSelectedForGenomeSequencing'
+            '\tNearestSelectedGenomeHit'
+            '\tNearestSelectedGenomeIdentity'
+            '\tSelectedGenomeMatchesGE99'
+            '\tSelectedGenomeMatchesGE97'
+            '\tSelectedGenomeMatchesGE95'
+            '\tCladeAlreadySelectedForGenomeSequencing'
+            '\tGenomeSequencingAdjustedNoveltyScore'
+            '\tGenomeSequencingAdjustedPriority'
+            '\tGenomeSequencingMetadataSource'
             '\tPhyloIsolation'              # normalised leaf branch length (0–1); higher = more isolated in tree
             '\tInvestigationScore'          # composite score (0–100) combining novelty + phylo isolation + density + taxonomy conflict
+            + mwl_header +
             '\tInTree'
             '\tClusterRepresentative'
             '\tClusterSize'
@@ -586,6 +772,8 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
                 f"\t{row['classification_identity']}"
                 f"\t{row['classification_confidence']}"
                 f"\t{row['nearest_hit']}"
+                f"\t{row.get('nearest_hit_dataset', 'NA')}"
+                f"\t{row.get('nearest_hit_taxonomy', 'NA')}"
                 f"\t{row['nearest_identity']}"
                 f"\t{row['matches_ge_99']}"
                 f"\t{row['matches_ge_97']}"
@@ -593,8 +781,55 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
                 f"\t{row['novelty_score']}"
                 f"\t{row['crowding']}"
                 f"\t{row['sequencing_priority']}"
+                f"\t{row.get('density_source', 'NA')}"
+                f"\t{row.get('all_known_nearest_hit', 'NA')}"
+                f"\t{row.get('all_known_nearest_hit_dataset', 'NA')}"
+                f"\t{row.get('all_known_nearest_hit_taxonomy', 'NA')}"
+                f"\t{row.get('all_known_nearest_identity', 'NA')}"
+                f"\t{row.get('all_known_matches_ge_99', 'NA')}"
+                f"\t{row.get('all_known_matches_ge_97', 'NA')}"
+                f"\t{row.get('all_known_matches_ge_95', 'NA')}"
+                f"\t{row.get('all_known_novelty_score', 'NA')}"
+                f"\t{row.get('all_known_crowding', 'NA')}"
+                f"\t{row.get('all_known_sequencing_priority', 'NA')}"
+                f"\t{row.get('all_known_density_source', 'NA')}"
+                f"\t{row.get('reference_nearest_hit', 'NA')}"
+                f"\t{row.get('reference_nearest_hit_taxonomy', 'NA')}"
+                f"\t{row.get('reference_nearest_identity', 'NA')}"
+                f"\t{row.get('reference_matches_ge_99', 'NA')}"
+                f"\t{row.get('reference_matches_ge_97', 'NA')}"
+                f"\t{row.get('reference_matches_ge_95', 'NA')}"
+                f"\t{row.get('reference_novelty_score', 'NA')}"
+                f"\t{row.get('reference_crowding', 'NA')}"
+                f"\t{row.get('reference_sequencing_priority', 'NA')}"
+                f"\t{row.get('reference_density_source', 'NA')}"
+                f"\t{row.get('partner_id', 'NA')}"
+                f"\t{row.get('selected_for_genome_sequencing', 'NA')}"
+                f"\t{row.get('nearest_selected_genome_hit', 'NA')}"
+                f"\t{row.get('nearest_selected_genome_identity', 'NA')}"
+                f"\t{row.get('selected_genome_matches_ge_99', 'NA')}"
+                f"\t{row.get('selected_genome_matches_ge_97', 'NA')}"
+                f"\t{row.get('selected_genome_matches_ge_95', 'NA')}"
+                f"\t{row.get('clade_already_selected_for_genome_sequencing', 'NA')}"
+                f"\t{row.get('genome_sequencing_adjusted_novelty_score', 'NA')}"
+                f"\t{row.get('genome_sequencing_adjusted_priority', 'NA')}"
+                f"\t{row.get('genome_sequencing_metadata_source', 'NA')}"
                 f"\t{row.get('phylo_isolation', 'NA')}"
                 f"\t{row.get('investigation_score', 'NA')}"
+            )
+            if include_mwl:
+                base += (
+                    f"\t{row.get('evaluation_score', 'NA')}"
+                    f"\t{row.get('mwl_match', 'NA')}"
+                    f"\t{row.get('mwl_id', 'NA')}"
+                    f"\t{row.get('mwl_matched_rank', 'NA')}"
+                    f"\t{row.get('mwl_matched_taxon', 'NA')}"
+                    f"\t{row.get('mwl_taxonomic_score', 'NA')}"
+                    f"\t{row.get('mwl_identity', 'NA')}"
+                    f"\t{row.get('mwl_score', 'NA')}"
+                    f"\t{row.get('mwl_role', 'NA')}"
+                )
+            base += (
                 f"\t{row.get('in_tree', 'Unknown')}"
                 f"\t{row.get('cluster_representative', 'N/A')}"
                 f"\t{row.get('cluster_size', '1')}"
@@ -612,3 +847,166 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
             fh.write(base + alt_part + '\n')
     return str(p)
 
+
+def _as_float(value, default=None):
+    try:
+        if value in (None, '', 'NA', 'None'):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _board_recommendation(row: dict) -> tuple[str, str]:
+    """Return a concise WGS-selection recommendation and short rationale."""
+    flags = []
+    placement_flags = str(row.get('placement_flags', '') or '')
+    adjusted_priority = row.get('genome_sequencing_adjusted_priority')
+    raw_priority = row.get('sequencing_priority', 'NA')
+    priority = adjusted_priority if adjusted_priority not in (None, '', 'NA') else raw_priority
+    selected = str(row.get('selected_for_genome_sequencing', 'NA')).lower() == 'true'
+    clade_selected = str(row.get('clade_already_selected_for_genome_sequencing', 'NA')).lower() == 'true'
+    mwl_match = str(row.get('mwl_match', 'No') or 'No')
+    baseline_identity = _as_float(row.get('nearest_identity'))
+    reference_identity = _as_float(row.get('reference_nearest_identity'))
+    classification_identity = _as_float(row.get('classification_identity'))
+
+    if selected:
+        recommendation = 'Already selected'
+        flags.append('current isolate marked selected')
+    elif clade_selected:
+        recommendation = 'Deprioritise - clade represented'
+        flags.append('nearby selected genome >=97% 16S identity')
+    elif placement_flags:
+        recommendation = 'Review before selection'
+        flags.append(f'placement flags: {placement_flags}')
+    elif priority == 'HIGH':
+        recommendation = 'Strong candidate'
+    elif priority == 'MEDIUM':
+        recommendation = 'Secondary candidate'
+    elif mwl_match == 'Yes':
+        recommendation = 'Review MWL candidate'
+    else:
+        recommendation = 'Lower priority'
+
+    if mwl_match == 'Yes':
+        matched = row.get('mwl_matched_taxon', 'NA')
+        rank = row.get('mwl_matched_rank', 'NA')
+        flags.append(f'MWL match {rank}:{matched}')
+    if baseline_identity is not None:
+        flags.append(f'baseline nearest {baseline_identity:.2f}%')
+    if reference_identity is not None:
+        flags.append(f'reference nearest {reference_identity:.2f}%')
+    if classification_identity is not None and classification_identity < 95.0:
+        flags.append(f'low taxonomy identity {classification_identity:.2f}%')
+
+    return recommendation, '; '.join(flags) if flags else 'No major flags'
+
+
+def write_selection_summary_tsv(path: str | Path, rows):
+    """Write a concise SAB-facing WGS selection summary.
+
+    This is intentionally much smaller than sequence_assessment.tsv. It keeps
+    the evidence needed for a selection discussion while leaving the full audit
+    trail in the main assessment table.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        'SequenceID',
+        'PartnerID',
+        'Recommendation',
+        'AdjustedPriority',
+        'AdjustedNoveltyScore',
+        'RawNoveltyPriority',
+        'BaselineNearestIdentity',
+        'BaselineNearestHit',
+        'BaselineNearestHitTaxonomy',
+        'AllKnownNearestIdentity',
+        'ReferenceNearestIdentity',
+        'ReferenceNearestHit',
+        'Taxonomy',
+        'ClassificationIdentity',
+        'MWLMatch',
+        'MWLMatchedRank',
+        'MWLMatchedTaxon',
+        'MWLScore',
+        'SelectedForGenomeSequencing',
+        'CladeAlreadySelectedForGenomeSequencing',
+        'NearestSelectedGenomeHit',
+        'NearestSelectedGenomeIdentity',
+        'InTree',
+        'ClusterRepresentative',
+        'ClusterSize',
+        'KeyRationale',
+    ]
+    with open(p, 'w') as fh:
+        fh.write('\t'.join(headers) + '\n')
+        for row in rows:
+            recommendation, rationale = _board_recommendation(row)
+            adjusted_priority = row.get('genome_sequencing_adjusted_priority')
+            if adjusted_priority in (None, '', 'NA'):
+                adjusted_priority = row.get('sequencing_priority', 'NA')
+            adjusted_score = row.get('genome_sequencing_adjusted_novelty_score')
+            if adjusted_score in (None, '', 'NA'):
+                adjusted_score = row.get('novelty_score', 'NA')
+            values = [
+                row.get('id', 'NA'),
+                row.get('partner_id', 'NA'),
+                recommendation,
+                adjusted_priority,
+                adjusted_score,
+                row.get('sequencing_priority', 'NA'),
+                row.get('nearest_identity', 'NA'),
+                row.get('nearest_hit', 'NA'),
+                row.get('nearest_hit_taxonomy', 'NA'),
+                row.get('all_known_nearest_identity', 'NA'),
+                row.get('reference_nearest_identity', 'NA'),
+                row.get('reference_nearest_hit', 'NA'),
+                row.get('taxonomy', 'NA'),
+                row.get('classification_identity', 'NA'),
+                row.get('mwl_match', 'NA'),
+                row.get('mwl_matched_rank', 'NA'),
+                row.get('mwl_matched_taxon', 'NA'),
+                row.get('mwl_score', 'NA'),
+                row.get('selected_for_genome_sequencing', 'NA'),
+                row.get('clade_already_selected_for_genome_sequencing', 'NA'),
+                row.get('nearest_selected_genome_hit', 'NA'),
+                row.get('nearest_selected_genome_identity', 'NA'),
+                row.get('in_tree', 'Unknown'),
+                row.get('cluster_representative', 'N/A'),
+                row.get('cluster_size', '1'),
+                rationale,
+            ]
+            safe = [str(v if v is not None else 'NA').replace('\t', ' ').replace('\n', ' ') for v in values]
+            fh.write('\t'.join(safe) + '\n')
+    return str(p)
+
+
+def write_baseline_hits_tsv(path: str | Path, rows):
+    """Write a concise nearest-baseline hit report for evaluated sequences."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, 'w') as fh:
+        fh.write(
+            'ID\tNearestBaselineHit\tBaselineDataset\tNearestIdentity\t'
+            'NearestBaselineTaxonomy\tNoveltyScore\tCrowding\tSequencingPriority\n'
+        )
+        for row in rows:
+            hit = row.get('nearest_hit', 'NA')
+            if hit in (None, '', 'NA'):
+                continue
+            source = row.get('density_source', 'NA')
+            if source not in (None, '', 'NA', 'none') and not str(source).startswith('baseline'):
+                continue
+            fh.write(
+                f"{row.get('id', 'NA')}\t"
+                f"{hit}\t"
+                f"{row.get('nearest_hit_dataset', 'NA')}\t"
+                f"{row.get('nearest_identity', 'NA')}\t"
+                f"{row.get('nearest_hit_taxonomy', 'NA')}\t"
+                f"{row.get('novelty_score', 'NA')}\t"
+                f"{row.get('crowding', 'NA')}\t"
+                f"{row.get('sequencing_priority', 'NA')}\n"
+            )
+    return str(p)

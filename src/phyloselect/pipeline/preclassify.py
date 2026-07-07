@@ -1,8 +1,8 @@
-"""Pre-classification pipeline for Relict.
+"""Pre-classification pipeline for PhyloSelect.
 
 This module classifies one or more FASTA files (reference collections such as
 Hungate 16S, SILVA, RDP etc.) against a reference database using vsearch and
-writes taxonomy outputs that the main Relict pipeline can consume without
+writes taxonomy outputs that the main PhyloSelect pipeline can consume without
 requiring on-the-fly classification at each run.
 
 Output files written to *outdir*
@@ -10,11 +10,14 @@ Output files written to *outdir*
   {dataset}_classification.tsv   Full vsearch matches (ID, BestHit, Identity,
                                   Taxon, Confidence).  Human readable.
   {dataset}_taxonomy.tsv         Condensed (ID, Taxon, Confidence).  Passable
-                                  directly to ``relict preload --taxa-assignments``.
+                                  directly to ``phyloselect preload --taxa-assignments``.
+  {dataset}_taxonomic_disagreement.tsv
+                                  High-quality candidate hits that resolve to
+                                  multiple different taxonomies.
   combined_taxonomy.tsv          All datasets merged with Dataset column.
   pipeline_taxonomy.tsv          All datasets merged without Dataset column;
-                                  passable directly to ``relict preload`` or
-                                  ``relict run`` via ``--taxa-assignments``.
+                                  passable directly to ``phyloselect preload`` or
+                                  ``phyloselect run`` via ``--taxa-assignments``.
   preclassify_summary.txt        Plain-text human-readable classification
                                   summary (counts, dataset labels, top hits).
 """
@@ -28,6 +31,8 @@ import re
 import textwrap
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
 
 logger = logging.getLogger(__name__)
 
@@ -173,40 +178,24 @@ def _canon_id(x: Optional[str]) -> Optional[str]:
 def _load_taxa_map(taxa_tsv: Optional[str]) -> dict:
     """Load a FeatureID→(Taxon, Confidence) mapping from *taxa_tsv*.
 
-    Accepts gzipped files.  Stores three keys per record (original, normalised,
-    canonical) to maximise hit rate when resolving vsearch best-hit IDs.
+    Accepts TSV, CSV, TSV.GZ, and CSV.GZ files. Stores three keys per record
+    (original, normalised, canonical) to maximise hit rate when resolving
+    vsearch best-hit IDs.
     """
     taxa_map: dict = {}
     if not taxa_tsv:
         return taxa_map
-    open_fn = gzip.open if str(taxa_tsv).endswith(".gz") else open
     try:
-        with open_fn(taxa_tsv, "rt") as fh:  # type: ignore[call-overload]
-            first = fh.readline()
-            if not any(kw in first.lower() for kw in ("feature", "taxon", "taxonomy", "id\t")):
-                parts = first.strip().split("\t")
-                if len(parts) >= 2:
-                    fid, tax = parts[0], parts[1]
-                    try:
-                        conf: Optional[float] = float(parts[2]) if len(parts) > 2 else None
-                    except Exception:
-                        conf = None
-                    for k in (fid, _norm_id(fid), _canon_id(fid)):
-                        if k:
-                            taxa_map[k] = (tax, conf)
-            for line in fh:
-                parts = line.strip().split("\t")
-                if len(parts) < 2:
-                    continue
-                fid, tax = parts[0], parts[1]
-                try:
-                    conf = float(parts[2]) if len(parts) > 2 else None
-                except Exception:
-                    conf = None
-                for k in (fid, _norm_id(fid), _canon_id(fid)):
-                    if k:
-                        taxa_map[k] = (tax, conf)
-        logger.info("[PRECLASSIFY] Loaded %d taxa mappings from %s", len(taxa_map), taxa_tsv)
+        rows_loaded = 0
+        for row in iter_taxonomy_assignment_rows(taxa_tsv):
+            fid = str(row.get('id', '')).strip()
+            tax = str(row.get('taxonomy', '')).strip()
+            conf = row.get('confidence')
+            for k in (fid, _norm_id(fid), _canon_id(fid)):
+                if k:
+                    taxa_map[k] = (tax, conf)
+            rows_loaded += 1
+        logger.info("[PRECLASSIFY] Loaded %d taxonomy assignment rows from %s", rows_loaded, taxa_tsv)
     except Exception as exc:
         logger.warning("[PRECLASSIFY] Failed to load taxa_tsv %s: %s", taxa_tsv, exc)
     return taxa_map
@@ -226,7 +215,7 @@ def _resolve_taxon(sid: str, taxa_map: dict) -> Tuple[Optional[str], Optional[fl
 
 
 def _is_fasta_file(path: str) -> bool:
-    """Return True if *path* looks like a FASTA file (not a TSV taxonomy file)."""
+    """Return True if *path* looks like a FASTA file (not a taxonomy table)."""
     p = str(path).lower()
     if p.endswith('.gz'):
         p = p[:-3]
@@ -326,10 +315,196 @@ def _run_vsearch_pass(
     return best
 
 
+CandidateHit = Tuple[str, float, str]  # subject ID, percent identity, round label
+
+
+def _load_candidate_hits(matches_path: str, round_label: str) -> Dict[str, List[CandidateHit]]:
+    """Return all parsed vsearch candidate hits from one blast6 match file."""
+    hits_by_query: Dict[str, List[CandidateHit]] = {}
+    try:
+        with open(matches_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 3:
+                    continue
+                qid, sid = parts[0], parts[1]
+                try:
+                    pct = float(parts[2])
+                except ValueError:
+                    pct = 0.0
+                hits_by_query.setdefault(qid, []).append((sid, pct, round_label))
+    except FileNotFoundError:
+        pass
+    return hits_by_query
+
+
+def _extend_candidate_hits(
+    target: Dict[str, List[CandidateHit]],
+    new_hits: Dict[str, List[CandidateHit]],
+) -> None:
+    for qid, hits in new_hits.items():
+        target.setdefault(qid, []).extend(hits)
+
+
+def _taxon_compare_key(taxon: Optional[str]) -> Optional[str]:
+    """Normalise taxonomy text for conflict detection without changing output."""
+    if taxon is None:
+        return None
+    text = str(taxon).strip()
+    if not text or text.upper() == "NA":
+        return None
+    parts = [re.sub(r"\s+", " ", part.strip()).lower() for part in text.split(";") if part.strip()]
+    if parts:
+        return ";".join(parts)
+    return re.sub(r"\s+", " ", text).lower()
+
+
+def _tsv_safe(value: object) -> str:
+    if value is None:
+        return "NA"
+    return str(value).replace("\t", " ").replace("\n", " ").replace("\r", " ")
+
+
+def _fmt_float(value: object) -> str:
+    try:
+        return f"{float(value):.4f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return "NA"
+
+
+def _build_taxonomic_disagreement_rows(
+    candidate_hits_by_query: Dict[str, List[CandidateHit]],
+    best_hit: Dict[str, Tuple[str, float]],
+    taxa_map: dict,
+    classify_round: Dict[str, str],
+    high_quality_threshold_pct: float,
+) -> List[dict]:
+    """Find queries with multiple high-quality hits resolving to different taxa."""
+    rows: List[dict] = []
+
+    for qid in sorted(candidate_hits_by_query):
+        high_quality_count = 0
+        assigned_hit_count = 0
+        details: List[str] = []
+        seen_details: set = set()
+        tax_groups: Dict[str, dict] = {}
+
+        for sid, pct, round_label in candidate_hits_by_query.get(qid, []):
+            if pct < high_quality_threshold_pct:
+                continue
+
+            high_quality_count += 1
+            tax, conf = _resolve_taxon(sid, taxa_map)
+            if conf is None and pct:
+                conf = round(pct / 100.0, 4)
+
+            detail = "|".join([
+                _tsv_safe(sid),
+                _fmt_float(pct),
+                _tsv_safe(tax),
+                _tsv_safe(conf),
+                _tsv_safe(round_label),
+            ])
+            if detail not in seen_details:
+                seen_details.add(detail)
+                details.append(detail)
+
+            tax_key = _taxon_compare_key(tax)
+            if tax_key is None:
+                continue
+
+            assigned_hit_count += 1
+            group = tax_groups.setdefault(
+                tax_key,
+                {
+                    "taxon": tax,
+                    "count": 0,
+                    "best_identity": pct,
+                    "best_hit": sid,
+                },
+            )
+            group["count"] += 1
+            if pct > group["best_identity"]:
+                group["best_identity"] = pct
+                group["best_hit"] = sid
+
+        if len(tax_groups) < 2:
+            continue
+
+        selected_hit, selected_identity = best_hit.get(qid, ("NA", 0.0))
+        selected_tax, selected_conf = _resolve_taxon(selected_hit, taxa_map)
+        if selected_conf is None and selected_identity:
+            selected_conf = round(selected_identity / 100.0, 4)
+
+        disagreeing_taxa = []
+        for group in sorted(
+            tax_groups.values(),
+            key=lambda g: (-float(g["best_identity"]), str(g["taxon"])),
+        ):
+            disagreeing_taxa.append(
+                f"{_tsv_safe(group['taxon'])} "
+                f"({group['count']} hits; best {_fmt_float(group['best_identity'])}% via {_tsv_safe(group['best_hit'])})"
+            )
+
+        rows.append({
+            "ID": qid,
+            "SelectedBestHit": selected_hit,
+            "SelectedIdentity": selected_identity,
+            "SelectedTaxon": selected_tax,
+            "SelectedConfidence": selected_conf,
+            "ClassifiedRound": classify_round.get(qid, "round1"),
+            "HighQualityHitCount": high_quality_count,
+            "TaxonAssignedHitCount": assigned_hit_count,
+            "DistinctTaxonCount": len(tax_groups),
+            "DisagreeingTaxa": " || ".join(disagreeing_taxa),
+            "CandidateHits": "; ".join(details),
+        })
+
+    return rows
+
+
+def _write_taxonomic_disagreement_tsv(
+    out_path: str,
+    dataset_name: str,
+    rows: List[dict],
+    high_quality_threshold_pct: float,
+) -> None:
+    """Write a review TSV for high-quality candidate hits with taxonomy conflicts."""
+    header = [
+        "ID",
+        "SelectedBestHit",
+        "SelectedIdentity",
+        "SelectedTaxon",
+        "SelectedConfidence",
+        "ClassifiedRound",
+        "HighQualityHitCount",
+        "TaxonAssignedHitCount",
+        "DistinctTaxonCount",
+        "DisagreeingTaxa",
+        "CandidateHits",
+    ]
+    with open(out_path, "w", newline="") as fh:
+        fh.write(
+            f"# Query 16S sequences from dataset '{dataset_name}' where high-quality "
+            f"candidate hits (>={high_quality_threshold_pct:.1f}% identity) resolve "
+            "to multiple different taxonomies.\n"
+        )
+        fh.write(
+            "# The condensed taxonomy output still uses SelectedBestHit; review these "
+            "rows for possible taxonomic disagreement, ambiguous placement, or reference issues.\n"
+        )
+        fh.write("\t".join(header) + "\n")
+        for row in rows:
+            fh.write("\t".join(_tsv_safe(row.get(col, "NA")) for col in header) + "\n")
+
+
 def _write_fasta_subset(source_fasta: str, target_ids: set, out_path: str) -> int:
     """Write sequences from *source_fasta* whose IDs are in *target_ids* to *out_path*.
 
-    Does a plain-text scan so it works even when relict.utils.fasta is unavailable.
+    Does a plain-text scan so it works even when phyloselect.utils.fasta is unavailable.
     Returns the number of sequences written.
     """
     written = 0
@@ -378,16 +553,19 @@ def classify_fasta(
     of 32 so that ambiguous sequences (e.g. those containing many N's) are
     not abandoned prematurely.
 
-    Writes four output files:
+    Writes five output files:
     - ``{outdir}/{dataset_name}_classification.tsv``  (full, human-readable)
     - ``{outdir}/{dataset_name}_taxonomy.tsv``        (condensed, pipeline-ready)
     - ``{outdir}/{dataset_name}_unclassified.tsv``    (sequences with no vsearch hit)
     - ``{outdir}/{dataset_name}_low_confidence.tsv``  (hits below *low_confidence_threshold*)
+    - ``{outdir}/{dataset_name}_taxonomic_disagreement.tsv``
+      (high-quality candidate hits with multiple different taxonomies)
 
     Returns a dict with keys: classification_tsv, taxonomy_tsv, unclassified_tsv,
-    low_confidence_tsv, n_input, n_classified, n_unclassified, n_low_confidence.
+    low_confidence_tsv, taxonomic_disagreement_tsv, n_input, n_classified,
+    n_unclassified, n_low_confidence, n_taxonomic_disagreements.
     """
-    from relict.utils.fasta import read_fasta, write_fasta
+    from phyloselect.utils.fasta import read_fasta, write_fasta
 
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
@@ -463,6 +641,7 @@ def classify_fasta(
         dataset_name=dataset_name,
         round_label="round1",
     )
+    candidate_hits_by_query: Dict[str, List[CandidateHit]] = _load_candidate_hits(matches_r1, "round1")
     # Track which round classified each sequence (for reporting)
     classify_round: Dict[str, str] = {qid: "round1" for qid in best_hit}
 
@@ -505,6 +684,11 @@ def classify_fasta(
             logger.warning("[PRECLASSIFY] %s failed: %s — skipping", round_label, exc)
             continue
 
+        _extend_candidate_hits(
+            candidate_hits_by_query,
+            _load_candidate_hits(retry_matches, round_label),
+        )
+
         newly_found = 0
         for qid, hit in new_hits.items():
             if qid not in best_hit or hit[1] > best_hit[qid][1]:
@@ -539,7 +723,7 @@ def classify_fasta(
 
     if not taxa_map:
         try:
-            from relict.pipeline.classify import _load_taxa_map_from_reference_fasta
+            from phyloselect.pipeline.classify import _load_taxa_map_from_reference_fasta
             taxa_map, _warn = _load_taxa_map_from_reference_fasta(ref_to_use)
             if taxa_map:
                 logger.info(
@@ -555,6 +739,7 @@ def classify_fasta(
     taxonomy_tsv       = os.path.join(outdir, f"{dataset_name}_taxonomy.tsv")
     unclassified_tsv   = os.path.join(outdir, f"{dataset_name}_unclassified.tsv")
     low_conf_tsv       = os.path.join(outdir, f"{dataset_name}_low_confidence.tsv")
+    tax_disagree_tsv   = os.path.join(outdir, f"{dataset_name}_taxonomic_disagreement.tsv")
 
     # Resolve taxonomy for each best hit
     full_rows: List[Tuple[str, str, float, Optional[str], Optional[float]]] = []
@@ -658,15 +843,37 @@ def classify_fasta(
         n_low_conf, int(low_confidence_threshold * 100), low_conf_tsv,
     )
 
+    # ── Write high-quality taxonomic disagreement TSV ───────────────────────
+    taxonomic_disagreement_rows = _build_taxonomic_disagreement_rows(
+        candidate_hits_by_query=candidate_hits_by_query,
+        best_hit=best_hit,
+        taxa_map=taxa_map,
+        classify_round=classify_round,
+        high_quality_threshold_pct=low_confidence_threshold * 100,
+    )
+    _write_taxonomic_disagreement_tsv(
+        out_path=tax_disagree_tsv,
+        dataset_name=dataset_name,
+        rows=taxonomic_disagreement_rows,
+        high_quality_threshold_pct=low_confidence_threshold * 100,
+    )
+    n_taxonomic_disagreements = len(taxonomic_disagreement_rows)
+    logger.info(
+        "[PRECLASSIFY] %d sequences have high-quality taxonomic disagreement → %s",
+        n_taxonomic_disagreements, tax_disagree_tsv,
+    )
+
     return {
         "classification_tsv": classification_tsv,
         "taxonomy_tsv":       taxonomy_tsv,
         "unclassified_tsv":   unclassified_tsv,
         "low_confidence_tsv": low_conf_tsv,
+        "taxonomic_disagreement_tsv": tax_disagree_tsv,
         "n_input":            n_input,
         "n_classified":       written,
         "n_unclassified":     n_unclassified,
         "n_low_confidence":   n_low_conf,
+        "n_taxonomic_disagreements": n_taxonomic_disagreements,
         "low_confidence_threshold": low_confidence_threshold,
         "min_identity":       min_identity,
         "max_hits":           max_hits,
@@ -703,7 +910,7 @@ def run_preclassify(
     outdir:
         Directory where all outputs are written.
     taxa_tsv:
-        Optional taxonomy annotation file (FeatureID\\tTaxon\\tConfidence).
+        Optional taxonomy annotation table (TSV/CSV, optionally .gz).
     threads:
         vsearch thread count.
     min_identity:
@@ -784,7 +991,7 @@ def run_preclassify(
     logger.info("[PRECLASSIFY] Wrote combined taxonomy (%d rows) → %s", len(combined_rows), combined_path)
 
     # Pipeline-compatible taxonomy (without Dataset column)
-    # Pass directly as --taxa-assignments to ``relict preload`` or ``relict run``.
+    # Pass directly as --taxa-assignments to ``phyloselect preload`` or ``phyloselect run``.
     pipeline_combined_path = os.path.join(outdir, "pipeline_taxonomy.tsv")
     with open(pipeline_combined_path, "w", newline="") as fh:
         fh.write("ID\tTaxon\tConfidence\n")
@@ -852,7 +1059,8 @@ def _write_dataset_summary_csv(
     PctHighConfidence, PctMediumConfidence, PctLowConfidence,
     PctClassified, PctUnclassified,
     HighConfThreshold_pct, MediumConfFloor_pct, MinIdentity_pct,
-    ClassificationTSV, UnclassifiedTSV, LowConfidenceTSV
+    ClassificationTSV, UnclassifiedTSV, LowConfidenceTSV,
+    TaxonomicDisagreements, TaxonomicDisagreementTSV
     """
     import csv as _csv
 
@@ -867,6 +1075,7 @@ def _write_dataset_summary_csv(
         "PctClassified", "PctUnclassified",
         "HighConfThreshold_pct", "MediumConfFloor_pct", "MinIdentity_pct",
         "ClassificationTSV", "UnclassifiedTSV", "LowConfidenceTSV",
+        "TaxonomicDisagreements", "TaxonomicDisagreementTSV",
     ]
 
     def _p(n: int, total: int) -> str:
@@ -891,6 +1100,8 @@ def _write_dataset_summary_csv(
         class_tsv = res.get("classification_tsv", "")
         unc_tsv   = res.get("unclassified_tsv", "")
         lc_tsv    = res.get("low_confidence_tsv", "")
+        tax_dis_tsv = res.get("taxonomic_disagreement_tsv", "")
+        n_tax_dis = int(res.get("n_taxonomic_disagreements", 0) or 0)
 
         # Count per-tier by reading the classification TSV identity column
         n_high = n_med = n_low = 0
@@ -920,7 +1131,7 @@ def _write_dataset_summary_csv(
             _p(n_high, n_input), _p(n_med, n_input), _p(n_low, n_input),
             _p(n_classified, n_input), _p(n_unclass, n_input),
             f"{high_floor:.0f}", f"{med_floor:.0f}", f"{min_id * 100:.0f}",
-            class_tsv, unc_tsv, lc_tsv,
+            class_tsv, unc_tsv, lc_tsv, n_tax_dis, tax_dis_tsv,
         ])
 
     with open(csv_path, "w", newline="") as fh:
@@ -948,11 +1159,11 @@ def _write_summary(
 ) -> None:
     lines: List[str] = []
     lines.append("=" * 70)
-    lines.append("Relict  –  Pre-classification summary")
+    lines.append("PhyloSelect  –  Pre-classification summary")
     lines.append("=" * 70)
     lines.append(f"\nReference FASTA : {ref_fasta}")
     if taxa_tsv:
-        lines.append(f"Taxa TSV        : {taxa_tsv}")
+        lines.append(f"Taxa table      : {taxa_tsv}")
     # Pull vsearch settings from first successful result for display
     _first = next((r for r in results.values() if isinstance(r, dict)), {})
     lines.append(f"Candidate hits  : up to {_first.get('max_hits', 10)} per query (best selected)")
@@ -983,6 +1194,8 @@ def _write_summary(
             tax_tsv_path = res.get("taxonomy_tsv", "")
             unclass_tsv  = res.get("unclassified_tsv", "")
             low_conf_tsv = res.get("low_confidence_tsv", "")
+            tax_dis_tsv  = res.get("taxonomic_disagreement_tsv", "")
+            n_tax_dis    = res.get("n_taxonomic_disagreements", 0)
             min_id_pct   = int(float(res.get("min_identity") or 0.80) * 100)
             lc_pct       = int(low_confidence_threshold * 100)
 
@@ -1059,6 +1272,17 @@ def _write_summary(
                     f"  │     Unclassified (no hit)               : 0"
                 )
 
+            # High-quality hits that resolve to different taxonomies.
+            if isinstance(n_tax_dis, int) and n_tax_dis > 0:
+                lines.append(
+                    f"  │  !  Potential taxonomic disagreement    : "
+                    f"{n_tax_dis}/{n_input}  ({_pct(n_tax_dis)})  -> {tax_dis_tsv}"
+                )
+            elif isinstance(n_tax_dis, int):
+                lines.append(
+                    f"  │     Potential taxonomic disagreement    : 0"
+                )
+
             lines.append(f"  │")
             lines.append(f"  │  Classification TSV   : {class_tsv}")
             lines.append(f"  │  Taxonomy TSV         : {tax_tsv_path}")
@@ -1066,6 +1290,8 @@ def _write_summary(
                 lines.append(f"  │  Unclassified TSV     : {unclass_tsv}")
             if isinstance(n_low, int) and n_low > 0:
                 lines.append(f"  │  Low-confidence TSV   : {low_conf_tsv}")
+            if isinstance(n_tax_dis, int) and n_tax_dis > 0:
+                lines.append(f"  │  Taxonomic disagreement TSV: {tax_dis_tsv}")
         else:
             lines.append("  │  [classification FAILED – see log]")
 
@@ -1077,6 +1303,7 @@ def _write_summary(
     total_class   = sum(int(r.get("n_classified", 0))     for r in results.values() if isinstance(r, dict))
     total_unclass = sum(int(r.get("n_unclassified", 0))   for r in results.values() if isinstance(r, dict))
     total_low_all = sum(int(r.get("n_low_confidence", 0)) for r in results.values() if isinstance(r, dict))
+    total_tax_dis = sum(int(r.get("n_taxonomic_disagreements", 0)) for r in results.values() if isinstance(r, dict))
 
     # Compute medium/low split from classification TSVs
     total_high = 0
@@ -1133,6 +1360,13 @@ def _write_summary(
         )
     else:
         lines.append(f"  ✓  Unclassified     (no hit, all rounds)     : 0")
+    if total_tax_dis:
+        lines.append(
+            f"  !  Potential taxonomic disagreements         : "
+            f"{total_tax_dis}  ({_gpct(total_tax_dis)})  - review *_taxonomic_disagreement.tsv"
+        )
+    else:
+        lines.append("  !  Potential taxonomic disagreements         : 0")
     lines.append("")
 
     lines.append(f"Combined taxonomy (with Dataset column)  : {combined_path}")
@@ -1141,11 +1375,11 @@ def _write_summary(
     lines.append(f"Total rows in combined taxonomy          : {len(combined_rows)}")
     lines.append("")
     lines.append("─" * 70)
-    lines.append("How to use these outputs with Relict")
+    lines.append("How to use these outputs with PhyloSelect")
     lines.append("─" * 70)
     lines.append(
         "\n1. Preload a classified dataset (taxonomy pre-computed, no re-classification):\n"
-        "   relict preload \\\n"
+        "   phyloselect preload \\\n"
         "     --fasta <original_fasta.fasta> \\\n"
         f"     --taxa-assignments {pipeline_combined_path} \\\n"
         "     --db my_project.db \\\n"
@@ -1154,7 +1388,7 @@ def _write_summary(
     )
     lines.append(
         "2. Run the main pipeline using the pre-classified taxonomy:\n"
-        "   relict run \\\n"
+        "   phyloselect run \\\n"
         "     --input my_samples.fasta \\\n"
         "     --ref <ref.fasta> \\\n"
         f"     --taxa-assignments {pipeline_combined_path} \\\n"
@@ -1167,4 +1401,3 @@ def _write_summary(
 
     with open(summary_path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
-

@@ -15,6 +15,20 @@ RANK_ALIASES = {
     'species': 's',
 }
 
+DOMAIN_QUERY_ALIASES = {
+    'bacterial': 'bacteria',
+    'bacterium': 'bacteria',
+    'bacteria': 'bacteria',
+    'archaeal': 'archaea',
+    'archaea': 'archaea',
+    'fungal': 'fungi',
+    'fungus': 'fungi',
+    'fungi': 'fungi',
+    'eukaryotic': 'eukaryota',
+    'eukarya': 'eukaryota',
+    'eukaryota': 'eukaryota',
+}
+
 
 def _clean_taxon_value(value: str) -> str:
     if value is None:
@@ -31,6 +45,11 @@ def normalize_taxon_name(value: str) -> str:
     value = value.lower()
     value = re.sub(r'[^a-z0-9]+', '', value)
     return value
+
+
+def normalize_domain_query(value: str) -> str:
+    norm = normalize_taxon_name(value)
+    return DOMAIN_QUERY_ALIASES.get(norm, norm)
 
 
 def parse_taxon_string(taxon: str) -> Dict[str, str]:
@@ -76,14 +95,17 @@ def taxonomy_matches_kingdom(taxon: Optional[str], kingdom: str) -> bool:
     """
     if not kingdom:
         return True
-    wanted = normalize_taxon_name(kingdom)
+    wanted = normalize_domain_query(kingdom)
     if not wanted:
         return True
-    actual = get_domain_or_kingdom(taxon)
-    if actual:
-        return normalize_taxon_name(actual) == wanted
+    parsed = parse_taxon_string(taxon)
+    domain = normalize_domain_query(parsed.get('d', ''))
+    kingdom_value = normalize_domain_query(parsed.get('k', ''))
+    candidates = [value for value in (domain, kingdom_value) if value]
+    if candidates:
+        return wanted in candidates
     # fallback for malformed lineage strings with no explicit rank prefixes
-    raw = normalize_taxon_name(taxon)
+    raw = normalize_domain_query(taxon)
     if not raw:
         return False
     return raw == wanted
@@ -150,4 +172,3 @@ def parse_reference_header_taxonomy(header: Optional[str]) -> tuple[Optional[str
         return ref_id, None
     lineage = re.sub(r'\s*;\s*', ';', lineage)
     return ref_id, lineage or None
-

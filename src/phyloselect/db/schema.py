@@ -40,5 +40,14 @@ CREATE TABLE IF NOT EXISTS seq_aliases (
     canonical_id TEXT PRIMARY KEY,
     original_header TEXT
 );
-"""
 
+CREATE TABLE IF NOT EXISTS sequencing_metadata (
+    id TEXT PRIMARY KEY,
+    partner_id TEXT,
+    dataset TEXT,
+    selected_for_wgs INTEGER DEFAULT 0,
+    source_id TEXT,
+    source_file TEXT,
+    raw_selected_value TEXT
+);
+"""

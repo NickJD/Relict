@@ -1,36 +1,36 @@
 """
-classify.py — Taxonomic classification for Relict.
+classify.py — Taxonomic classification for PhyloSelect.
 
 Uses VSEARCH --usearch_global against a reference database (GreenGenes2,
 SILVA, or custom) to assign taxonomy to query sequences.
 
 Key design decisions
 --------------------
-- Reference anchors (RELICT_REF_* headers) are excluded from output.
+- Reference anchors (PHYLOSELECT_REF_* headers) are excluded from output.
 - The taxonomy lookup map is built once at load time for performance.
 - vsearch is run at --id 0.8 minimum identity — this is for taxonomy only.
   Novelty detection (novelty.py) runs its own separate vsearch at a lower
   threshold to compute true nearest-neighbour distances.
 - Output columns: ID  BestHit  Identity  Taxon  Confidence
-  Confidence comes from the taxa TSV when provided (e.g. QIIME2 classifier score,
-  0–1 scale).  When taxonomy is read directly from reference FASTA headers (no
-  --taxa flag), Confidence is derived from the VSEARCH alignment identity
+  Confidence comes from the taxa TSV/CSV when provided (e.g. QIIME2 classifier
+  score, 0–1 scale). When taxonomy is read directly from reference FASTA headers
+  (no --taxa flag), Confidence is derived from the VSEARCH alignment identity
   (identity / 100), so a 98.5% identity hit yields 0.9850.
 """
 
 from __future__ import annotations
 
-import gzip
 import logging
 import os
 import re
 from pathlib import Path
 from typing import Optional
 
-from relict.taxonomy import parse_reference_header_taxonomy, reference_lookup_keys
-from relict.utils.fasta import read_fasta, write_fasta
-from relict.utils.subprocess import run_cmd
-from relict.pipeline.tree import is_ref_anchor
+from phyloselect.taxonomy import parse_reference_header_taxonomy, reference_lookup_keys
+from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
+from phyloselect.utils.fasta import read_fasta, write_fasta
+from phyloselect.utils.subprocess import run_cmd
+from phyloselect.pipeline.tree import is_ref_anchor
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +82,12 @@ def _canon_id(x: str) -> str:
 
 def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
     """
-    Load a taxonomy TSV into a lookup dict.
+    Load a taxonomy TSV/CSV into a lookup dict.
 
     Accepts two formats:
       FeatureID  Taxon  Confidence       (QIIME2 / GreenGenes2 style)
       ID  Taxon  Confidence              (plain two-column)
+      and equivalent comma-delimited CSV files, including .gz variants.
 
     Builds THREE index keys per entry for resilient lookup:
       - raw ID
@@ -105,28 +106,16 @@ def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
         except Exception:
             logger.info("[CLASSIFY] Loading taxonomy map from %s...", taxa_tsv)
 
-        if str(taxa_tsv).endswith('.gz'):
-            fh_ctx = gzip.open(taxa_tsv, 'rt')
-        else:
-            fh_ctx = open(taxa_tsv, 'rt')
-        with fh_ctx as fh:
-            first_line = fh.readline().strip()
-            # Detect and skip header row
-            is_header = any(
-                kw in first_line.lower()
-                for kw in ("feature", "taxon", "taxonomy", "id\t")
-            )
-            if not is_header:
-                # First line is data — process it
-                _add_taxa_row(first_line, taxa_map)
+        rows_loaded = 0
+        for row in iter_taxonomy_assignment_rows(taxa_tsv):
+            fid = str(row.get('id', '')).strip()
+            tax = str(row.get('taxonomy', '')).strip()
+            conf = row.get('confidence')
+            _add_taxa_entry(fid, tax, conf, taxa_map)
+            rows_loaded += 1
 
-            for line in fh:
-                line = line.strip()
-                if line:
-                    _add_taxa_row(line, taxa_map)
-
-        logger.info("[CLASSIFY] Loaded %d unique taxa IDs from %s",
-                    len(taxa_map) // 3, taxa_tsv)
+        logger.info("[CLASSIFY] Loaded %d taxonomy assignment rows from %s",
+                    rows_loaded, taxa_tsv)
     except Exception as e:
         logger.warning("[CLASSIFY] Failed to load taxa file %s: %s", taxa_tsv, e)
 
@@ -154,7 +143,7 @@ def _load_taxa_map_from_reference_fasta(ref_fasta: str) -> tuple[dict[str, tuple
             })
             continue
         parsed += 1
-        for key in reference_lookup_keys(ref_id):
+        for key in list(reference_lookup_keys(header)) + list(reference_lookup_keys(ref_id)):
             if key and key not in taxa_map:
                 taxa_map[key] = (taxonomy, None)
     if total and parsed / float(total) < 0.8:
@@ -166,20 +155,19 @@ def _load_taxa_map_from_reference_fasta(ref_fasta: str) -> tuple[dict[str, tuple
     return taxa_map, warning_rows
 
 
-def _add_taxa_row(line: str, taxa_map: dict) -> None:
-    parts = line.split("\t")
-    if len(parts) < 2:
+def _add_taxa_entry(fid: str, tax: str, conf: object, taxa_map: dict) -> None:
+    fid = str(fid or '').strip()
+    tax = str(tax or '').strip()
+    if not fid or not tax:
         return
-    fid = parts[0].strip()
-    tax = parts[1].strip()
     try:
-        conf: Optional[float] = float(parts[2]) if len(parts) > 2 else None
-    except (ValueError, IndexError):
-        conf = None
+        conf_value: Optional[float] = float(conf) if conf is not None else None
+    except (ValueError, TypeError):
+        conf_value = None
 
     for key in list(reference_lookup_keys(fid)) + [_norm_id(fid), _canon_id(fid)]:
         if key and key not in taxa_map:
-            taxa_map[key] = (tax, conf)
+            taxa_map[key] = (tax, conf_value)
 
 
 def _lookup_tax(sid: str, taxa_map: dict) -> tuple[Optional[str], Optional[float]]:
@@ -275,23 +263,16 @@ def _ensure_uncompressed(ref_fasta: str, outdir: str, out_name: str = "ref_uncom
 
 
 def _iter_taxa_file_rows(taxa_tsv: str):
-    if str(taxa_tsv).endswith('.gz'):
-        fh_ctx = gzip.open(taxa_tsv, 'rt')
-    else:
-        fh_ctx = open(taxa_tsv, 'rt')
-    with fh_ctx as fh:
-        first_line = fh.readline().strip()
-        is_header = any(kw in first_line.lower() for kw in ('feature', 'taxon', 'taxonomy', 'id\t'))
-        if not is_header and first_line:
-            yield first_line.split('\t')
-        for line in fh:
-            line = line.strip()
-            if line:
-                yield line.split('\t')
+    for row in iter_taxonomy_assignment_rows(taxa_tsv):
+        values = [str(row.get('id', '')), str(row.get('taxonomy', ''))]
+        conf = row.get('confidence')
+        if conf is not None:
+            values.append(str(conf))
+        yield values
 
 
 def validate_reference_taxonomy_consistency(ref_fasta: Optional[str], taxa_tsv: Optional[str]):
-    """Return warning rows about mismatches between reference FASTA and taxonomy TSV.
+    """Return warning rows about mismatches between reference FASTA and taxonomy table.
 
     Skips validation for large reference files (>500 MB) as it's too expensive.
     """
@@ -348,12 +329,12 @@ def validate_reference_taxonomy_consistency(ref_fasta: Optional[str], taxa_tsv: 
             warnings.append({
                 'category': 'LOW_REFERENCE_TAXONOMY_OVERLAP',
                 'subject_id': f'{len(matched_ref)}/{len(ref_ids)}',
-                'detail': f'Only {overlap:.1%} of reference FASTA IDs matched taxonomy TSV IDs; taxonomy source may be inconsistent with the classifier reference.',
+                'detail': f'Only {overlap:.1%} of reference FASTA IDs matched taxonomy table IDs; taxonomy source may be inconsistent with the classifier reference.',
             })
     for rid in unmatched_ref[:25]:
         warnings.append({'category': 'REFERENCE_ID_MISSING_TAXONOMY', 'subject_id': rid, 'detail': 'Reference FASTA entry had no matching taxonomy row.'})
     for tid in unmatched_taxa[:25]:
-        warnings.append({'category': 'TAXONOMY_ID_MISSING_REFERENCE', 'subject_id': tid, 'detail': 'Taxonomy TSV entry had no matching reference FASTA record.'})
+        warnings.append({'category': 'TAXONOMY_ID_MISSING_REFERENCE', 'subject_id': tid, 'detail': 'Taxonomy table entry had no matching reference FASTA record.'})
     return warnings
 
 
@@ -385,7 +366,7 @@ def run_classification(
     input_fasta  : Query FASTA (QC-filtered, dereplicated)
     outdir       : Output directory
     ref_fasta    : Reference FASTA database for VSEARCH search
-    taxa_tsv     : Optional TSV mapping reference IDs to taxonomy strings.
+    taxa_tsv     : Optional TSV/CSV mapping reference IDs to taxonomy strings.
                    If omitted, only the best-hit accession is reported.
     threads      : VSEARCH thread count
 
@@ -394,7 +375,7 @@ def run_classification(
     outdir/taxonomy.tsv  — TSV with columns:
         ID  BestHit  Identity  Taxon  Confidence
 
-    Reference anchor sequences (RELICT_REF_*) are excluded from output.
+    Reference anchor sequences (PHYLOSELECT_REF_*) are excluded from output.
 
     Returns
     -------
@@ -570,11 +551,11 @@ def run_classification_single(
     ref_to_use = _ensure_uncompressed(ref_fasta, outdir, out_name=decomp_name)
 
     # Build taxa lookup map.
-    # When a --alt-taxa TSV is supplied it is used directly; otherwise taxonomy
+    # When a --alt-taxa TSV/CSV is supplied it is used directly; otherwise taxonomy
     # is parsed from the reference FASTA headers (GTDB-style lineage strings).
     taxa_map: dict = {}
     if taxa_tsv:
-        logger.info("[CLASSIFY][%s] Loading taxa map from TSV: %s", db_name, taxa_tsv)
+        logger.info("[CLASSIFY][%s] Loading taxa map from table: %s", db_name, taxa_tsv)
         taxa_map = _load_taxa_map(taxa_tsv)
     else:
         try:
@@ -671,9 +652,9 @@ def run_all_classifications(
     Parameters
     ----------
     primary_ref   : Path to the primary reference FASTA.
-    primary_taxa  : Optional taxa TSV for the primary reference.
+    primary_taxa  : Optional taxa TSV/CSV for the primary reference.
     primary_name  : Display name for the primary database (default ``'main'``).
-    alt_refs      : List of ``(ref_fasta, taxa_tsv_or_None, db_name)`` tuples.
+    alt_refs      : List of ``(ref_fasta, taxa_table_or_None, db_name)`` tuples.
     main_db       : Which database (by name) should be written to the canonical
                     ``taxonomy.tsv``.  Defaults to *primary_name*.
 
@@ -754,4 +735,3 @@ def _write_merged_taxonomy(
 
     logger.info("[CLASSIFY] Wrote merged multi-db taxonomy → %s", output)
     return output
-

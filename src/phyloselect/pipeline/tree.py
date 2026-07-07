@@ -1,22 +1,22 @@
 """
-tree.py — Phylogenetic tree construction and incremental updating for Relict.
+tree.py — Phylogenetic tree construction and incremental updating for PhyloSelect.
 
 Architecture
 ------------
 The tree is built from THREE layers of sequences:
 
-  1. Reference anchors  (ref_anchors.fasta, bundled with Relict)
-     ~2 well-characterised SILVA sequences per phylum, curated manually.
+  1. Reference anchors  (reference_anchors.fasta, bundled with PhyloSelect)
+     Curated NCBI RefSeq 16S sequences spanning major rumen/gut phyla.
      These constrain the topology so the tree reflects real taxonomy.
-     They are NEVER shown in outputs — they are scaffolding only.
-     Identified by the prefix RELICT_REF_ in their headers.
+     They are NEVER shown in outputs - they are scaffolding only.
+     Identified by the prefix PHYLOSELECT_REF_ in their headers.
 
   2. Preload sequences  (e.g. Hungate1000)
-     User-supplied baseline dataset loaded via `relict preload`.
+     User-supplied baseline dataset loaded via `phyloselect preload`.
      Stored in the DB with dataset label. Shown in iTOL.
 
   3. Run sequences
-     User query sequences submitted via `relict run`. Shown in iTOL.
+     User query sequences submitted via `phyloselect run`. Shown in iTOL.
 
 Tree building strategy
 ----------------------
@@ -32,7 +32,7 @@ The bundled anchor file lives at:
     <package_root>/data/reference_anchors.fasta
 
 Each sequence header must be:
-    >RELICT_REF_<PhylumName> accession=<ACC> source=SILVA138
+    >PHYLOSELECT_REF_<PhylumName> accession=<ACC> source=<SOURCE>
 
 Sequences in that file are excluded from all result outputs, novelty
 scoring, and iTOL files. They exist purely to constrain tree topology.
@@ -51,15 +51,15 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-from relict.utils.fasta import read_fasta, reverse_complement, write_fasta
-from relict.utils.subprocess import run_cmd
+from phyloselect.utils.fasta import read_fasta, reverse_complement, write_fasta
+from phyloselect.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 # Prefix that marks a sequence as a reference anchor
-REF_ANCHOR_PREFIX = "RELICT_REF_"
+REF_ANCHOR_PREFIX = "PHYLOSELECT_REF_"
 
 # Path to the bundled anchor file, relative to this module's location
 _MODULE_DIR = Path(__file__).resolve().parent
@@ -89,7 +89,7 @@ def get_anchor_file(custom_anchor_file: Optional[str] = None) -> Optional[Path]:
     Return the path to the anchor FASTA to use.
     Priority:
       1. custom_anchor_file argument (user-supplied)
-      2. BUILTIN_ANCHOR_FILE (bundled with Relict)
+      2. BUILTIN_ANCHOR_FILE (bundled with PhyloSelect)
     Returns None if neither exists.
     """
     if custom_anchor_file:
@@ -103,7 +103,7 @@ def get_anchor_file(custom_anchor_file: Optional[str] = None) -> Optional[Path]:
 
     logger.warning(
         "[ANCHORS] No reference anchor file found. Tree topology may not "
-        "reflect true taxonomy. Consider running: relict download-anchors"
+        "reflect true taxonomy. Consider running: phyloselect download-anchors"
     )
     return None
 
@@ -149,7 +149,7 @@ def build_combined_fasta(
 ) -> Path:
     """
     Build a combined FASTA containing:
-      - Reference anchor sequences (RELICT_REF_* prefixed)
+      - Reference anchor sequences (PHYLOSELECT_REF_* prefixed)
       - All sequences from the DB that passed QC (if db provided)
       - User/query sequences from user_fasta
 
@@ -600,7 +600,7 @@ def _resolve_iqtree_binary() -> Optional[str]:
     This function:
       1. Searches all candidates via ``shutil.which`` (honours PATH).
       2. Falls back to ``dirname(sys.executable)`` — the conda env's bin dir —
-         so the correct binary is always found when Relict is run from within
+         so the correct binary is always found when PhyloSelect is run from within
          the conda environment.
     """
     candidates = ["iqtree2", "iqtree", "IQ-TREE", "iqtree-omp"]
@@ -774,16 +774,22 @@ def _seed_backbone_from_preload(preload_dir: Optional[str], outdir: Path) -> boo
     p = Path(preload_dir)
     preload_aln = p / 'current_alignment.fasta'
     if not preload_aln.exists():
+        preload_aln = p / 'tree' / 'current_alignment.fasta'
+    if not preload_aln.exists():
         return False
     outdir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(preload_aln, outdir / 'current_alignment.fasta')
     preload_tree = p / 'current_tree.nwk'
+    if not preload_tree.exists():
+        preload_tree = p / 'tree' / 'current_tree.nwk'
     if preload_tree.exists():
         try:
             shutil.copyfile(preload_tree, outdir / 'current_tree.nwk')
         except Exception:
             pass
     preload_orient = p / 'tree_orientation_summary.tsv'
+    if not preload_orient.exists():
+        preload_orient = p / 'tree' / 'tree_orientation_summary.tsv'
     if preload_orient.exists():
         try:
             shutil.copyfile(preload_orient, outdir / 'tree_orientation_summary.tsv')
@@ -850,7 +856,7 @@ def write_tree_warning_tsv(outdir: str, warning_rows):
 
 
 def _prune_anchor_leaves(newick: str) -> str:
-    """Remove all RELICT_REF_* leaf nodes from a Newick string.
+    """Remove all PHYLOSELECT_REF_* leaf nodes from a Newick string.
 
     Anchor sequences constrain tree topology at *build time* (during MAFFT
     alignment and FastTree inference).  Once the tree has been written the
@@ -876,7 +882,7 @@ def _prune_anchor_leaves(newick: str) -> str:
     In practice, with 26 anchors spread across hundreds of data sequences,
     the degenerate single-child case essentially never occurs.
     """
-    _ANCHOR_PAT = r'RELICT_REF_[^,:()\s;]+(?::[0-9Ee.+\-]+)?'
+    _ANCHOR_PAT = r'PHYLOSELECT_REF_[^,:()\s;]+(?::[0-9Ee.+\-]+)?'
 
     for _ in range(100):          # safety iteration cap
         before = newick
@@ -886,7 +892,7 @@ def _prune_anchor_leaves(newick: str) -> str:
         # Clean artefacts.
         # IMPORTANT: remove empty clades *including* any trailing internal-node
         # label and branch-length that FastTree attaches to the closing ')'.
-        # Without this, a sole-anchor clade like (RELICT_REF_X:0.5)1.000:0.09
+        # Without this, a sole-anchor clade like (PHYLOSELECT_REF_X:0.5)1.000:0.09
         # becomes ()1.000:0.09 then just 1.000:0.09 which looks like a leaf.
         newick = re.sub(                                      # ()label:len or ()label
             r'\(\s*\)(?:[^,():;\s]+(?::[^,():;\s]+)?)?', '', newick
@@ -947,7 +953,7 @@ def initialise_or_update_tree(
     tree_method: str = "fasttree",
 ):
     """
-    Initialise or incrementally update the Relict phylogenetic tree.
+    Initialise or incrementally update the PhyloSelect phylogenetic tree.
 
     Parameters
     ----------

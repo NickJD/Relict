@@ -1,6 +1,6 @@
 from pathlib import Path
 import hashlib
-from relict.taxonomy import parse_taxon_string as _shared_parse_taxon_string
+from phyloselect.taxonomy import parse_taxon_string as _shared_parse_taxon_string
 
 
 def _hash_to_hue(s: str) -> float:
@@ -125,24 +125,6 @@ def _name_to_color_by_rank(name: str, rank: str = None) -> str:
     }
     s, v = sv_map.get(rank, (0.65, 0.90))
     return _hsv_to_hex(h, s=s, v=v)
-
-
-def _darken_hex(hexcol: str, factor: float = 0.55) -> str:
-    """Return a darker variant of a hex color by scaling RGB toward 0.
-
-    factor in 0..1, lower -> darker.
-    """
-    try:
-        h = hexcol.lstrip('#')
-        r = int(h[0:2], 16)
-        g = int(h[2:4], 16)
-        b = int(h[4:6], 16)
-        r = int(max(0, min(255, r * factor)))
-        g = int(max(0, min(255, g * factor)))
-        b = int(max(0, min(255, b * factor)))
-        return '#{:02x}{:02x}{:02x}'.format(r, g, b)
-    except Exception:
-        return hexcol
 
 
 def parse_taxon_string(taxon: str):
@@ -372,14 +354,12 @@ def write_dataset_membership_strip(output_path: str, ids_in_order, ds_map, datas
 
 
 def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = None, id_map: dict = None, tree_file: str = None, phylum_groups: list = None):
-    """Generate simple iTOL-compatible color mapping files for phylum, family, genus.
+    """Generate one iTOL-compatible colorstrip per taxonomy metadata type.
 
-    Outputs files in outdir:
-      - itol_phylum_colors.csv (id,color)
-      - itol_family_colors.csv
-      - itol_genus_colors.csv
-      - itol_user_colors.csv (if provided)
-      - itol_combined_colors.csv (id,phylum_color,family_color,genus_color,user_color)
+    Outputs DATASET_COLORSTRIP files in outdir for phylum, family, genus, and
+    optional user colours. TREE_COLORS and DATASET_SYMBOL variants are not
+    retained because they duplicate the same metadata in another visual
+    encoding and clutter the workflow outputs.
 
     The user_color_csv, if provided, should be a CSV with header including 'id' and 'color'.
 
@@ -713,25 +693,20 @@ def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = N
         return cmap
 
     phylum_map = _make_palette(group_ph_names, 'phylum')
-    # derive darker stroke colours for branches/clade outlines so range fills
-    # can be bright and distinct while strokes remain legible
-    phylum_stroke_map = {name: _darken_hex(col, factor=0.55) for name, col in phylum_map.items()}
     family_map = _make_palette(fa_names, 'family')
     genus_map = _make_palette(ge_names, 'genus')
 
-    # If a tree file is provided, compute internal node -> leaf set mapping so
-    # we can detect MRCA nodes for whole taxon clades and emit TREE_COLORS
-    # clade/range entries to colour internal segments directly.
-    internal_subtrees = {}
+    # If a tree file is provided, repair/write stable internal node labels and
+    # retain the newick text so colorstrip rows can be limited to actual leaves.
+    newick = None
     if tree_file:
         try:
             tf = Path(tree_file)
-            newick = None
             if tf.exists():
                 newick = tf.read_text()
                 try:
                     # Repair malformed NODE labels before further tree rewriting.
-                    from relict.pipeline.tree import _repair_legacy_internal_node_labels
+                    from phyloselect.pipeline.tree import _repair_legacy_internal_node_labels
                     newick = _repair_legacy_internal_node_labels(newick)
                 except Exception:
                     pass
@@ -769,104 +744,15 @@ def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = N
                         newick = labeled_newick
                     except Exception:
                         pass
-                # compute mapping node_label -> set(leaves)
-                def _compute_internal_subtrees(s: str):
-                    s = s.strip()
-                    # remove whitespace
-                    s = ''.join(s.split())
-                    internal = {}
-                    stack = []  # each element is list of leaf tokens at that level
-                    token = ''
-                    i = 0
-                    L = len(s)
-
-                    def _map_leaf_token(tok: str):
-                        # strip surrounding quotes
-                        if not tok:
-                            return tok
-                        if tok.startswith("'") and tok.endswith("'") or tok.startswith('"') and tok.endswith('"'):
-                            tok = tok[1:-1]
-                        # if id_map provided, map original headers to short ids when possible
-                        try:
-                            if id_map and tok in id_map:
-                                return id_map[tok]
-                            # try last pipe-field
-                            if '|' in tok:
-                                last = tok.split('|')[-1]
-                                if id_map and last in id_map:
-                                    return id_map[last]
-                        except Exception:
-                            pass
-                        return tok
-
-                    while i < L:
-                        c = s[i]
-                        if c == '(':
-                            stack.append([])
-                            token = ''
-                            i += 1
-                            continue
-                        if c == ',' or c == ')' or c == ';':
-                            if token:
-                                # leaf token before delimiter
-                                if stack:
-                                    stack[-1].append(token)
-                                token = ''
-                            if c == ')':
-                                # complete current subtree
-                                if not stack:
-                                    i += 1
-                                    continue
-                                items = stack.pop()
-                                leaves = set()
-                                # items may include leaf names; map them to short ids
-                                for it in items:
-                                    if it:
-                                        mapped = _map_leaf_token(it)
-                                        leaves.add(mapped)
-                                # after ')' there may be a node label before ':' or ',' or ')' or ';'
-                                j = i + 1
-                                label = ''
-                                while j < L and s[j] not in ',):;':
-                                    label += s[j]
-                                    j += 1
-                                # strip branch length if present (label may include :...), stop at ':'
-                                if ':' in label:
-                                    label = label.split(':', 1)[0]
-                                label = label.strip()
-                                if label:
-                                    internal[label] = leaves.copy()
-                                # propagate leaves upward: add to parent if exists
-                                if stack:
-                                    # parent list append all leaf names so far (use mapped forms)
-                                    stack[-1].extend(list(leaves))
-                                i = j
-                                continue
-                            i += 1
-                            continue
-                        if c == ':':
-                            # skip branch length
-                            j = i + 1
-                            while j < L and s[j] not in ',);':
-                                j += 1
-                            i = j
-                            continue
-                        # accumulate token characters for leaf/internal names
-                        token += c
-                        i += 1
-                    return internal
-
-                internal_subtrees = _compute_internal_subtrees(newick)
         except Exception:
-            internal_subtrees = {}
+            newick = None
 
     # second pass: build per-sequence combined lines using per-name palettes,
     # allowing a per-sequence user color to override if provided
     for qid in list(taxa.keys()):
         ph, fa, ge = parsed_map[qid]
         user_col = user_colors.get(qid, '')
-        # use stroke map for per-sequence branch colours (darker), legend uses fill colours
-        ph_c = user_col or phylum_stroke_map.get(ph, _name_to_color_by_rank(ph, 'phylum'))
+        ph_c = user_col or phylum_map.get(ph, _name_to_color_by_rank(ph, 'phylum'))
         fa_c = user_col or family_map.get(fa, _name_to_color_by_rank(fa, 'family'))
         ge_c = user_col or genus_map.get(ge, _name_to_color_by_rank(ge, 'genus'))
         combined_lines.append((qid, ph_c, fa_c, ge_c, user_col))
@@ -913,8 +799,8 @@ def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = N
                 f.write(f"{id_},{col}\n")
 
     # Determine set of leaf ids present in the provided tree (when available).
-    # This lets us avoid emitting TREE_COLORS entries for ids that are not
-    # present in the tree (iTOL will complain otherwise).
+    # This lets us avoid writing colorstrip rows for ids that are not present
+    # in the uploaded tree.
     leaf_ids_in_tree = set()
     if tree_file:
         try:
@@ -935,13 +821,13 @@ def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = N
 
     # write per-rank color maps as iTOL colorstrip datasets
     # for per-rank we need per-sequence mappings: map each qid to its phylum/family/genus color
-    # include the taxon name in pairs to aid symbol assignment later
+    # include the taxon name in pairs for stable tree-id resolution
     ph_pairs = [(qid, ph_c, parsed_map[qid][0]) for qid, ph_c, _, _, _ in combined_lines]
     fa_pairs = [(qid, fa_c, parsed_map[qid][1]) for qid, _, fa_c, _, _ in combined_lines]
     ge_pairs = [(qid, ge_c, parsed_map[qid][2]) for qid, _, _, ge_c, _ in combined_lines]
 
-    # For TREE_COLORS we must only emit entries for ids that actually appear
-    # in the tree. Build filtered versions of the pairs for tree output.
+    # Only emit rows for ids that actually appear in the tree. Build filtered
+    # versions of the pairs for colorstrip output.
     if leaf_ids_in_tree:
         # Resolve each qid to an id present in the tree. Load member->rep
         # collapse mappings so original members map to their representative
@@ -974,33 +860,6 @@ def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = N
                     continue
         except Exception:
             collapse_map = {}
-
-        # If we discovered a collapse_map, remap internal_subtrees leaf ids to
-        # use representative ids. This is important when the tree was built
-        # from a collapsed fasta: the internal node subtrees will contain
-        # original member labels while the dataset/pairs use rep ids.
-        if collapse_map and internal_subtrees:
-            try:
-                remapped_internal = {}
-                for node_label, leaves in internal_subtrees.items():
-                    new_leaves = set()
-                    for leaf in leaves:
-                        # try direct mapping, then pipe-last token fallback
-                        rep = collapse_map.get(leaf)
-                        if rep is None and '|' in leaf:
-                            rep = collapse_map.get(leaf.split('|')[-1])
-                        # if id_map maps original headers to short ids prefer that
-                        if rep is None and id_map and leaf in id_map:
-                            rep = id_map.get(leaf)
-                        # fallback to the original leaf token
-                        if rep is None:
-                            rep = leaf
-                        new_leaves.add(rep)
-                    remapped_internal[node_label] = new_leaves
-                internal_subtrees = remapped_internal
-            except Exception:
-                # if remapping fails, keep original internal_subtrees
-                pass
 
         def _candidate_forms(x):
             forms = []
@@ -1088,229 +947,39 @@ def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = N
         ph_dataset_pairs = [(qid, col) for qid, col, _ in ph_pairs_tree]
         fa_dataset_pairs = [(qid, col) for qid, col, _ in fa_pairs_tree]
         ge_dataset_pairs = [(qid, col) for qid, col, _ in ge_pairs_tree]
-        # for symbol strips use the tree-resolved triplets (preserve tax_name)
-        ph_symbol_source = ph_pairs_tree
-        fa_symbol_source = fa_pairs_tree
-        ge_symbol_source = ge_pairs_tree
     else:
         ph_dataset_pairs = [(qid, col) for qid, col, _ in ph_pairs]
         fa_dataset_pairs = [(qid, col) for qid, col, _ in fa_pairs]
         ge_dataset_pairs = [(qid, col) for qid, col, _ in ge_pairs]
-        ph_symbol_source = ph_pairs
-        fa_symbol_source = fa_pairs
-        ge_symbol_source = ge_pairs
 
     write_colorstrip(out / 'itol_phylum_colors.itol', 'Phylum colors', ph_dataset_pairs, legend_pairs=ph_legend)
     write_colorstrip(out / 'itol_family_colors.itol', 'Family colors', fa_dataset_pairs, legend_pairs=fa_legend)
     write_colorstrip(out / 'itol_genus_colors.itol', 'Genus colors', ge_dataset_pairs, legend_pairs=ge_legend)
 
-    # Additionally produce TREE_COLORS-style files so branches can be coloured
-    # directly in iTOL without UI dataset conversion. Use TAB separators.
-    def write_tree_colors(path, title, pairs, legend_map):
-        with open(path, 'w') as f:
-            f.write('TREE_COLORS\n')
-            f.write('SEPARATOR TAB\n')
-            f.write('\n')
-            # legend entries (labels may contain commas; keep as-is but TAB-separated)
-            if legend_map:
-                labels = [lbl for lbl, _ in legend_map]
-                colors = [col for _, col in legend_map]
-                shapes = ['1'] * len(legend_map)
-                f.write('LEGEND_TITLE\t' + title + ' legend\n')
-                f.write('LEGEND_SHAPES\t' + '\t'.join(shapes) + '\n')
-                f.write('LEGEND_COLORS\t' + '\t'.join(colors) + '\n')
-                f.write('LEGEND_LABELS\t' + '\t'.join(labels) + '\n')
-                f.write('\n')
-            f.write('DATA\n')
-            # pairs are (id, color, tax_name)
-            for qid, col, _ in pairs:
-                # format: id<TAB>branch<TAB>color<TAB>style<TAB>width
-                f.write(f"{qid}\tbranch\t{col}\tnormal\t2\n")
-
-            # emit clade/range entries when internal_subtrees mapping is available
-            try:
-                # Build a mapping of tax_name -> set(leaf_ids) from the provided pairs
-                tax_to_leaves = {}
-                for qid, col, tname in pairs:
-                    tax_to_leaves.setdefault(tname, set()).add(qid)
-
-                # legend_map entries are (label,count) with label like 'Name (n)'.
-                # Build a canonical lookup from normalized tax name -> (label_base, color)
-                # so we can use exactly the same tax label text the colorstrip used
-                # when writing range labels. Normalization is forgiving to underscores
-                # vs spaces and case differences.
-                def _canon(n):
-                    if not n:
-                        return ''
-                    try:
-                        s = str(n)
-                    except Exception:
-                        s = ''
-                    import re as _re
-                    s = s.strip().lower()
-                    s = _re.sub(r"[\s_]+", '_', s)
-                    return s
-
-                legend_canon_map = {}
-                for lbl, col in legend_map:
-                    base = lbl.split(' (')[0]
-                    legend_canon_map[_canon(base)] = (base, col)
-
-                # Build list of tax items (tax_label_used_in_pairs, chosen_color, leaf_ids)
-                tax_items = []
-                for tax_name, leaf_ids in tax_to_leaves.items():
-                    if not leaf_ids:
-                        continue
-                    # prefer legend label exactly matching canon form
-                    can = _canon(tax_name)
-                    legend_match = legend_canon_map.get(can)
-                    if legend_match:
-                        chosen_label, col = legend_match
-                    else:
-                        # no legend match: try relaxed matching by comparing canon of legend keys
-                        # fallback: deterministic color
-                        chosen_label = tax_name
-                        rank = title.split()[0].lower() if title else None
-                        col = _name_to_color_by_rank(tax_name, rank)
-                    tax_items.append((chosen_label, col, leaf_ids))
-
-                # sort taxa by descending number of leaves so larger groups get
-                # reserved first (helps avoid splitting larger clades later)
-                tax_items.sort(key=lambda x: len(x[2]), reverse=True)
-
-                claimed_leaves = set()
-                for tax_label, col, leaf_ids in tax_items:
-                    if not leaf_ids:
-                        continue
-
-                    # Find monophyletic candidate nodes: nodes whose entire
-                    # subtree is contained within the set of leaves for this taxon.
-                    candidates = []
-                    for node_label, subtree in internal_subtrees.items():
-                        if subtree and subtree.issubset(leaf_ids):
-                            candidates.append((node_label, len(subtree), subtree))
-                    if not candidates:
-                        # no monophyletic subclades for this taxon
-                        continue
-
-                    # Keep only maximal candidate nodes (prefer larger enclosing
-                    # clades to avoid nested ranges). A maximal node is not a
-                    # strict subset of any other candidate's subtree.
-                    maximal = []
-                    for cand in candidates:
-                        node_label, size, subtree = cand
-                        is_subset = False
-                        for other in candidates:
-                            if other is cand:
-                                continue
-                            # if this candidate's subtree is strictly contained
-                            # in another candidate's subtree, mark as subset
-                            if subtree.issubset(other[2]) and subtree != other[2]:
-                                is_subset = True
-                                break
-                        if not is_subset:
-                            maximal.append(cand)
-
-                    # sort maximal nodes by descending size so larger blocks are
-                    # written first (helps with deterministic claims)
-                    maximal.sort(key=lambda x: x[1], reverse=True)
-
-                    # For each maximal monophyletic node, emit clade/range if it
-                    # does not overlap leaves already claimed by previously
-                    # written ranges. This avoids nested/conflicting ranges.
-                    for node_label, size, node_subtree in maximal:
-                        if claimed_leaves.isdisjoint(node_subtree):
-                            claimed_leaves.update(node_subtree)
-                            # use a darker stroke for clade outline and a bright fill for range
-                            stroke = _darken_hex(col, factor=0.35)
-                            # Use a stronger alpha for range fills so adjacent wedges remain distinct
-                            f.write(f"{node_label}\tclade\t{stroke}\tnormal\t2\n")
-                            f.write(f"{node_label}\trange\t{col}A0\t{tax_label}\n")
-            except Exception:
-                pass
-
-    write_tree_colors(out / 'itol_phylum_tree_colors.txt', 'Phylum colors', ph_pairs_tree, ph_legend)
-    write_tree_colors(out / 'itol_family_tree_colors.txt', 'Family colors', fa_pairs_tree, fa_legend)
-    write_tree_colors(out / 'itol_genus_tree_colors.txt', 'Genus colors', ge_pairs_tree, ge_legend)
-
-    # Remove any stale 'tree_colors_with_clades.txt' file from earlier runs
-    # to avoid confusion with the canonical 'itol_phylum_tree_colors.txt'.
-    try:
-        legacy = out / 'tree_colors_with_clades.txt'
-        if legacy.exists():
-            legacy.unlink()
-    except Exception:
-        pass
-
-    # write symbol strips to give an additional visual cue (shapes per name)
-    def write_symbolstrip(path, title, id_shape_color_triplets, legend_pairs=None):
-        with open(path, 'w') as f:
-            f.write('DATASET_SYMBOL\n')
-            f.write('SEPARATOR COMMA\n')
-            f.write(f'DATASET_LABEL,{title}\n')
-            # choose a neutral dataset color
-            dataset_color = legend_pairs[0][1] if legend_pairs and len(legend_pairs) > 0 else (id_shape_color_triplets[0][2] if id_shape_color_triplets else '#AAAAAA')
-            f.write(f'COLOR,{dataset_color}\n')
-            f.write('MARGIN,5\n')
-            f.write('SHOW_INTERNAL,0\n')
-            if legend_pairs:
-                labels = [lbl.replace(',', ';') for lbl, _ in legend_pairs]
-                colors = [col for _, col in legend_pairs]
-                # shapes: cycle through 1..12
-                shapes = [str((i % 12) + 1) for i in range(len(legend_pairs))]
-                f.write(f"LEGEND_TITLE,{title} legend\n")
-                f.write('LEGEND_SHAPES,' + ','.join(shapes) + '\n')
-                f.write('LEGEND_COLORS,' + ','.join(colors) + '\n')
-                f.write('LEGEND_LABELS,' + ','.join(labels) + '\n')
-            f.write('DATA\n')
-            for item in id_shape_color_triplets:
-                # accept triplet (id, shape, color)
-                if len(item) >= 3:
-                    id_, shape, col = item[0], item[1], item[2]
-                else:
-                    continue
-                f.write(f"{id_},{shape},{col}\n")
-
-    # prepare symbol triplets for each rank: id, shape, color
-    # choose shapes by mapping unique names to shape numbers 1..12
-    def _make_symbol_triplets(pairs, legend_map):
-        # pairs: list of (qid, color, tax_name)
-        # legend_map: list of (name_label, color)
-        shapes = {}
-        for i, (lbl, _) in enumerate(legend_map):
-            shapes[lbl] = str((i % 12) + 1)
-        triplets = []
-        for qid, col, tax_name in pairs:
-            # legend_map labels are like 'Name (count)'; extract base name
-            matched_shape = None
-            for lbl, _ in legend_map:
-                name = lbl.split(' (')[0]
-                if name == tax_name:
-                    matched_shape = shapes.get(lbl)
-                    break
-            if not matched_shape:
-                matched_shape = str((hash(qid) & 0x0f) + 1)
-            triplets.append((qid, matched_shape, col))
-        return triplets
-
-    ph_symbol_triplets = _make_symbol_triplets(ph_symbol_source, ph_legend)
-    fa_symbol_triplets = _make_symbol_triplets(fa_symbol_source, fa_legend)
-    ge_symbol_triplets = _make_symbol_triplets(ge_symbol_source, ge_legend)
-
-    write_symbolstrip(out / 'itol_phylum_symbols.itol', 'Phylum symbols', ph_symbol_triplets, legend_pairs=ph_legend)
-    write_symbolstrip(out / 'itol_family_symbols.itol', 'Family symbols', fa_symbol_triplets, legend_pairs=fa_legend)
-    write_symbolstrip(out / 'itol_genus_symbols.itol', 'Genus symbols', ge_symbol_triplets, legend_pairs=ge_legend)
-
-    # write combined per-node CSV for convenience
-    with open(out / 'itol_combined_colors.csv', 'w') as f:
-        f.write('id,phylum_color,family_color,genus_color,user_color\n')
-        for row in combined_lines:
-            f.write(','.join(row) + '\n')
-
     # write user-provided colors as iTOL dataset if any
     if user_colors:
         user_pairs = [(rid, col) for rid, col in user_colors.items()]
         write_colorstrip(out / 'itol_user_colors.itol', 'User colors', user_pairs)
+
+    # Keep only one iTOL metadata file per metadata type: the colorstrip.
+    # Branch TREE_COLORS files and DATASET_SYMBOL files are alternative
+    # encodings of the same metadata and made workflow outputs noisy.
+    for stale_name in (
+        'itol_phylum_tree_colors.txt',
+        'itol_family_tree_colors.txt',
+        'itol_genus_tree_colors.txt',
+        'itol_phylum_symbols.itol',
+        'itol_family_symbols.itol',
+        'itol_genus_symbols.itol',
+        'itol_combined_colors.csv',
+        'tree_colors_with_clades.txt',
+    ):
+        try:
+            stale = out / stale_name
+            if stale.exists():
+                stale.unlink()
+        except Exception:
+            pass
 
     return str(out)
 
@@ -1749,7 +1418,7 @@ def generate_rumen_function_draft(
 ) -> tuple:
     """Auto-generate a draft rumen functional annotation from a taxonomy TSV.
 
-    Reads the combined taxonomy TSV produced by a Relict run and maps each
+    Reads the combined taxonomy TSV produced by a PhyloSelect run and maps each
     sequence to one of the broad ruminant microbiome functional groups defined
     in :data:`_RUMEN_FUNC_PALETTE`.
 
@@ -1900,4 +1569,3 @@ def generate_rumen_function_draft(
         return str(tsv_path), None
 
     return str(tsv_path), str(itol_path)
-
