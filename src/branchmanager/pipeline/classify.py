@@ -1,12 +1,12 @@
 """
-classify.py — Taxonomic classification for PhyloSelect.
+classify.py — Taxonomic classification for BranchManager.
 
 Uses VSEARCH --usearch_global against a reference database (GreenGenes2,
 SILVA, or custom) to assign taxonomy to query sequences.
 
 Key design decisions
 --------------------
-- Reference anchors (PHYLOSELECT_REF_* headers) are excluded from output.
+- Reference anchors (BRANCHMANAGER_REF_* headers) are excluded from output.
 - The taxonomy lookup map is built once at load time for performance.
 - vsearch is run at --id 0.8 minimum identity — this is for taxonomy only.
   Novelty detection (novelty.py) runs its own separate vsearch at a lower
@@ -26,11 +26,11 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from phyloselect.taxonomy import parse_reference_header_taxonomy, reference_lookup_keys
-from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
-from phyloselect.utils.fasta import read_fasta, write_fasta
-from phyloselect.utils.subprocess import run_cmd
-from phyloselect.pipeline.tree import is_ref_anchor
+from branchmanager.taxonomy import parse_reference_header_taxonomy, reference_lookup_keys
+from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
+from branchmanager.utils.fasta import read_fasta, write_fasta
+from branchmanager.utils.subprocess import run_cmd
+from branchmanager.pipeline.tree import is_ref_anchor
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +375,7 @@ def run_classification(
     outdir/taxonomy.tsv  — TSV with columns:
         ID  BestHit  Identity  Taxon  Confidence
 
-    Reference anchor sequences (PHYLOSELECT_REF_*) are excluded from output.
+    Reference anchor sequences (BRANCHMANAGER_REF_*) are excluded from output.
 
     Returns
     -------
@@ -665,7 +665,7 @@ def run_all_classifications(
 
     Side effects
     ------------
-    * ``taxonomy.tsv``                   – main DB (backwards-compatible)
+    * ``taxonomy.tsv``                   - main DB
     * ``taxonomy_<name>.tsv``            – one file per additional DB
     * ``taxonomy_all_dbs.tsv``           – wide merged table (multi-DB only)
     """

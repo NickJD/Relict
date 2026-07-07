@@ -12,7 +12,7 @@ from html import escape as html_escape
 from pathlib import Path
 from typing import Iterable, Optional
 
-from phyloselect.utils.fasta import read_fasta, reverse_complement, write_fasta
+from branchmanager.utils.fasta import read_fasta, reverse_complement, write_fasta
 
 
 logger = logging.getLogger(__name__)
@@ -1052,7 +1052,7 @@ def _classify_output_qc(
     elif recommendation == 'MANUAL_REVIEW':
         suggested_action = 'Inspect chromatograms/overlap manually; accept only if trace evidence supports the consensus.'
     else:
-        suggested_action = 'Accept for downstream PhyloSelect evaluate.'
+        suggested_action = 'Accept for downstream BranchManager evaluate.'
     reasons = fail_reasons + warn_reasons
     return {
         'qc_class': qc_class,
@@ -1683,7 +1683,7 @@ def run_sanger(
         mode_counts[mode] = mode_counts.get(mode, 0) + 1
     summary_txt.write_text(
         '\n'.join([
-            'PhyloSelect Sanger/AB1 Processing Summary',
+            'BranchManager Sanger/AB1 Processing Summary',
             f'Input files: {len(files)}',
             f'Reads parsed: {len(reads)}',
             f'Minimum trimmed read length: {read_min_length}',

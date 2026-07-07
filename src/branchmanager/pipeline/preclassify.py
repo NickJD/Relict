@@ -1,8 +1,8 @@
-"""Pre-classification pipeline for PhyloSelect.
+"""Pre-classification pipeline for BranchManager.
 
 This module classifies one or more FASTA files (reference collections such as
 Hungate 16S, SILVA, RDP etc.) against a reference database using vsearch and
-writes taxonomy outputs that the main PhyloSelect pipeline can consume without
+writes taxonomy outputs that the main BranchManager pipeline can consume without
 requiring on-the-fly classification at each run.
 
 Output files written to *outdir*
@@ -10,14 +10,14 @@ Output files written to *outdir*
   {dataset}_classification.tsv   Full vsearch matches (ID, BestHit, Identity,
                                   Taxon, Confidence).  Human readable.
   {dataset}_taxonomy.tsv         Condensed (ID, Taxon, Confidence).  Passable
-                                  directly to ``phyloselect preload --taxa-assignments``.
+                                  directly to ``branchmanager preload --taxa-assignments``.
   {dataset}_taxonomic_disagreement.tsv
                                   High-quality candidate hits that resolve to
                                   multiple different taxonomies.
   combined_taxonomy.tsv          All datasets merged with Dataset column.
   pipeline_taxonomy.tsv          All datasets merged without Dataset column;
-                                  passable directly to ``phyloselect preload`` or
-                                  ``phyloselect run`` via ``--taxa-assignments``.
+                                  passable directly to ``branchmanager preload`` or
+                                  ``branchmanager run`` via ``--taxa-assignments``.
   preclassify_summary.txt        Plain-text human-readable classification
                                   summary (counts, dataset labels, top hits).
 """
@@ -32,7 +32,7 @@ import textwrap
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
+from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
 
 logger = logging.getLogger(__name__)
 
@@ -504,7 +504,7 @@ def _write_taxonomic_disagreement_tsv(
 def _write_fasta_subset(source_fasta: str, target_ids: set, out_path: str) -> int:
     """Write sequences from *source_fasta* whose IDs are in *target_ids* to *out_path*.
 
-    Does a plain-text scan so it works even when phyloselect.utils.fasta is unavailable.
+    Does a plain-text scan so it works even when branchmanager.utils.fasta is unavailable.
     Returns the number of sequences written.
     """
     written = 0
@@ -565,7 +565,7 @@ def classify_fasta(
     low_confidence_tsv, taxonomic_disagreement_tsv, n_input, n_classified,
     n_unclassified, n_low_confidence, n_taxonomic_disagreements.
     """
-    from phyloselect.utils.fasta import read_fasta, write_fasta
+    from branchmanager.utils.fasta import read_fasta, write_fasta
 
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
@@ -723,7 +723,7 @@ def classify_fasta(
 
     if not taxa_map:
         try:
-            from phyloselect.pipeline.classify import _load_taxa_map_from_reference_fasta
+            from branchmanager.pipeline.classify import _load_taxa_map_from_reference_fasta
             taxa_map, _warn = _load_taxa_map_from_reference_fasta(ref_to_use)
             if taxa_map:
                 logger.info(
@@ -991,7 +991,7 @@ def run_preclassify(
     logger.info("[PRECLASSIFY] Wrote combined taxonomy (%d rows) → %s", len(combined_rows), combined_path)
 
     # Pipeline-compatible taxonomy (without Dataset column)
-    # Pass directly as --taxa-assignments to ``phyloselect preload`` or ``phyloselect run``.
+    # Pass directly as --taxa-assignments to ``branchmanager preload`` or ``branchmanager run``.
     pipeline_combined_path = os.path.join(outdir, "pipeline_taxonomy.tsv")
     with open(pipeline_combined_path, "w", newline="") as fh:
         fh.write("ID\tTaxon\tConfidence\n")
@@ -1159,7 +1159,7 @@ def _write_summary(
 ) -> None:
     lines: List[str] = []
     lines.append("=" * 70)
-    lines.append("PhyloSelect  –  Pre-classification summary")
+    lines.append("BranchManager  –  Pre-classification summary")
     lines.append("=" * 70)
     lines.append(f"\nReference FASTA : {ref_fasta}")
     if taxa_tsv:
@@ -1375,11 +1375,11 @@ def _write_summary(
     lines.append(f"Total rows in combined taxonomy          : {len(combined_rows)}")
     lines.append("")
     lines.append("─" * 70)
-    lines.append("How to use these outputs with PhyloSelect")
+    lines.append("How to use these outputs with BranchManager")
     lines.append("─" * 70)
     lines.append(
         "\n1. Preload a classified dataset (taxonomy pre-computed, no re-classification):\n"
-        "   phyloselect preload \\\n"
+        "   branchmanager preload \\\n"
         "     --fasta <original_fasta.fasta> \\\n"
         f"     --taxa-assignments {pipeline_combined_path} \\\n"
         "     --db my_project.db \\\n"
@@ -1388,7 +1388,7 @@ def _write_summary(
     )
     lines.append(
         "2. Run the main pipeline using the pre-classified taxonomy:\n"
-        "   phyloselect run \\\n"
+        "   branchmanager run \\\n"
         "     --input my_samples.fasta \\\n"
         "     --ref <ref.fasta> \\\n"
         f"     --taxa-assignments {pipeline_combined_path} \\\n"

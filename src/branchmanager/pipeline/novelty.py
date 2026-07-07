@@ -1,5 +1,5 @@
 """
-novelty.py — Novelty detection for PhyloSelect.
+novelty.py — Novelty detection for BranchManager.
 
 Novelty is expressed as the identity percentage of the best hit against
 the reference database. This gives a gradient from 0 (no hit at all, or
@@ -28,9 +28,9 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from phyloselect.pipeline import tree as tree_pipeline
-from phyloselect.utils.fasta import read_fasta, write_fasta
-from phyloselect.utils.subprocess import run_cmd
+from branchmanager.pipeline import tree as tree_pipeline
+from branchmanager.utils.fasta import read_fasta, write_fasta
+from branchmanager.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ def run_novelty(
     Novelty is measured against previously submitted sequences (preload + other
     runs already in the DB).  This means a sequence is "novel" if it is more
     than ``1 - id_threshold`` different from everything the user has already
-    submitted to PhyloSelect, not from a global reference.
+    submitted to BranchManager, not from a global reference.
 
     If ``target_fasta`` is given, novelty is measured against those sequences
     instead of (or as a supplement to) the DB-derived sequences.
@@ -159,7 +159,7 @@ def run_novelty(
     else:
         logger.info(
             "[NOVELTY] No previously submitted sequences available and no --target FASTA provided; "
-            "all input sequences will be treated as novel. Consider running `phyloselect preload` first "
+            "all input sequences will be treated as novel. Consider running `branchmanager preload` first "
             "to build a baseline database."
         )
 
@@ -409,7 +409,7 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
     novel_results = {}
     if db_preset_fasta.exists():
         try:
-            from phyloselect.utils.subprocess import run_cmd
+            from branchmanager.utils.subprocess import run_cmd
             novelty_matches = Path(outdir) / 'novelty_matches.tsv'
             thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
             cmd = f"vsearch --usearch_global {mapped_derep} --db {db_preset_fasta} --id 0.5 --strand both --blast6out {novelty_matches} --maxaccepts 1 --maxhits 1{thread_flag}"
@@ -435,7 +435,7 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
     if not run_ids:
         return None
 
-    from phyloselect.pipeline import itol
+    from branchmanager.pipeline import itol
 
     nov_lines = [
         'DATASET_COLORSTRIP',
@@ -932,7 +932,7 @@ def build_reference_novelty_metrics(
     sequences (preload + all other run datasets stored in the DB), NOT against
     the external reference database.  This ensures that novelty is always
     expressed relative to the sequences *the user* has already characterised,
-    which is the core PhyloSelect design goal.
+    which is the core BranchManager design goal.
 
     If ``target_fasta`` is provided it overrides both the DB lookup and the
     ``ref_fasta`` fallback — only those sequences are used as the density

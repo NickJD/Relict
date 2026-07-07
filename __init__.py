@@ -1,3 +1,0 @@
-"""PhyloSelect project metadata."""
-
-__version__ = "0.1"

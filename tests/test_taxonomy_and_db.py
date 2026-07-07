@@ -14,29 +14,30 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from phyloselect.cli import _find_preferred_id_map, _load_evaluate_baseline, _load_partner_metadata_for_run, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_preload, cmd_run
-from phyloselect.db.interface import Database
-from phyloselect.pipeline import classify as classify_pipeline
-from phyloselect.pipeline import novelty as novelty_pipeline
-from phyloselect.pipeline import preclassify as preclassify_pipeline
-from phyloselect.pipeline import mwl as mwl_pipeline
-from phyloselect.pipeline import qc as qc_pipeline
-from phyloselect.pipeline import sanger as sanger_pipeline
-from phyloselect.pipeline.classify import _load_taxa_map_from_reference_fasta, validate_reference_taxonomy_consistency
-from phyloselect.pipeline.collapse import collapse_fasta_within_taxa
-from phyloselect.pipeline.itol import generate_itol_colors, write_dataset_membership_strip
-from phyloselect.pipeline.novelty import build_reference_novelty_metrics
-from phyloselect.pipeline.tree import (
+from branchmanager.cli import _find_preferred_id_map, _load_evaluate_baseline, _load_partner_metadata_for_run, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_preload, cmd_run
+from branchmanager.db.interface import Database
+from branchmanager.pipeline import classify as classify_pipeline
+from branchmanager.pipeline import novelty as novelty_pipeline
+from branchmanager.pipeline import preclassify as preclassify_pipeline
+from branchmanager.pipeline import mwl as mwl_pipeline
+from branchmanager.pipeline import qc as qc_pipeline
+from branchmanager.pipeline import sanger as sanger_pipeline
+from branchmanager.pipeline.classify import _load_taxa_map_from_reference_fasta, validate_reference_taxonomy_consistency
+from branchmanager.pipeline.collapse import collapse_fasta_within_taxa
+from branchmanager.pipeline.itol import generate_itol_colors, write_dataset_membership_strip
+from branchmanager.pipeline.novelty import build_reference_novelty_metrics
+from branchmanager.pipeline.tree import (
     _orient_tree_input_fasta,
     _label_internal_nodes,
-    _repair_legacy_internal_node_labels,
+    _repair_internal_node_label_delimiters,
     build_combined_fasta,
     collect_tree_build_warnings,
     initialise_or_update_tree,
     summarize_alignment_quality,
+    _prune_anchor_leaves,
 )
-from phyloselect.utils.fasta import read_fasta, reverse_complement
-from phyloselect.pipeline.workflow_helpers import (
+from branchmanager.utils.fasta import read_fasta, reverse_complement
+from branchmanager.pipeline.workflow_helpers import (
     _assignment_source_is_fasta,
     build_placement_warning_rows,
     build_sequence_assessment_rows,
@@ -46,7 +47,7 @@ from phyloselect.pipeline.workflow_helpers import (
     merge_combined_taxonomy_rows,
     write_selection_summary_tsv,
 )
-from phyloselect.taxonomy import (
+from branchmanager.taxonomy import (
     canonicalize_sequence_id,
     parse_taxon_string,
     taxonomy_matches_kingdom,
@@ -557,16 +558,16 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 anchor_file=None,
             )
 
-            with mock.patch('phyloselect.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.classify.run_classification', side_effect=fake_run_classification) as classify_mock, \
-                 mock.patch('phyloselect.cli.novelty.run_novelty', side_effect=fake_run_novelty) as novelty_mock, \
-                 mock.patch('phyloselect.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
-                 mock.patch('phyloselect.cli.tree.initialise_or_update_tree'), \
-                 mock.patch('phyloselect.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('phyloselect.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('phyloselect.cli.itol.generate_itol_colors'), \
-                 mock.patch('phyloselect.cli.novelty.build_run_novelty_itol'):
+            with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification) as classify_mock, \
+                 mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty) as novelty_mock, \
+                 mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
+                 mock.patch('branchmanager.cli.tree.initialise_or_update_tree'), \
+                 mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
+                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
                 cmd_run(args)
 
             self.assertEqual(classify_mock.call_args.kwargs['ref_fasta'], str(ref_fasta))
@@ -637,16 +638,16 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 shorten_ids=False,
             )
 
-            with mock.patch('phyloselect.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.classify.run_classification', side_effect=fake_run_classification), \
-                 mock.patch('phyloselect.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
-                 mock.patch('phyloselect.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
-                 mock.patch('phyloselect.cli.tree.initialise_or_update_tree'), \
-                 mock.patch('phyloselect.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('phyloselect.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('phyloselect.cli.itol.generate_itol_colors'), \
-                 mock.patch('phyloselect.cli.novelty.build_run_novelty_itol'):
+            with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification), \
+                 mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
+                 mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
+                 mock.patch('branchmanager.cli.tree.initialise_or_update_tree'), \
+                 mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
+                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
                 cmd_run(args)
 
             headers = [h for h, _ in read_fasta(outdir / 'intermediate' / 'derep_short.fasta')]
@@ -719,16 +720,16 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 shorten_ids=False,
             )
 
-            with mock.patch('phyloselect.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.classify.run_classification', side_effect=fake_run_classification), \
-                 mock.patch('phyloselect.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
-                 mock.patch('phyloselect.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
-                 mock.patch('phyloselect.cli.tree.initialise_or_update_tree'), \
-                 mock.patch('phyloselect.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('phyloselect.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('phyloselect.cli.itol.generate_itol_colors'), \
-                 mock.patch('phyloselect.cli.novelty.build_run_novelty_itol'):
+            with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification), \
+                 mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
+                 mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
+                 mock.patch('branchmanager.cli.tree.initialise_or_update_tree'), \
+                 mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
+                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
                 cmd_run(args)
 
             db = Database(str(db_path))
@@ -798,16 +799,16 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 shorten_ids=True,
             )
 
-            with mock.patch('phyloselect.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('phyloselect.cli.classify.run_classification', side_effect=fake_run_classification), \
-                 mock.patch('phyloselect.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
-                 mock.patch('phyloselect.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
-                 mock.patch('phyloselect.cli.tree.initialise_or_update_tree') as tree_mock, \
-                 mock.patch('phyloselect.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('phyloselect.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('phyloselect.cli.itol.generate_itol_colors'), \
-                 mock.patch('phyloselect.cli.novelty.build_run_novelty_itol'):
+            with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification), \
+                 mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
+                 mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
+                 mock.patch('branchmanager.cli.tree.initialise_or_update_tree') as tree_mock, \
+                 mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
+                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
                 cmd_run(args)
 
             self.assertEqual(tree_mock.call_args.kwargs['preload_dir'], str(preload_dir))
@@ -842,7 +843,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(class_path)
 
-            with mock.patch('phyloselect.cli.classify.run_classification', side_effect=fake_run_classification):
+            with mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification):
                 baseline_out = _load_evaluate_baseline(args, db, str(outdir), str(ref), None, 1)
 
             self.assertEqual(baseline_out, str(outdir / 'baseline_preload'))
@@ -903,7 +904,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 'sequence_id\tselected_for_genome_sequencing\n'
                 'IsoA\tyes\n'
             )
-            from phyloselect.partner_metadata import load_partner_sequencing_metadata
+            from branchmanager.partner_metadata import load_partner_sequencing_metadata
 
             with self.assertRaisesRegex(ValueError, 'partner acronym'):
                 load_partner_sequencing_metadata(str(metadata))
@@ -938,7 +939,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                     'Q2': ('R1', 99.9),
                 }
 
-            with mock.patch('phyloselect.pipeline.preclassify._run_vsearch_pass', side_effect=fake_run_vsearch_pass):
+            with mock.patch('branchmanager.pipeline.preclassify._run_vsearch_pass', side_effect=fake_run_vsearch_pass):
                 res = preclassify_pipeline.classify_fasta(
                     fasta_path=str(query),
                     ref_fasta=str(ref),
@@ -1227,7 +1228,7 @@ class OutputHelperTests(unittest.TestCase):
                 self.assertIsNotNone(m)
                 Path(m.group(1)).write_text('Q1\tREF1\t99.0\t4\t0\t0\t4\t1\t1\t4\t-1\t0\n')
 
-            with mock.patch('phyloselect.pipeline.tree.run_cmd', side_effect=fake_run_cmd):
+            with mock.patch('branchmanager.pipeline.tree.run_cmd', side_effect=fake_run_cmd):
                 oriented, rows = _orient_tree_input_fasta(
                     str(query),
                     ref_fasta=str(ref),
@@ -1268,7 +1269,7 @@ class OutputHelperTests(unittest.TestCase):
                         hits.append('U1\tREF1\t99.0\t4\t0\t0\t4\t1\t1\t4\t-1\t0')
                 matches_path.write_text('\n'.join(hits) + ('\n' if hits else ''))
 
-            with mock.patch('phyloselect.pipeline.tree.run_cmd', side_effect=fake_run_cmd):
+            with mock.patch('branchmanager.pipeline.tree.run_cmd', side_effect=fake_run_cmd):
                 combined = build_combined_fasta(
                     str(user),
                     tmp,
@@ -1312,9 +1313,9 @@ class OutputHelperTests(unittest.TestCase):
                 Path(output_fasta).write_text('>BASE\nAAAA\n>Q1\nAGTC\n')
                 return True
 
-            with mock.patch('phyloselect.pipeline.tree.run_cmd', side_effect=fake_run_cmd), \
-                 mock.patch('phyloselect.pipeline.tree._run_mafft_addfragments', side_effect=fake_addfragments), \
-                 mock.patch('phyloselect.pipeline.tree._run_fasttree', return_value=True):
+            with mock.patch('branchmanager.pipeline.tree.run_cmd', side_effect=fake_run_cmd), \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_addfragments', side_effect=fake_addfragments), \
+                 mock.patch('branchmanager.pipeline.tree._run_fasttree', return_value=True):
                 initialise_or_update_tree(
                     ref_fasta=str(ref),
                     user_fasta=str(user),
@@ -1351,11 +1352,11 @@ class OutputHelperTests(unittest.TestCase):
                 Path(output_fasta).write_text('>BASE\n' + ('A' * 1500) + '\n>Q1\n' + ('A' * 1400) + '\n')
                 return True
 
-            with mock.patch('phyloselect.pipeline.tree.run_cmd', side_effect=fake_run_cmd), \
-                 mock.patch('phyloselect.pipeline.tree._run_mafft_full', return_value=False) as full_mock, \
-                 mock.patch('phyloselect.pipeline.tree._run_mafft_add', side_effect=fake_add) as add_mock, \
-                 mock.patch('phyloselect.pipeline.tree._run_mafft_addfragments', return_value=False) as addfrag_mock, \
-                 mock.patch('phyloselect.pipeline.tree._run_fasttree', return_value=True):
+            with mock.patch('branchmanager.pipeline.tree.run_cmd', side_effect=fake_run_cmd), \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_full', return_value=False) as full_mock, \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_add', side_effect=fake_add) as add_mock, \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_addfragments', return_value=False) as addfrag_mock, \
+                 mock.patch('branchmanager.pipeline.tree._run_fasttree', return_value=True):
                 initialise_or_update_tree(
                     ref_fasta=str(ref),
                     user_fasta=str(user),
@@ -1385,7 +1386,7 @@ class OutputHelperTests(unittest.TestCase):
                 seen['cmd'] = cmd
                 (tmp / 'matches.tsv').write_text('')
 
-            with mock.patch('phyloselect.pipeline.classify.run_cmd', side_effect=fake_run_cmd):
+            with mock.patch('branchmanager.pipeline.classify.run_cmd', side_effect=fake_run_cmd):
                 classify_pipeline.run_classification(str(query), str(tmp), ref_fasta=str(ref))
 
             self.assertIn('--strand both', seen['cmd'])
@@ -1404,7 +1405,7 @@ class OutputHelperTests(unittest.TestCase):
                 seen['cmd'] = cmd
                 (tmp / 'novelty_matches.tsv').write_text('')
 
-            with mock.patch('phyloselect.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
+            with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
                 novelty_pipeline.run_novelty(str(query), str(ref), str(tmp), target_fasta=str(ref))
 
             self.assertIn('--strand both', seen['cmd'])
@@ -1429,7 +1430,7 @@ class OutputHelperTests(unittest.TestCase):
                 'tax1': [('S1', 'ACGT'), ('S2', 'ACGT')],
                 'tax2': [('S3', 'TGCA')],
             }
-            with mock.patch('phyloselect.pipeline.collapse.shutil.which', return_value=None):
+            with mock.patch('branchmanager.pipeline.collapse.shutil.which', return_value=None):
                 artifacts = collapse_fasta_within_taxa(
                     taxa_groups,
                     tmpdir,
@@ -1452,12 +1453,12 @@ class OutputHelperTests(unittest.TestCase):
         self.assertIn('NODE', labeled)
         self.assertNotIn('::', labeled)
 
-    def test_repair_legacy_internal_node_labels(self):
+    def test_repair_internal_node_label_delimiters(self):
         broken = '((A:0.1,B:0.2)NODE0001::0.3,C:0.4);'
-        repaired = _repair_legacy_internal_node_labels(broken)
+        repaired = _repair_internal_node_label_delimiters(broken)
         self.assertEqual(repaired, '((A:0.1,B:0.2)NODE0001:0.3,C:0.4);')
 
-    def test_generate_itol_colors_repairs_legacy_tree_labels(self):
+    def test_generate_itol_colors_repairs_malformed_tree_labels(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             taxonomy_tsv = tmp / 'combined_taxonomy.tsv'
@@ -1478,7 +1479,7 @@ class OutputHelperTests(unittest.TestCase):
             tmp = Path(tmpdir)
             user_fasta = tmp / 'user.fasta'
             user_fasta.write_text('>A\nACGT\n>B\nACGTNNNN\n')
-            with mock.patch('phyloselect.pipeline.tree.load_anchor_sequences', return_value=[]):
+            with mock.patch('branchmanager.pipeline.tree.load_anchor_sequences', return_value=[]):
                 warnings = collect_tree_build_warnings(str(user_fasta), anchor_file='missing_anchor_file.fasta')
             cats = {w['category'] for w in warnings}
             self.assertIn('LOW_SEQUENCE_COUNT', cats)
@@ -1577,7 +1578,7 @@ class OutputHelperTests(unittest.TestCase):
                 density = Path(parts[parts.index('--blast6out') + 1])
                 density.write_text('Q1\tR1\t99.2\nQ1\tR2\t97.4\nQ1\tR3\t95.1\n')
 
-            with mock.patch('phyloselect.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
+            with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
                 out = build_reference_novelty_metrics(str(input_fasta), str(ref_fasta), str(novelty_tsv), str(tmp))
 
             text = Path(out).read_text()
@@ -1620,7 +1621,7 @@ class OutputHelperTests(unittest.TestCase):
                 else:
                     out.write_text('')
 
-            with mock.patch('phyloselect.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
+            with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
                 out = build_reference_novelty_metrics(
                     str(input_fasta),
                     str(ref_fasta),
@@ -1682,7 +1683,7 @@ class OutputHelperTests(unittest.TestCase):
                 else:
                     out.write_text('')
 
-            with mock.patch('phyloselect.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
+            with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
                 out = build_reference_novelty_metrics(
                     str(input_fasta),
                     str(ref_fasta),

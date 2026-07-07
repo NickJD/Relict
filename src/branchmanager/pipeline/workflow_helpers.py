@@ -6,9 +6,9 @@ import csv
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
-from phyloselect.taxonomy import parse_reference_header_taxonomy, taxonomy_matches_kingdom
-from phyloselect.utils.fasta import read_fasta
+from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
+from branchmanager.taxonomy import parse_reference_header_taxonomy, taxonomy_matches_kingdom
+from branchmanager.utils.fasta import read_fasta
 
 
 ClassificationRow = Dict[str, object]

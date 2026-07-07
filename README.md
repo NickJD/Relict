@@ -1,12 +1,14 @@
-# PhyloSelect -  WARNING - BETA! - This tool is in early development. Expect bugs, breaking changes, and rough edges. Please report issues and contribute improvements!
+# BranchManager -  WARNING - BETA! - This tool is in early development. Expect bugs, breaking changes, and rough edges. Please report issues and contribute improvements!
 
 **Marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation for genome-sequencing candidate selection.**
 
-PhyloSelect helps answer the question:
+BranchManager helps answer the question:
 
 > Has this lineage already been seen and characterised, or is it still poorly represented enough to justify deeper follow-up such as whole-genome sequencing?
 
 It combines Sanger/AB1 quality control, marker-gene taxonomic classification, nearest-neighbour novelty scoring, neighbourhood density (crowding), Most Wanted List matching, and phylogenetic tree visualisation into sequence assessment and selection reports.
+
+The canonical toolkit name, command, and Python package are `BranchManager`, `branchmanager`, and `branchmanager.*`.
 
 ![Hungate_Plus_NewSequences_example.jpg](examples/Hungate_Plus_NewSequences_example.jpg)
 
@@ -16,7 +18,7 @@ It combines Sanger/AB1 quality control, marker-gene taxonomic classification, ne
 
 ```bash
 # 1. Load a baseline dataset and build a reference tree
-phyloselect preload \
+branchmanager preload \
   --fasta hungate.fasta \
   --db project.db \
   --dataset Hungate \
@@ -26,7 +28,7 @@ phyloselect preload \
   --threads 10
 
 # 2. Process new sequences — scores novelty against the baseline
-phyloselect run \
+branchmanager run \
   --input new_sequences.fasta \
   --db project.db \
   --dataset Batch1 \
@@ -36,14 +38,14 @@ phyloselect run \
   --threads 10
 
 # 3. Zoom into a specific taxon
-phyloselect subtree \
+branchmanager subtree \
   --db project.db \
   --taxon archaea \
   --from-dir preload_out \
   -o archaea_out
 
 # 4. Regenerate iTOL files with new grouping options
-phyloselect regen-itol \
+branchmanager regen-itol \
   --db project.db \
   --out preload_out \
   --group-phyla archaea \
@@ -56,9 +58,9 @@ phyloselect regen-itol \
 
 ### Novelty is relative to YOUR submitted sequences
 
-All novelty and neighbourhood-density calculations are made against the sequences submitted to PhyloSelect (the preload database plus all prior `run` datasets stored in the DB). They are **not** made against the full external reference (GTDB/SILVA) unless no user-submitted sequences are present.
+All novelty and neighbourhood-density calculations are made against the sequences submitted to BranchManager (the preload database plus all prior `run` datasets stored in the DB). They are **not** made against the full external reference (GTDB/SILVA) unless no user-submitted sequences are present.
 
-This is intentional: PhyloSelect helps you judge whether a new sequence is worth investigating relative to what your lab or project has already characterised — not relative to all known biology.
+This is intentional: BranchManager helps you judge whether a new sequence is worth investigating relative to what your lab or project has already characterised — not relative to all known biology.
 
 Each successive `run` extends the reference pool, so novelty scores become increasingly precise as your project grows.
 
@@ -70,7 +72,7 @@ The phylogenetic tree is built from three independent layers:
 |---|---|---|
 | 1 — Anchors | 26 NCBI RefSeq anchor sequences (bundled) | **No** — invisible topology scaffolding |
 | 2 — Preload | Your baseline dataset (e.g. Hungate) | Yes |
-| 3 — Run sequences | Each new `phyloselect run` batch | Yes |
+| 3 — Run sequences | Each new `branchmanager run` batch | Yes |
 
 Anchor sequences constrain phylum-level topology during MAFFT + FastTree inference, then are pruned from the stored newick. They are never shown in outputs, iTOL files, or novelty scoring.
 
@@ -78,12 +80,12 @@ Anchor sequences constrain phylum-level topology during MAFFT + FastTree inferen
 
 ## Subcommands
 
-### `phyloselect preload`
+### `branchmanager preload`
 
 Load a baseline FASTA dataset, classify against a reference, and build the backbone tree. This is always the first step.
 
 ```bash
-phyloselect preload \
+branchmanager preload \
   --fasta baseline.fasta \
   --db project.db \
   --dataset Hungate \
@@ -97,7 +99,7 @@ phyloselect preload \
 | Parameter | Required | Default | Description |
 |---|---|---|---|
 | `--fasta` | ✓ | — | Input FASTA file containing the baseline sequences |
-| `--db` | ✓ | — | Path to the PhyloSelect SQLite database (created if absent) |
+| `--db` | ✓ | — | Path to the BranchManager SQLite database (created if absent) |
 | `-o / --out` | | `.` | Output directory for tree, iTOL files, and reports |
 | `--dataset` | ✓ | — | Label stored in the DB (e.g. `Hungate`) |
 | `--ref` | | — | Reference FASTA (GTDB/SILVA reps) for classification and tree orientation |
@@ -109,7 +111,6 @@ phyloselect preload \
 | `--collapse` | | off | Collapse near-identical same-taxonomy sequences into one representative for the tree |
 | `--collapse-threshold` | | `99.8` | Identity threshold (%) for collapsing |
 | `--sequence-domain` | | `bacteria` | Domain/profile to process: `bacteria`, `archaea`, `fungi`, or `mixed`/`all`/`none` to disable filtering. Use matching references, preloads, and anchors for non-bacterial runs |
-| `--kingdom` | | — | Backward-compatible explicit domain/kingdom filter; overrides `--sequence-domain` |
 | `--anchors` | | bundled | Custom anchor FASTA for tree topology scaffolding |
 | `--threads` | | `4` | CPU threads for MAFFT and VSEARCH |
 | `--colors` | | — | CSV mapping sequence IDs to custom hex colours for iTOL (columns: `id`, `color`) |
@@ -118,12 +119,12 @@ phyloselect preload \
 
 ---
 
-### `phyloselect sanger` / `phyloselect ab1`
+### `branchmanager sanger` / `branchmanager ab1`
 
-Convert Sanger AB1 chromatograms or already-basecalled primer reads into a trimmed FASTA for `evaluate`. When multiple reads belong to the same isolate, for example `27F` and `907R`, PhyloSelect orients reverse-primer reads and builds a quality-aware overlap consensus.
+Convert Sanger AB1 chromatograms or already-basecalled primer reads into a trimmed FASTA for `evaluate`. When multiple reads belong to the same isolate, for example `27F` and `907R`, BranchManager orients reverse-primer reads and builds a quality-aware overlap consensus.
 
 ```bash
-phyloselect sanger \
+branchmanager sanger \
   --input sanger_reads/ \
   -o sanger_out \
   --min-quality 20 \
@@ -131,7 +132,7 @@ phyloselect sanger \
   --min-length 800 \
   --min-overlap 40
 
-phyloselect evaluate \
+branchmanager evaluate \
   --input sanger_out/assembled.fasta \
   --partner-metadata new_sequences_metadata.tsv \
   --db project.db \
@@ -140,7 +141,7 @@ phyloselect evaluate \
   -o batch1_out
 ```
 
-If filenames are structured like `Iso001_27F.ab1` and `Iso001_907R.ab1`, PhyloSelect infers `Iso001` as the sequence ID, keeps `27F` forward, and reverse-complements `907R` before assembly. If filenames are not informative, provide `--read-metadata` as CSV/TSV:
+If filenames are structured like `Iso001_27F.ab1` and `Iso001_907R.ab1`, BranchManager infers `Iso001` as the sequence ID, keeps `27F` forward, and reverse-complements `907R` before assembly. If filenames are not informative, provide `--read-metadata` as CSV/TSV:
 
 ```tsv
 file	sequence_id	primer	direction
@@ -167,12 +168,12 @@ Iso002	well_B01.ab1;well_B02.ab1	highest_quality
 Run it with:
 
 ```bash
-phyloselect sanger --sample-map sample_reads.tsv -o sanger_out
+branchmanager sanger --sample-map sample_reads.tsv -o sanger_out
 ```
 
 `assemble`/`merge`/`consensus` orients the primer reads and tries to build one longer sequence. `best_read`/`highest_quality`/`select_best`/`independent` converts each read independently and writes only the highest-quality passing read for that isolate.
 
-PhyloSelect treats Sanger QC conservatively:
+BranchManager treats Sanger QC conservatively:
 
 - `--min-quality` is a Phred cutoff used for Mott-style end trimming.
 - `--mask-quality` masks internal bases below the Phred cutoff to `N` before assembly.
@@ -186,7 +187,7 @@ Outputs:
 
 | File | Description |
 |---|---|
-| `assembled.fasta` | One trimmed/assembled sequence per isolate, suitable for `phyloselect evaluate --input` |
+| `assembled.fasta` | One trimmed/assembled sequence per isolate, suitable for `branchmanager evaluate --input` |
 | `trimmed_oriented_reads.fasta` | Individual reads after quality trimming and primer-direction orientation |
 | `raw_reads.fasta` | Raw base calls extracted from AB1 or input sequence files |
 | `read_qc.tsv` | Per-read trimming, quality, expected error, length, and filter status |
@@ -202,12 +203,12 @@ Supported inputs are `.ab1`, `.abi`, `.fasta`, `.fa`, `.fna`, `.fastq`, and `.fq
 
 ---
 
-### `phyloselect run` / `phyloselect evaluate`
+### `branchmanager run` / `branchmanager evaluate`
 
 Process new sequences against the baseline; score novelty and update the phylogenetic tree.
 
 ```bash
-phyloselect run \
+branchmanager run \
   --input new_sequences.fasta \
   --db project.db \
   --dataset Batch1 \
@@ -221,7 +222,7 @@ phyloselect run \
 | Parameter | Required | Default | Description |
 |---|---|---|---|
 | `--input` | ✓ | — | FASTA file of new sequences to analyse |
-| `--db` | ✓ | — | Path to the PhyloSelect SQLite database |
+| `--db` | ✓ | — | Path to the BranchManager SQLite database |
 | `-o / --out` | ✓ | — | Output directory (assessment TSV, novelty metrics, tree, iTOL files) |
 | `--dataset` | ✓ | — | Label for this batch (used in iTOL dataset-membership strip) |
 | `--ref` | | — | Reference FASTA for classification and tree orientation |
@@ -235,7 +236,6 @@ phyloselect run \
 | `--collapse` | | off | Collapse near-identical same-taxonomy sequences for the tree |
 | `--collapse-threshold` | | `99.8` | Identity threshold (%) for collapsing |
 | `--sequence-domain` | | `bacteria` | Domain/profile to process: `bacteria`, `archaea`, `fungi`, or `mixed`/`all`/`none` to disable filtering. Run archaea/fungi separately with matching `--ref`, `--alt-ref`, `--baseline-fasta`, `--preload-dir`, and `--anchors` |
-| `--kingdom` | | — | Backward-compatible explicit domain/kingdom filter; overrides `--sequence-domain` |
 | `--phylum` | | — | Filter iTOL output to a specific phylum (does not affect novelty scoring) |
 | `--target` | | — | FASTA to measure novelty against instead of the DB |
 | `--baseline-fasta` | | — | Baseline/context FASTA to load before evaluating, e.g. Hungate |
@@ -251,18 +251,18 @@ phyloselect run \
 
 Domain/profile handling:
 
-PhyloSelect defaults to `--sequence-domain bacteria` for `preload` and `evaluate`. This keeps bacterial 16S runs clean by filtering non-bacterial assignments before DB insertion and tree building where taxonomy is available. Process archaea and fungi as separate runs with their own DB/output/preload/reference setup:
+BranchManager defaults to `--sequence-domain bacteria` for `preload` and `evaluate`. This keeps bacterial 16S runs clean by filtering non-bacterial assignments before DB insertion and tree building where taxonomy is available. Process archaea and fungi as separate runs with their own DB/output/preload/reference setup:
 
 ```bash
-phyloselect evaluate ... --sequence-domain archaea --ref archaeal_16s_refs.fasta --preload-dir archaea_preload -o archaea_eval
-phyloselect evaluate ... --sequence-domain fungi --ref fungal_its_or_18s_refs.fasta --anchors fungal_anchors.fasta -o fungi_eval
+branchmanager evaluate ... --sequence-domain archaea --ref archaeal_16s_refs.fasta --preload-dir archaea_preload -o archaea_eval
+branchmanager evaluate ... --sequence-domain fungi --ref fungal_its_or_18s_refs.fasta --anchors fungal_anchors.fasta -o fungi_eval
 ```
 
-Use `--sequence-domain mixed` when you intentionally want to keep all domains in one run. The older `--kingdom` flag still works and overrides `--sequence-domain`.
+Use `--sequence-domain mixed` when you intentionally want to keep all domains in one run.
 
 ---
 
-### `phyloselect subtree`
+### `branchmanager subtree`
 
 Extract all sequences matching a given taxon from the DB and build a focused phylogenetic tree for that group only.
 
@@ -272,18 +272,18 @@ Extract all sequences matching a given taxon from the DB and build a focused phy
 
 ```bash
 # Domain-level (auto-detected keyword)
-phyloselect subtree --db project.db --taxon archaea      --from-dir preload_out -o archaea_out
-phyloselect subtree --db project.db --taxon bacteria     --from-dir preload_out -o bacteria_out
+branchmanager subtree --db project.db --taxon archaea      --from-dir preload_out -o archaea_out
+branchmanager subtree --db project.db --taxon bacteria     --from-dir preload_out -o bacteria_out
 
 # Phylum — plain name (rank auto-detected) or GTDB-prefixed
-phyloselect subtree --db project.db --taxon Bacteroidota       --from-dir preload_out -o bact_out
-phyloselect subtree --db project.db --taxon p__Bacillota       --from-dir preload_out -o firm_out
+branchmanager subtree --db project.db --taxon Bacteroidota       --from-dir preload_out -o bact_out
+branchmanager subtree --db project.db --taxon p__Bacillota       --from-dir preload_out -o firm_out
 
 # Family
-phyloselect subtree --db project.db --taxon f__Lachnospiraceae --from-dir preload_out -o lachno_out
+branchmanager subtree --db project.db --taxon f__Lachnospiraceae --from-dir preload_out -o lachno_out
 
 # Genus
-phyloselect subtree --db project.db --taxon g__Ruminococcus    --from-dir preload_out -o rumino_out
+branchmanager subtree --db project.db --taxon g__Ruminococcus    --from-dir preload_out -o rumino_out
 ```
 
 Accepted taxon formats:
@@ -299,7 +299,7 @@ Accepted taxon formats:
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `--db` | ✓ | — | Path to the PhyloSelect SQLite database |
+| `--db` | ✓ | — | Path to the BranchManager SQLite database |
 | `-o / --out` | ✓ | — | Output directory |
 | `--taxon` | ✓ | — | Taxon to extract (see table above) |
 | `--rank` | | `auto` | Override rank detection: `domain` / `phylum` / `family` / `genus` / `species` |
@@ -325,12 +325,12 @@ Subtree outputs:
 
 ---
 
-### `phyloselect regen-itol`
+### `branchmanager regen-itol`
 
 Regenerate all iTOL colour files from taxonomy already stored in the DB — without re-classifying or rebuilding the tree. Useful when changing phylum groupings.
 
 ```bash
-phyloselect regen-itol \
+branchmanager regen-itol \
   --db project.db \
   --out preload_out \
   --group-phyla archaea \
@@ -339,10 +339,10 @@ phyloselect regen-itol \
 
 | Parameter | Required | Default | Description |
 |---|---|---|---|
-| `--db` | ✓ | — | Path to the PhyloSelect SQLite database |
+| `--db` | ✓ | — | Path to the BranchManager SQLite database |
 | `-o / --out` | ✓ | — | Output directory (use your preload or run output dir) |
 | `--include-datasets` | | all | Comma-separated dataset names to include |
-| `--kingdom` | | — | Include only sequences from this domain |
+| `--sequence-domain` | | — | Include only sequences from this domain/profile |
 | `--group-phyla SPEC` | | — | Group phyla into a single colour (repeatable) |
 | `--functional` | | — | TSV file mapping sequence IDs to functional attributes (first column = ID; subsequent columns = attributes). Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP). |
 
@@ -362,7 +362,7 @@ Available on all four subcommands. Groups multiple phyla into a single colour en
 Multiple `--group-phyla` arguments are independent and additive:
 
 ```bash
-phyloselect run ... \
+branchmanager run ... \
   --group-phyla archaea \
   --group-phyla "Bacillota,Bacillota_I,Bacillota_A" \
   --group-phyla "Bacteroidota,Bacteroidota_A"
@@ -376,26 +376,26 @@ Datasets accumulate in the DB. Each `run` sees the growing baseline:
 
 ```bash
 # Step 1 — baseline
-phyloselect preload --fasta hungate.fasta --db project.db --dataset Hungate ...
+branchmanager preload --fasta hungate.fasta --db project.db --dataset Hungate ...
 
 # Step 2 — first batch: novelty scored against Hungate
-phyloselect run --input batch1.fasta --db project.db --dataset Batch1 ...
+branchmanager run --input batch1.fasta --db project.db --dataset Batch1 ...
 
 # Step 3 — second batch: novelty scored against Hungate + Batch1
-phyloselect run --input batch2.fasta --db project.db --dataset Batch2 ...
+branchmanager run --input batch2.fasta --db project.db --dataset Batch2 ...
 ```
 
 ---
 
 ## Clustering and tree redundancy reduction (`--collapse`)
 
-When `--collapse` is enabled, PhyloSelect groups sequences sharing ≥ `--collapse-threshold` identity and the same taxonomy, keeping only one **cluster representative** per group for tree building.
+When `--collapse` is enabled, BranchManager groups sequences sharing ≥ `--collapse-threshold` identity and the same taxonomy, keeping only one **cluster representative** per group for tree building.
 
 #### Column Explanation
 
 | Column | Meaning |
 |---|---|
-| ID | Short identifier (e.g. FLZ63) assigned by PhyloSelect for tree readability |
+| ID | Short identifier (e.g. FLZ63) assigned by BranchManager for tree readability |
 | Taxonomy | Full GTDB lineage assigned by the classifier |
 | BestHit | Closest reference genome accession (VSEARCH best hit) |
 | ClassificationIdentity | % identity to the BestHit reference (VSEARCH alignment) |
@@ -426,7 +426,7 @@ This table keeps the novelty lenses separate:
 
 ## All output files
 
-### `phyloselect preload` outputs
+### `branchmanager preload` outputs
 
 | File | Description |
 |---|---|
@@ -445,7 +445,7 @@ This table keeps the novelty lenses separate:
 | `tree_orientation_summary.tsv` | Per-sequence orientation audit (forward / RC / unknown) |
 | `OUTPUT_EXPLANATIONS.tsv` | Manifest describing each output file |
 
-### `phyloselect run` / `phyloselect evaluate` outputs
+### `branchmanager run` / `branchmanager evaluate` outputs
 
 | File | Description |
 |---|---|
@@ -469,9 +469,9 @@ This table keeps the novelty lenses separate:
 | `itol/novelty.itol` | iTOL strip showing nearest-hit novelty |
 | `ids/user_id_map.tsv` | Short ID → original FASTA header mapping for this run |
 | `intermediate/` | QC, dereplication, collapse, and classifier scratch outputs retained for debugging |
-| `logs/phyloselect.log` | Run log |
+| `logs/branchmanager.log` | Run log |
 
-PhyloSelect keeps iTOL `DATASET_COLORSTRIP` files, one per metadata type. Older `TREE_COLORS` branch/range files and symbol-strip variants are removed because they encoded the same metadata in additional visual styles.
+BranchManager keeps iTOL `DATASET_COLORSTRIP` files, one per metadata type. Older `TREE_COLORS` branch/range files and symbol-strip variants are removed because they encoded the same metadata in additional visual styles.
 
 ### `selection_summary.tsv`
 
@@ -481,7 +481,7 @@ This is the board-facing table for scientific advisory board discussions. It del
 
 | Column | Meaning |
 |---|---|
-| `ID` | Short identifier assigned by PhyloSelect for tree readability |
+| `ID` | Short identifier assigned by BranchManager for tree readability |
 | `Taxonomy` | Full GTDB lineage assigned by the classifier |
 | `ClassificationHit` | Closest reference genome/16S accession in the primary taxonomy reference |
 | `ClassificationIdentity` | % identity to the ClassificationHit reference |
@@ -522,7 +522,7 @@ This is the board-facing table for scientific advisory board discussions. It del
 
 ### Partner sequencing metadata
 
-`phyloselect evaluate` requires `--partner-metadata` / `--sequencing-metadata`. Provide this as a simple sidecar `.csv`, `.tsv`, or gzipped CSV/TSV alongside the FASTA. It must contain:
+`branchmanager evaluate` requires `--partner-metadata` / `--sequencing-metadata`. Provide this as a simple sidecar `.csv`, `.tsv`, or gzipped CSV/TSV alongside the FASTA. It must contain:
 
 - A sequence ID column such as `sequence_id`, `isolate_id`, `sample_id`, or `ID`. These values must match the FASTA record IDs.
 - A partner acronym column such as `partner_id`, `partner`, or `partner_acronym`, with values like `QUB` or `UoG`.
@@ -542,14 +542,14 @@ Each run stores this status in the project SQLite DB. Later evaluate runs use al
 
 ## ID shortening
 
-By default, PhyloSelect preserves the FASTA IDs exactly as supplied. This is especially important for Hungate/baseline datasets and partner-provided isolate IDs.
+By default, BranchManager preserves the FASTA IDs exactly as supplied. This is especially important for Hungate/baseline datasets and partner-provided isolate IDs.
 
 - `--no-shorten-ids` (default) — keep supplied IDs.
 - `--shorten-ids` — generate compact IDs when explicitly requested.
 - `--no-baseline-shorten-ids` (default for evaluate baselines) — keep baseline IDs exactly.
 - `--baseline-shorten-ids` — generate compact baseline IDs when explicitly requested.
 
-When IDs are shortened, PhyloSelect writes an ID map under `ids/`. When IDs are preserved, the map is still useful as an audit trail but should normally be identity-to-identity.
+When IDs are shortened, BranchManager writes an ID map under `ids/`. When IDs are preserved, the map is still useful as an audit trail but should normally be identity-to-identity.
 
 ---
 
@@ -557,7 +557,7 @@ When IDs are shortened, PhyloSelect writes an ID map under `ids/`. When IDs are 
 
 Anchor sequences are **invisible scaffolding** constraining phylum-level topology during tree construction. They are pruned from the stored newick after each build and never appear in outputs, iTOL files, or novelty scoring.
 
-The bundled anchor set (`src/phyloselect/data/reference_anchors.fasta`) contains 26 NCBI RefSeq 16S sequences covering major gut/rumen phyla. A companion metadata table (`src/phyloselect/data/reference_anchors.tsv`) explains what each anchor represents, its rumen relevance, and whether it is a core rumen anchor or broader topology scaffold.
+The bundled anchor set (`src/branchmanager/data/reference_anchors.fasta`) contains 26 NCBI RefSeq 16S sequences covering major gut/rumen phyla. A companion metadata table (`src/branchmanager/data/reference_anchors.tsv`) explains what each anchor represents, its rumen relevance, and whether it is a core rumen anchor or broader topology scaffold.
 
 | Phylum | Type strain | Accession |
 |---|---|---|
@@ -592,11 +592,11 @@ This is a pragmatic rumen/gut scaffold rather than a final rumen-only reference 
 
 To use a custom anchor file:
 ```bash
-phyloselect preload --anchors /path/to/my_anchors.fasta ...
+branchmanager preload --anchors /path/to/my_anchors.fasta ...
 ```
-Custom anchor headers must begin with `PHYLOSELECT_REF_`:
+Custom anchor headers must begin with `BRANCHMANAGER_REF_`:
 ```
->PHYLOSELECT_REF_MyPhylum accession=NR_XXXXXX source=SILVA138
+>BRANCHMANAGER_REF_MyPhylum accession=NR_XXXXXX source=SILVA138
 ```
 
 To refresh the bundled anchors from NCBI:
@@ -643,8 +643,8 @@ If a large `unknown` sector appears in iTOL, check:
 
 ---
 
-## What PhyloSelect does
+## What BranchManager does
 
-PhyloSelect is aimed at ranking marker-gene sequence evidence for isolate follow-up. It helps identify lineages that may have been missed because of primer bias, sparse reference coverage, taxonomy lag, or conservative filtering. Many targets are not new in nature — they are often **new to the reference record** or **underrepresented in existing collections**.
+BranchManager is aimed at ranking marker-gene sequence evidence for isolate follow-up. It helps identify lineages that may have been missed because of primer bias, sparse reference coverage, taxonomy lag, or conservative filtering. Many targets are not new in nature — they are often **new to the reference record** or **underrepresented in existing collections**.
 
-That is why PhyloSelect combines reference-aware classification with novelty scoring, Sanger QC, baseline/reference comparisons, partner metadata, and warning layers, rather than treating every long branch as a discovery.
+That is why BranchManager combines reference-aware classification with novelty scoring, Sanger QC, baseline/reference comparisons, partner metadata, and warning layers, rather than treating every long branch as a discovery.

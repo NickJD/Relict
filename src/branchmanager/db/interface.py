@@ -1,10 +1,10 @@
 import sqlite3
-from phyloselect.db.schema import SCHEMA
+from branchmanager.db.schema import SCHEMA
 from pathlib import Path
-from phyloselect.utils.fasta import write_fasta
+from branchmanager.utils.fasta import write_fasta
 import hashlib
 import logging
-from phyloselect.taxonomy import canonicalize_sequence_id, parse_taxon_string
+from branchmanager.taxonomy import canonicalize_sequence_id, parse_taxon_string
 
 
 class Database:
@@ -119,7 +119,7 @@ class Database:
 
 
     def get_input_ids(self, fasta):
-        from phyloselect.utils.fasta import read_fasta
+        from branchmanager.utils.fasta import read_fasta
         return [h for h, _ in read_fasta(fasta)]
 
     def preload_from_files(self, fasta_path, taxa_tsv=None, color_csv=None, source='preload', dataset='preload', outdir=None, shorten_ids=False):
@@ -130,7 +130,7 @@ class Database:
         - color_csv: optional CSV with id,color to set explicit colors
         - source: string to record as the source for inserted colors
         """
-        from phyloselect.utils.fasta import read_fasta
+        from branchmanager.utils.fasta import read_fasta
         self.logger.info("[DB][PRELOAD] Reading fasta %s", fasta_path)
         records = [(h, s) for h, s in read_fasta(fasta_path)]
         self.logger.info("[DB][PRELOAD] Read %d records from %s", len(records), fasta_path)
@@ -192,7 +192,7 @@ class Database:
         if taxa_tsv:
             self.logger.info("[DB][PRELOAD] Loading taxa table %s", taxa_tsv)
             tax_entries = []
-            from phyloselect.taxonomy_io import iter_taxonomy_assignment_rows
+            from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
             for row in iter_taxonomy_assignment_rows(taxa_tsv):
                 tax_entries.append((row.get('id'), row.get('taxonomy'), row.get('confidence')))
             if tax_entries:
@@ -264,7 +264,7 @@ class Database:
         # if no color entries, derive colors from taxonomy/genus
         if not color_entries:
             try:
-                from phyloselect.pipeline.itol import _name_to_color
+                from branchmanager.pipeline.itol import _name_to_color
                 with self.connect() as conn:
                     cur = conn.cursor()
                     # restrict color derivation to taxonomy rows for this dataset only

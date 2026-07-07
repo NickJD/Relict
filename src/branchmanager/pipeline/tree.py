@@ -1,22 +1,22 @@
 """
-tree.py — Phylogenetic tree construction and incremental updating for PhyloSelect.
+tree.py — Phylogenetic tree construction and incremental updating for BranchManager.
 
 Architecture
 ------------
 The tree is built from THREE layers of sequences:
 
-  1. Reference anchors  (reference_anchors.fasta, bundled with PhyloSelect)
+  1. Reference anchors  (reference_anchors.fasta, bundled with BranchManager)
      Curated NCBI RefSeq 16S sequences spanning major rumen/gut phyla.
      These constrain the topology so the tree reflects real taxonomy.
      They are NEVER shown in outputs - they are scaffolding only.
-     Identified by the prefix PHYLOSELECT_REF_ in their headers.
+     Identified by the BRANCHMANAGER_REF_ prefix in their headers.
 
   2. Preload sequences  (e.g. Hungate1000)
-     User-supplied baseline dataset loaded via `phyloselect preload`.
+     User-supplied baseline dataset loaded via `branchmanager preload`.
      Stored in the DB with dataset label. Shown in iTOL.
 
   3. Run sequences
-     User query sequences submitted via `phyloselect run`. Shown in iTOL.
+     User query sequences submitted via `branchmanager run`. Shown in iTOL.
 
 Tree building strategy
 ----------------------
@@ -32,7 +32,7 @@ The bundled anchor file lives at:
     <package_root>/data/reference_anchors.fasta
 
 Each sequence header must be:
-    >PHYLOSELECT_REF_<PhylumName> accession=<ACC> source=<SOURCE>
+    >BRANCHMANAGER_REF_<PhylumName> accession=<ACC> source=<SOURCE>
 
 Sequences in that file are excluded from all result outputs, novelty
 scoring, and iTOL files. They exist purely to constrain tree topology.
@@ -51,15 +51,15 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-from phyloselect.utils.fasta import read_fasta, reverse_complement, write_fasta
-from phyloselect.utils.subprocess import run_cmd
+from branchmanager.utils.fasta import read_fasta, reverse_complement, write_fasta
+from branchmanager.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Prefix that marks a sequence as a reference anchor
-REF_ANCHOR_PREFIX = "PHYLOSELECT_REF_"
+# Prefix that marks a sequence as a reference anchor.
+REF_ANCHOR_PREFIX = "BRANCHMANAGER_REF_"
 
 # Path to the bundled anchor file, relative to this module's location
 _MODULE_DIR = Path(__file__).resolve().parent
@@ -89,7 +89,7 @@ def get_anchor_file(custom_anchor_file: Optional[str] = None) -> Optional[Path]:
     Return the path to the anchor FASTA to use.
     Priority:
       1. custom_anchor_file argument (user-supplied)
-      2. BUILTIN_ANCHOR_FILE (bundled with PhyloSelect)
+      2. BUILTIN_ANCHOR_FILE (bundled with BranchManager)
     Returns None if neither exists.
     """
     if custom_anchor_file:
@@ -103,18 +103,18 @@ def get_anchor_file(custom_anchor_file: Optional[str] = None) -> Optional[Path]:
 
     logger.warning(
         "[ANCHORS] No reference anchor file found. Tree topology may not "
-        "reflect true taxonomy. Consider running: phyloselect download-anchors"
+        "reflect true taxonomy. Consider running: branchmanager download-anchors"
     )
     return None
 
 
 def load_anchor_sequences(anchor_file: Optional[Path]) -> list[tuple[str, str]]:
-    """Load anchor sequences, validating that headers have the REF_ANCHOR_PREFIX."""
+    """Load anchor sequences, adding the canonical anchor prefix when absent."""
     if anchor_file is None:
         return []
     records = []
     for header, seq in read_fasta(str(anchor_file)):
-        if not header.startswith(REF_ANCHOR_PREFIX):
+        if not is_ref_anchor(header):
             # Auto-prefix headers that are missing it so the file is forgiving
             header = f"{REF_ANCHOR_PREFIX}{header}"
         records.append((header, seq))
@@ -149,7 +149,7 @@ def build_combined_fasta(
 ) -> Path:
     """
     Build a combined FASTA containing:
-      - Reference anchor sequences (PHYLOSELECT_REF_* prefixed)
+      - Reference anchor sequences (BRANCHMANAGER_REF_* prefixed)
       - All sequences from the DB that passed QC (if db provided)
       - User/query sequences from user_fasta
 
@@ -325,7 +325,7 @@ def _label_internal_nodes(newick_text: str, prefix: str = "NODE") -> str:
         return newick_text
 
 
-def _repair_legacy_internal_node_labels(newick_text: Optional[str]) -> str:
+def _repair_internal_node_label_delimiters(newick_text: Optional[str]) -> str:
     """Repair malformed node labels such as NODE0001::0.03 (duplicated delimiter)."""
     if not newick_text:
         return ''
@@ -600,7 +600,7 @@ def _resolve_iqtree_binary() -> Optional[str]:
     This function:
       1. Searches all candidates via ``shutil.which`` (honours PATH).
       2. Falls back to ``dirname(sys.executable)`` — the conda env's bin dir —
-         so the correct binary is always found when PhyloSelect is run from within
+         so the correct binary is always found when BranchManager is run from within
          the conda environment.
     """
     candidates = ["iqtree2", "iqtree", "IQ-TREE", "iqtree-omp"]
@@ -856,7 +856,7 @@ def write_tree_warning_tsv(outdir: str, warning_rows):
 
 
 def _prune_anchor_leaves(newick: str) -> str:
-    """Remove all PHYLOSELECT_REF_* leaf nodes from a Newick string.
+    """Remove all BranchManager reference-anchor leaf nodes from a Newick string.
 
     Anchor sequences constrain tree topology at *build time* (during MAFFT
     alignment and FastTree inference).  Once the tree has been written the
@@ -882,7 +882,7 @@ def _prune_anchor_leaves(newick: str) -> str:
     In practice, with 26 anchors spread across hundreds of data sequences,
     the degenerate single-child case essentially never occurs.
     """
-    _ANCHOR_PAT = r'PHYLOSELECT_REF_[^,:()\s;]+(?::[0-9Ee.+\-]+)?'
+    _ANCHOR_PAT = r'BRANCHMANAGER_REF_[^,:()\s;]+(?::[0-9Ee.+\-]+)?'
 
     for _ in range(100):          # safety iteration cap
         before = newick
@@ -892,7 +892,7 @@ def _prune_anchor_leaves(newick: str) -> str:
         # Clean artefacts.
         # IMPORTANT: remove empty clades *including* any trailing internal-node
         # label and branch-length that FastTree attaches to the closing ')'.
-        # Without this, a sole-anchor clade like (PHYLOSELECT_REF_X:0.5)1.000:0.09
+        # Without this, a sole-anchor clade like (BRANCHMANAGER_REF_X:0.5)1.000:0.09
         # becomes ()1.000:0.09 then just 1.000:0.09 which looks like a leaf.
         newick = re.sub(                                      # ()label:len or ()label
             r'\(\s*\)(?:[^,():;\s]+(?::[^,():;\s]+)?)?', '', newick
@@ -929,8 +929,8 @@ def _finalise_tree(out: Path, id_map: dict) -> None:
                     "(%d unexpected occurrences remaining)",
                     before_prune - after_prune, after_prune)
 
-    # Repair malformed legacy labels first, then relabel internal nodes cleanly.
-    newick = _repair_legacy_internal_node_labels(newick)
+    # Repair malformed labels first, then relabel internal nodes cleanly.
+    newick = _repair_internal_node_label_delimiters(newick)
     newick = _label_internal_nodes(newick)
     tree_path.write_text(newick)
     logger.info("[TREE] Internal nodes labelled; tree finalised at %s", tree_path)
@@ -953,7 +953,7 @@ def initialise_or_update_tree(
     tree_method: str = "fasttree",
 ):
     """
-    Initialise or incrementally update the PhyloSelect phylogenetic tree.
+    Initialise or incrementally update the BranchManager phylogenetic tree.
 
     Parameters
     ----------

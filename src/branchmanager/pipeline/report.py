@@ -1,5 +1,5 @@
 """
-report.py — Final summary report generation for PhyloSelect.
+report.py — Final summary report generation for BranchManager.
 """
 import logging
 

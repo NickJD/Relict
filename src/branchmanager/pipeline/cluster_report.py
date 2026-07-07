@@ -1,7 +1,7 @@
 """
 cluster_report.py — Cluster-level summarisation and per-cluster detail files.
 
-After `phyloselect run --collapse`, multiple sequences are grouped into clusters
+After `branchmanager run --collapse`, multiple sequences are grouped into clusters
 (representatives + members).  This module:
 
   1. Aggregates per-sequence assessment rows into *cluster-level summaries*
@@ -857,7 +857,7 @@ ADDITIONAL ANALYSES THAT COULD BE ADDED
    Implementation: parse tree, walk up to LCA, count leaves.
 
 2. **Multi-run novelty trajectory**
-   Track how NoveltyScore for each sequence changes across successive `phyloselect run`
+   Track how NoveltyScore for each sequence changes across successive `branchmanager run`
    calls.  A sequence that remains novel even after adding more data is a stronger
    candidate than one that becomes crowded quickly.
    Implementation: store novelty_score per run in a new DB table `novelty_history`.

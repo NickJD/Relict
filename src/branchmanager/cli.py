@@ -1,4 +1,4 @@
-"""PhyloSelect CLI — lightweight entrypoint for the phyloselect package.
+"""BranchManager CLI — lightweight entrypoint for the branchmanager package.
 
 Implements the `preload`, `run`/`evaluate`, and `regen-itol` commands for the src/ layout.
 """
@@ -9,9 +9,9 @@ import shutil
 import sys
 from pathlib import Path
 
-# When invoked directly (python src/phyloselect/PhenGO-Predict.py) the package root (src)
-# may not be on sys.path. Ensure the parent of this `phyloselect` package is
-# available so absolute imports like `phyloselect.db.interface` work.
+# When invoked directly (python src/branchmanager/PhenGO-Predict.py) the package root (src)
+# may not be on sys.path. Ensure the parent of this `branchmanager` package is
+# available so absolute imports like `branchmanager.db.interface` work.
 try:
     here = Path(__file__).resolve().parent
     src_root = str(here.parent)
@@ -20,13 +20,13 @@ try:
 except Exception:
     pass
 
-from phyloselect.db.interface import Database
-from phyloselect.pipeline import classify, tree, itol, qc, derep, novelty
-from phyloselect.pipeline import cluster_report as _cluster_report
-from phyloselect.pipeline import mwl as _mwl
-from phyloselect.pipeline.classify import _derive_db_name as _classify_derive_db_name
-from phyloselect.pipeline.collapse import collapse_fasta_within_taxa
-from phyloselect.pipeline.workflow_helpers import (
+from branchmanager.db.interface import Database
+from branchmanager.pipeline import classify, tree, itol, qc, derep, novelty
+from branchmanager.pipeline import cluster_report as _cluster_report
+from branchmanager.pipeline import mwl as _mwl
+from branchmanager.pipeline.classify import _derive_db_name as _classify_derive_db_name
+from branchmanager.pipeline.collapse import collapse_fasta_within_taxa
+from branchmanager.pipeline.workflow_helpers import (
     _assignment_source_is_fasta,
     build_orig_to_short_map as _build_orig_to_short_map_helper,
     build_placement_warning_rows,
@@ -45,8 +45,8 @@ from phyloselect.pipeline.workflow_helpers import (
     write_selection_summary_tsv,
     write_sequence_assessment_tsv,
 )
-from phyloselect.taxonomy import canonicalize_sequence_id, normalize_domain_query, taxonomy_matches_kingdom
-from phyloselect.partner_metadata import load_partner_sequencing_metadata
+from branchmanager.taxonomy import canonicalize_sequence_id, normalize_domain_query, taxonomy_matches_kingdom
+from branchmanager.partner_metadata import load_partner_sequencing_metadata
 
 
 SEQUENCE_DOMAIN_CHOICES = (
@@ -56,7 +56,6 @@ SEQUENCE_DOMAIN_CHOICES = (
     'eukaryota', 'eukarya',
     'mixed', 'all', 'none',
 )
-
 
 def _find_tree_file_in_dir(d: str):
     """Return path to a tree file in directory d if present, preferring current_tree.nwk."""
@@ -93,7 +92,7 @@ def _configure_logging(outdir: str):
     ch.setFormatter(fmt)
     logger.addHandler(ch)
     try:
-        fh = logging.FileHandler(os.path.join(outdir, 'phyloselect.log'))
+        fh = logging.FileHandler(os.path.join(outdir, 'branchmanager.log'))
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
@@ -123,7 +122,7 @@ def _dataset_sequence_ids(db: Database, dataset: str) -> set[str]:
 
 
 def _filter_fasta_to_ids(src: str | Path, dst: str | Path, allowed_ids: set[str]) -> int:
-    from phyloselect.utils.fasta import read_fasta, write_fasta
+    from branchmanager.utils.fasta import read_fasta, write_fasta
     records = [(h, s) for h, s in read_fasta(str(src)) if str(h) in allowed_ids]
     write_fasta(records, str(dst))
     return len(records)
@@ -353,9 +352,9 @@ def _write_detailed_output_guide(outdir: Path, rows):
         ])
 
     lines = [
-        "# PhyloSelect Output Guide",
+        "# BranchManager Output Guide",
         "",
-        "This guide explains the output files and the main metrics produced by `phyloselect run` / `phyloselect evaluate`.",
+        "This guide explains the output files and the main metrics produced by `branchmanager run` / `branchmanager evaluate`.",
         "",
         "## Recommended Reading Order",
         "",
@@ -433,7 +432,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "- `itol/dataset_membership.itol`: dataset-of-origin colorstrip.",
         "- `itol/novelty.itol`: novelty/nearest-identity colorstrip.",
         "",
-        "PhyloSelect keeps iTOL `DATASET_COLORSTRIP` files only. Older branch `TREE_COLORS` and symbol-strip variants duplicated the same metadata and are removed to keep outputs readable.",
+        "BranchManager keeps iTOL `DATASET_COLORSTRIP` files only. Older branch `TREE_COLORS` and symbol-strip variants duplicated the same metadata and are removed to keep outputs readable.",
         "",
         "## File Catalogue",
         "",
@@ -530,7 +529,7 @@ def _write_output_explanations(outdir: str):
         ('itol_dataset_preload.itol', 'iTOL colorstrip for the preload dataset; maps preload ids to the dataset color.'),
         ('.nwk', 'Newick tree file (phylogenetic tree). Commonly named current_tree.nwk.'),
         ('.itol', 'iTOL dataset file (text format) describing colors/strips/legends for visualization in iTOL.'),
-        ('.log', 'Log file produced by the pipeline (phyloselect.log) containing debug/info messages')
+        ('.log', 'Log file produced by the pipeline (branchmanager.log) containing debug/info messages')
     ]
 
     rows = []
@@ -778,7 +777,7 @@ def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
     _move_glob(out, 'novelty_*_pool.fasta', 'intermediate')
     _move_glob(out, '*.uc', 'intermediate')
 
-    _move_if_exists(out, 'phyloselect.log', 'logs')
+    _move_if_exists(out, 'branchmanager.log', 'logs')
 
 
 def _classification_ids_matching_kingdom(classification_tsv: str, kingdom: str):
@@ -795,14 +794,7 @@ def _normalise_sequence_domain(value: str | None) -> str | None:
 
 
 def _sequence_domain_filter(args, *, default: str | None = 'bacteria') -> str | None:
-    """Return the domain/kingdom filter implied by CLI flags.
-
-    ``--kingdom`` is retained for backwards compatibility and wins when
-    explicitly supplied. New commands should prefer ``--sequence-domain``.
-    """
-    explicit_kingdom = getattr(args, 'kingdom', None)
-    if explicit_kingdom:
-        return _normalise_sequence_domain(explicit_kingdom)
+    """Return the domain filter implied by CLI flags."""
     profile = getattr(args, 'sequence_domain', None)
     if profile:
         return _normalise_sequence_domain(profile)
@@ -1022,8 +1014,8 @@ def _resolve_reference_inputs(
 
     External FASTA/FASTA.gz files provided via --taxa-assignments are treated as
     the effective classifier reference database. TSV inputs (and the special case
-    where the assignments file is the same file as the source FASTA) keep the
-    legacy direct-assignment behaviour.
+    where the assignments file is the same file as the source FASTA) are treated
+    as direct input-sequence taxonomy assignments.
     """
     effective_ref = ref_fasta
     effective_taxa = taxa_tsv
@@ -1045,14 +1037,14 @@ def _resolve_reference_inputs(
         log = logging.getLogger(__name__)
         if effective_ref and not _same_path(effective_ref, taxa_assignments):
             log.info(
-                "%s Treating --taxa-assignments=%s as the GTDB/reference FASTA and using it instead of --ref=%s (supported for compatibility, but --ref is the preferred flag for reference databases)",
+                "%s Treating --taxa-assignments=%s as the GTDB/reference FASTA and using it instead of --ref=%s (--ref is the preferred flag for reference databases)",
                 log_prefix,
                 taxa_assignments,
                 effective_ref,
             )
         else:
             log.info(
-                "%s Treating --taxa-assignments=%s as the GTDB/reference FASTA for classification (supported for compatibility, but --ref is the preferred flag for reference databases)",
+                "%s Treating --taxa-assignments=%s as the GTDB/reference FASTA for classification (--ref is the preferred flag for reference databases)",
                 log_prefix,
                 taxa_assignments,
             )
@@ -1244,7 +1236,7 @@ def cmd_preload(args):
                         qid_to_tax = {}
 
                     # group records by tax and cluster within groups
-                    from phyloselect.utils.fasta import read_fasta
+                    from branchmanager.utils.fasta import read_fasta
                     taxa_groups = {}
                     try:
                         for h, s in read_fasta(user_fasta):
@@ -1443,7 +1435,7 @@ def cmd_run(args):
     derep_out = derep.run_derep(qc_out, outdir)
 
     # map user-provided dereplicated IDs to runtime IDs and insert into DB
-    from phyloselect.utils.fasta import read_fasta, write_fasta
+    from branchmanager.utils.fasta import read_fasta, write_fasta
     mapped_derep = Path(outdir) / 'derep_short.fasta'
     used_ids = set(db.get_all_ids())
     orig_to_short = {}
@@ -1459,11 +1451,11 @@ def cmd_run(args):
     if kingdom:
         kingdom_text = str(kingdom)
         if not effective_ref:
-            logging.getLogger(__name__).warning("[RUN] --kingdom specified but no reference FASTA was available; cannot classify to filter; proceeding without kingdom filtering")
+            logging.getLogger(__name__).warning("[RUN] --sequence-domain specified but no reference FASTA was available; cannot classify to filter; proceeding without domain filtering")
             allowed_qids = None
         else:
             try:
-                logging.getLogger(__name__).info("[RUN] Running pre-insert classification on dereplicated fasta to filter by kingdom=%s", kingdom)
+                logging.getLogger(__name__).info("[RUN] Running pre-insert classification on dereplicated fasta to filter by domain=%s", kingdom)
                 early_class_out = classify.run_classification(str(derep_out), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
                 allowed_qids = _classification_ids_matching_kingdom(early_class_out, kingdom_text)
                 logging.getLogger(__name__).info("[RUN] Kingdom filter: %d dereplicated sequences match %s", len(allowed_qids), kingdom)
@@ -1484,7 +1476,7 @@ def cmd_run(args):
             if not hit:
                 continue
 
-        # If DB already contains this sequence ID (or a legacy alias), we still
+        # If DB already contains this sequence ID (or another alias), we still
         # want to include it in the tree for visualization, but we use the
         # existing DB ID so downstream taxonomy/metadata resolve consistently.
         # The "INSERT OR IGNORE" during insert_sequences will prevent DB duplicates.
@@ -2136,7 +2128,7 @@ def _detect_taxon_rank(taxon_query: str, rank_arg: str) -> str:
       3. Known domain keywords: ``archaea`` / ``bacteria`` → 'd'
       4. Fallback: 'p' (phylum)
     """
-    from phyloselect.taxonomy import RANK_ALIASES
+    from branchmanager.taxonomy import RANK_ALIASES
     if rank_arg and rank_arg.lower() != 'auto':
         return RANK_ALIASES.get(rank_arg.lower(), rank_arg.lower()[:1])
     if '__' in taxon_query:
@@ -2174,11 +2166,11 @@ def cmd_subtree(args):
     sequences are exported from the DB and a full MAFFT + FastTree build
     is performed (same as a normal run).
     """
-    from phyloselect.pipeline import itol as itol_mod
-    from phyloselect.pipeline import tree as tree_mod  # noqa: F401 (used in _build_subtree)
-    from phyloselect.pipeline.workflow_helpers import write_combined_taxonomy_tsv
-    from phyloselect.taxonomy import parse_taxon_string
-    from phyloselect.utils.fasta import read_fasta, write_fasta  # noqa: F401
+    from branchmanager.pipeline import itol as itol_mod
+    from branchmanager.pipeline import tree as tree_mod  # noqa: F401 (used in _build_subtree)
+    from branchmanager.pipeline.workflow_helpers import write_combined_taxonomy_tsv
+    from branchmanager.taxonomy import parse_taxon_string
+    from branchmanager.utils.fasta import read_fasta, write_fasta  # noqa: F401
 
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
@@ -2350,12 +2342,12 @@ def _build_subtree(
     Slow path: write the raw sequences as a FASTA and run the full
     ``initialise_or_update_tree`` pipeline (MAFFT → FastTree).
     """
-    from phyloselect.pipeline.tree import (
+    from branchmanager.pipeline.tree import (
         _run_fasttree, _make_unique_fasta,
         is_ref_anchor, get_anchor_file,
     )
-    from phyloselect.utils.fasta import read_fasta, write_fasta
-    from phyloselect.pipeline import tree as tree_mod
+    from branchmanager.utils.fasta import read_fasta, write_fasta
+    from branchmanager.pipeline import tree as tree_mod
     import re
 
     out = Path(outdir)
@@ -2444,8 +2436,8 @@ def _build_subtree(
 
 def _finalise_tree_subtree(out: Path, id_map: dict, tree_path: Path, log) -> None:
     """Remap IDs, prune anchors, and label internal nodes for subtree output."""
-    from phyloselect.pipeline.tree import (
-        _repair_legacy_internal_node_labels, _label_internal_nodes,
+    from branchmanager.pipeline.tree import (
+        _repair_internal_node_label_delimiters, _label_internal_nodes,
         _prune_anchor_leaves, REF_ANCHOR_PREFIX,
     )
     if not tree_path.exists():
@@ -2459,7 +2451,7 @@ def _finalise_tree_subtree(out: Path, id_map: dict, tree_path: Path, log) -> Non
     after = newick.count(REF_ANCHOR_PREFIX)
     if before:
         log.info("[SUBTREE] Pruned %d anchor leaves from subtree newick", before - after)
-    newick = _repair_legacy_internal_node_labels(newick)
+    newick = _repair_internal_node_label_delimiters(newick)
     newick = _label_internal_nodes(newick)
     tree_path.write_text(newick)
     log.info("[SUBTREE] Subtree finalised → %s", tree_path)
@@ -2594,9 +2586,9 @@ def cmd_regen_itol(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog='phyloselect',
+        prog='branchmanager',
         description=(
-            'PhyloSelect — marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation toolkit.\n\n'
+            'BranchManager — marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation toolkit.\n\n'
             'Subcommands:\n'
             '  preclassify Pre-classify reference FASTA collections (Hungate, SILVA …) once and reuse.\n'
             '  preload     Load a baseline dataset (e.g. Hungate) and build the backbone tree.\n'
@@ -2605,10 +2597,10 @@ def build_parser():
             '  subtree     Extract a focused tree and iTOL files for a specific taxon from an existing DB.\n'
             '  regen-itol  Regenerate iTOL colour files from an existing DB without re-running analysis.\n\n'
             'Typical workflow:\n'
-            '  0. phyloselect preclassify --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o preclassify_out\n'
-            '  1. phyloselect preload  --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments preclassify_out/pipeline_taxonomy.tsv --build-tree -o preload_out\n'
-            '  2. phyloselect evaluate --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1  --ref gtdb.fna --baseline-fasta hungate.fasta --baseline-dataset Hungate --mwl MWL.xlsx -o eval_out\n'
-            '  3. phyloselect subtree  --db project.db --taxon archaea --from-dir preload_out -o archaea_out\n'
+            '  0. branchmanager preclassify --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o preclassify_out\n'
+            '  1. branchmanager preload  --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments preclassify_out/pipeline_taxonomy.tsv --build-tree -o preload_out\n'
+            '  2. branchmanager evaluate --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1  --ref gtdb.fna --baseline-fasta hungate.fasta --baseline-dataset Hungate --mwl MWL.xlsx -o eval_out\n'
+            '  3. branchmanager subtree  --db project.db --taxon archaea --from-dir preload_out -o archaea_out\n'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2630,7 +2622,7 @@ def build_parser():
     preload.add_argument('--fasta', required=True,
         help='Input FASTA file containing the baseline sequences to load.')
     preload.add_argument('--db', required=True,
-        help='Path to the PhyloSelect SQLite database (created if it does not exist).')
+        help='Path to the BranchManager SQLite database (created if it does not exist).')
     preload.add_argument('-o', '--out', required=False, default='.',
         help='Output directory for tree, iTOL files, and reports (default: current directory).')
     preload.add_argument('--dataset', required=True,
@@ -2670,10 +2662,8 @@ def build_parser():
             'Use archaea for archaeal 16S, fungi for fungal/eukaryotic runs with suitable refs/anchors, '
             'or mixed/all/none to disable domain filtering.'
         ))
-    preload.add_argument('--kingdom', required=False,
-        help='Backward-compatible explicit domain/kingdom filter. Overrides --sequence-domain when supplied.')
     preload.add_argument('--anchors', required=False, default=None,
-        help='Custom reference anchor FASTA for tree topology scaffolding. Defaults to the 26-sequence bundled anchor set (src/phyloselect/data/reference_anchors.fasta).')
+        help='Custom reference anchor FASTA for tree topology scaffolding. Defaults to the 26-sequence bundled anchor set (src/branchmanager/data/reference_anchors.fasta).')
     preload.add_argument('--threads', type=int, required=False, default=4,
         help='Number of CPU threads for MAFFT and VSEARCH (default: 4).')
     preload.add_argument('--tree-method', dest='tree_method',
@@ -2730,7 +2720,7 @@ def build_parser():
             'and preload/baseline sequences, updates the tree, and optionally matches GTDB taxonomy against\n'
             'the Most Wanted List via --mwl.\n\n'
             'Provide --baseline-fasta for context datasets such as Hungate when they have not already\n'
-            'been loaded with `phyloselect preload`. Novelty is always relative to YOUR submitted data,\n'
+            'been loaded with `branchmanager preload`. Novelty is always relative to YOUR submitted data,\n'
             'not the full external reference. Each successive run extends the baseline, so scores\n'
             'become increasingly precise.'
         ),
@@ -2739,7 +2729,7 @@ def build_parser():
     run.add_argument('--input', required=True,
         help='FASTA file of new sequences to analyse.')
     run.add_argument('--db', required=True,
-        help='Path to the PhyloSelect SQLite database (must have been initialised with `phyloselect preload`).')
+        help='Path to the BranchManager SQLite database (must have been initialised with `branchmanager preload`).')
     run.add_argument('-o', '--out', required=True,
         help='Output directory for this run (sequence_assessment.tsv, novelty_metrics.tsv, tree, iTOL files, etc.).')
     run.add_argument('--dataset', required=True,
@@ -2806,8 +2796,6 @@ def build_parser():
             'or mixed/all/none to disable domain filtering. Provide domain-specific --ref/--alt-ref, '
             '--baseline-fasta, --preload-dir, and --anchors as needed.'
         ))
-    run.add_argument('--kingdom', required=False,
-        help='Backward-compatible explicit domain/kingdom filter. Overrides --sequence-domain when supplied.')
     run.add_argument('--phylum', required=False,
         help='Filter iTOL output to sequences assigned to this phylum (e.g. Bacillota). Does not affect novelty scoring.')
     run.add_argument('--target', required=False, default=None,
@@ -2870,13 +2858,11 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     regen.add_argument('--db', required=True,
-        help='Path to the PhyloSelect SQLite database.')
+        help='Path to the BranchManager SQLite database.')
     regen.add_argument('-o', '--out', required=True,
         help='Output directory where iTOL files will be written (should be the preload or run output dir).')
     regen.add_argument('--include-datasets', required=False,
         help='Comma-separated list of dataset names to include (default: all datasets in the DB).')
-    regen.add_argument('--kingdom', required=False,
-        help='Include only sequences whose taxonomy contains this kingdom string (e.g. bacteria).')
     regen.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
         choices=SEQUENCE_DOMAIN_CHOICES, default=None,
         help='Optional domain profile filter for regenerated outputs: bacteria, archaea, fungi, or mixed/all/none.')
@@ -2919,7 +2905,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subtree.add_argument('--db', required=True,
-        help='Path to the PhyloSelect SQLite database.')
+        help='Path to the BranchManager SQLite database.')
     subtree.add_argument('-o', '--out', required=True,
         help='Output directory for the subtree results.')
     subtree.add_argument('--taxon', required=True,
@@ -3009,7 +2995,7 @@ def build_parser():
     sanger.add_argument('--min-quality', dest='min_quality', type=int, default=20,
         help='Phred cutoff for Mott-style end trimming (default: 20).')
     sanger.add_argument('--window', type=int, default=20,
-        help='Compatibility option retained for older commands; rigorous trimming uses the Phred cutoff directly.')
+        help='Window size retained in reports for trimming context; rigorous trimming uses the Phred cutoff directly.')
     sanger.add_argument('--min-length', dest='min_length', type=int, default=800,
         help='Minimum final sequence length to write to assembled.fasta (default: 800 bp).')
     sanger.add_argument('--min-read-length', dest='min_read_length', type=int, default=None,
@@ -3069,14 +3055,14 @@ def build_parser():
             '  pipeline_taxonomy.tsv       All datasets merged; pass to --taxa-assignments\n'
             '  preclassify_summary.txt     Plain-text summary with usage examples\n\n'
             'Example:\n'
-            '  phyloselect preclassify \\\n'
+            '  branchmanager preclassify \\\n'
             '    --dataset hungate16s=/data/hungate.fasta \\\n'
             '    --dataset silva=/data/silva_16s.fasta \\\n'
             '    --ref /data/gtdb_ssu_reps.fna \\\n'
             '    --taxa /data/gtdb_taxonomy.tsv.gz \\\n'
             '    --threads 8 -o preclassify_out/\n\n'
             'Then use the output in a preload:\n'
-            '  phyloselect preload --fasta hungate.fasta \\\n'
+            '  branchmanager preload --fasta hungate.fasta \\\n'
             '    --taxa-assignments preclassify_out/pipeline_taxonomy.tsv \\\n'
             '    --db project.db --dataset Hungate -o preload_out/'
         ),
@@ -3148,7 +3134,7 @@ def build_parser():
 
 def cmd_preclassify(args):
     """Handler for the ``preclassify`` subcommand."""
-    from phyloselect.pipeline import preclassify as _preclassify_mod
+    from branchmanager.pipeline import preclassify as _preclassify_mod
 
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
@@ -3220,14 +3206,14 @@ def cmd_preclassify(args):
         f"  Pipeline taxonomy : {pipeline_tsv}\n"
         f"  Summary           : {os.path.join(outdir, 'preclassify_summary.txt')}\n\n"
         f"Use in preload:\n"
-        f"  phyloselect preload --fasta <fasta> --taxa-assignments {pipeline_tsv} "
+        f"  branchmanager preload --fasta <fasta> --taxa-assignments {pipeline_tsv} "
         f"--db project.db --dataset <name> -o preload_out/"
     )
 
 
 def cmd_sanger(args):
     """Handler for the ``sanger`` / ``ab1`` subcommand."""
-    from phyloselect.pipeline import sanger as _sanger_mod
+    from branchmanager.pipeline import sanger as _sanger_mod
 
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
@@ -3275,7 +3261,7 @@ def cmd_sanger(args):
         f"  Read visual     : {outputs['read_error_svg']}\n"
         f"  Assembly visual : {outputs['assembly_svg']}\n\n"
         "Use in evaluate:\n"
-        f"  phyloselect evaluate --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
+        f"  branchmanager evaluate --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
     )
 
 

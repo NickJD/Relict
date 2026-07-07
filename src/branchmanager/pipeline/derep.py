@@ -2,7 +2,7 @@ import hashlib
 import logging
 from collections import defaultdict
 
-from phyloselect.utils.fasta import read_fasta, write_fasta
+from branchmanager.utils.fasta import read_fasta, write_fasta
 
 logger = logging.getLogger(__name__)
 

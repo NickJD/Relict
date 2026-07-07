@@ -1,7 +1,7 @@
 """Most Wanted List (MWL) taxonomy matching helpers.
 
 The MWL workbook is treated as a taxonomy/priority overlay on top of the
-standard PhyloSelect sequence assessment.  GTDB taxonomy remains the authoritative
+standard BranchManager sequence assessment.  GTDB taxonomy remains the authoritative
 input for MWL matching; other reference databases are still reported as
 cross-checks through the existing multi-db classification columns.
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 from xml.etree import ElementTree as ET
 
-from phyloselect.taxonomy import normalize_taxon_name, parse_taxon_string
+from branchmanager.taxonomy import normalize_taxon_name, parse_taxon_string
 
 
 RANK_ORDER = ['d', 'p', 'c', 'o', 'f', 'g', 's']

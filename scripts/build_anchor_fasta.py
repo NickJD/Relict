@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-build_anchor_fasta.py - Download and format reference anchor sequences for PhyloSelect.
+build_anchor_fasta.py - Download and format reference anchor sequences for BranchManager.
 
 Fetches a curated set of high-quality 16S rRNA anchor sequences spanning major
 bacterial and archaeal lineages from NCBI RefSeq, then writes them in the
-format expected by PhyloSelect's tree builder:
+format expected by BranchManager's tree builder:
 
-    >PHYLOSELECT_REF_<PhylumName> accession=<ACC> source=NCBI_RefSeq
+    >BRANCHMANAGER_REF_<PhylumName> accession=<ACC> source=NCBI_RefSeq
 
-Output: src/phyloselect/data/reference_anchors.fasta
+Output: src/branchmanager/data/reference_anchors.fasta
 
 Usage
 -----
@@ -68,7 +68,7 @@ from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Anchor definitions
-# Each entry: (phyloselect_label, ncbi_accession, description)
+# Each entry: (branchmanager_label, ncbi_accession, description)
 # ---------------------------------------------------------------------------
 ANCHORS = [
     # ── Bacillota (Firmicutes) ────────────────────────────────────────────
@@ -142,7 +142,7 @@ def fetch_sequence(acc: str, email: str, retries: int = 3) -> str:
     """Fetch a single FASTA sequence from NCBI eutils.  Returns raw FASTA text."""
     url = NCBI_EFETCH.format(acc=acc)
     if email:
-        url += f"&email={email}&tool=phyloselect_build_anchors"
+        url += f"&email={email}&tool=branchmanager_build_anchors"
     for attempt in range(retries):
         try:
             with urllib.request.urlopen(url, timeout=30) as resp:
@@ -183,8 +183,8 @@ def build_anchor_fasta(out_path: Path, email: str, skip_existing: bool = False):
     failed = []
 
     print(f"Fetching {len(ANCHORS)} anchor sequences from NCBI RefSeq ...")
-    for phyloselect_label, acc, description in ANCHORS:
-        print(f"  {acc:14s}  {phyloselect_label} ...", end=" ", flush=True)
+    for branchmanager_label, acc, description in ANCHORS:
+        print(f"  {acc:14s}  {branchmanager_label} ...", end=" ", flush=True)
         try:
             raw = fetch_sequence(acc, email)
             _orig_header, seq = parse_fasta_sequence(raw)
@@ -192,12 +192,12 @@ def build_anchor_fasta(out_path: Path, email: str, skip_existing: bool = False):
                 print(f"WARN - sequence only {len(seq)} bp; keeping anyway")
             else:
                 print(f"OK ({len(seq)} bp)")
-            phyloselect_header = f"PHYLOSELECT_REF_{phyloselect_label} accession={acc} source=NCBI_RefSeq desc={description!r}"
-            records.append((phyloselect_header, seq))
+            branchmanager_header = f"BRANCHMANAGER_REF_{branchmanager_label} accession={acc} source=NCBI_RefSeq desc={description!r}"
+            records.append((branchmanager_header, seq))
             time.sleep(0.4)  # stay well within NCBI rate limits
         except Exception as e:
             print(f"FAILED - {e}")
-            failed.append((acc, phyloselect_label, str(e)))
+            failed.append((acc, branchmanager_label, str(e)))
 
     # Write output
     with open(out_path, "w") as fh:
@@ -214,16 +214,16 @@ def build_anchor_fasta(out_path: Path, email: str, skip_existing: bool = False):
         print("\nRe-run the script to retry, or fetch these manually from")
         print("https://www.ncbi.nlm.nih.gov/nuccore/<ACCESSION>?report=fasta")
         print("and append them with headers like:")
-        print("  >PHYLOSELECT_REF_<PhylumName> accession=<ACC> source=NCBI_RefSeq")
+        print("  >BRANCHMANAGER_REF_<PhylumName> accession=<ACC> source=NCBI_RefSeq")
 
 
 # ---------------------------------------------------------------------------
 
 def main():
-    default_out = Path(__file__).resolve().parent.parent / "src" / "phyloselect" / "data" / "reference_anchors.fasta"
+    default_out = Path(__file__).resolve().parent.parent / "src" / "branchmanager" / "data" / "reference_anchors.fasta"
 
     parser = argparse.ArgumentParser(
-        description="Download NCBI RefSeq 16S sequences to use as PhyloSelect tree anchors."
+        description="Download NCBI RefSeq 16S sequences to use as BranchManager tree anchors."
     )
     parser.add_argument(
         "--out", default=str(default_out), metavar="PATH",

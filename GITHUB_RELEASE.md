@@ -1,14 +1,14 @@
-# PhyloSelect Beta: Marker-Gene QC, Novelty Scoring, and Isolate Prioritisation
+# BranchManager First Working Prototype: Marker-Gene QC, Novelty Scoring, and Isolate Prioritisation
 
-PhyloSelect is a substantially expanded marker-gene based candidate-selection system for isolate collections: Sanger/AB1 QC, taxonomy against multiple 16S/marker databases, novelty scoring against baseline and project collections, MWL matching, tree/iTOL output, and concise candidate-selection summaries.
+BranchManager is a substantially expanded marker-gene based candidate-selection system for isolate collections: Sanger/AB1 QC, taxonomy against multiple 16S/marker databases, novelty scoring against baseline and project collections, MWL matching, tree/iTOL output, and concise candidate-selection summaries.
 
 ## Breaking Changes
 
-- The toolkit is now branded **PhyloSelect** throughout.
-- Python imports use the `phyloselect.*` namespace.
-- CLI examples and help now use `phyloselect`.
-- Reference anchor headers use the `PHYLOSELECT_REF_` prefix.
-- Run logs are now written as `phyloselect.log`.
+- The toolkit is now branded **BranchManager** throughout.
+- Python imports use the `branchmanager.*` namespace.
+- CLI examples and help now use `branchmanager`.
+- Reference anchor headers use the `BRANCHMANAGER_REF_` prefix.
+- Run logs are now written as `branchmanager.log`.
 - IDs are preserved by default; generated shortened IDs are only used when requested.
 - `preload` and `evaluate` default to `--sequence-domain bacteria`; use `--sequence-domain archaea`, `fungi`, or `mixed` as needed.
 - The Sanger/AB1 workflow now applies stricter QC by default and withholds `FAIL_QC` sequences from `assembled.fasta`.
@@ -27,7 +27,7 @@ PhyloSelect is a substantially expanded marker-gene based candidate-selection sy
 
 ## Sanger / AB1 Processing
 
-- Added `phyloselect sanger` / `phyloselect ab1` / `phyloselect ab1-to-fasta`.
+- Added `branchmanager sanger` / `branchmanager ab1` / `branchmanager ab1-to-fasta`.
 - Supports AB1/ABI, FASTA, and FASTQ inputs, including gzipped files.
 - Supports read-level metadata and one-row-per-isolate sample maps.
 - Supports per-isolate handling modes:
@@ -49,7 +49,7 @@ PhyloSelect is a substantially expanded marker-gene based candidate-selection sy
 - Taxonomy assignments can now be read from FASTA headers or external CSV/TSV files.
 - FASTA, CSV, and TSV taxonomy inputs can be gzipped.
 - Added stronger reference/taxonomy consistency checks.
-- Added domain-aware filtering for bacteria, archaea, fungi, mixed/all, and legacy `--kingdom`.
+- Added domain-aware filtering for bacteria, archaea, fungi, and mixed/all runs.
 
 ## Novelty and Candidate Scoring
 
@@ -63,7 +63,7 @@ PhyloSelect is a substantially expanded marker-gene based candidate-selection sy
 ## Outputs and Reporting
 
 - Reorganised outputs into clearer directories for assessment, taxonomy, baseline hits, tree/MSA files, iTOL files, IDs, logs, and intermediates.
-- Removed redundant iTOL symbol and tree-colour files; PhyloSelect now emits one colour-strip style output per metadata type.
+- Removed redundant iTOL symbol and tree-colour files; BranchManager now emits one colour-strip style output per metadata type.
 - Added `OUTPUT_EXPLANATIONS.tsv` and `OUTPUT_GUIDE.md`.
 - Added per-sequence QC rejection reasons.
 - Added `selection_summary.tsv` as the board-facing candidate-decision report.
@@ -79,12 +79,12 @@ PhyloSelect is a substantially expanded marker-gene based candidate-selection sy
 ## Validation
 
 - Focused test suite passes: `67 passed`.
-- CLI smoke test passes: `python src/phyloselect/cli.py --help`.
+- CLI smoke test passes: `python src/branchmanager/cli.py --help`.
 - Sanger workflow was exercised on a 120-read AB1 batch and produced reproducible QC, assembly, and resequencing recommendation outputs.
 
-## Migration Notes
+## Upgrade Notes
 
-- Update legacy CLI invocations to `phyloselect ...`.
-- Update legacy Python imports to `phyloselect.*`.
-- Update custom anchor headers to `PHYLOSELECT_REF_...`.
+- Use `branchmanager ...` as the only CLI spelling.
+- Use `branchmanager.*` as the only Python import namespace.
+- Use `BRANCHMANAGER_REF_...` for custom anchor headers.
 - Review Sanger outputs carefully after upgrading: stricter QC may classify previously retained reads as `MANUAL_REVIEW` or `RESEQUENCE`.

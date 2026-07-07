@@ -7,8 +7,8 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Tuple
 
-from phyloselect.utils.fasta import read_fasta, write_fasta
-from phyloselect.utils.subprocess import run_cmd
+from branchmanager.utils.fasta import read_fasta, write_fasta
+from branchmanager.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
 

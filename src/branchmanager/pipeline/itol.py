@@ -1,6 +1,6 @@
 from pathlib import Path
 import hashlib
-from phyloselect.taxonomy import parse_taxon_string as _shared_parse_taxon_string
+from branchmanager.taxonomy import parse_taxon_string as _shared_parse_taxon_string
 
 
 def _hash_to_hue(s: str) -> float:
@@ -706,8 +706,8 @@ def generate_itol_colors(taxonomy_tsv: str, outdir: str, user_color_csv: str = N
                 newick = tf.read_text()
                 try:
                     # Repair malformed NODE labels before further tree rewriting.
-                    from phyloselect.pipeline.tree import _repair_legacy_internal_node_labels
-                    newick = _repair_legacy_internal_node_labels(newick)
+                    from branchmanager.pipeline.tree import _repair_internal_node_label_delimiters
+                    newick = _repair_internal_node_label_delimiters(newick)
                 except Exception:
                     pass
                 # Inject deterministic textual node names for any internal node
@@ -1418,7 +1418,7 @@ def generate_rumen_function_draft(
 ) -> tuple:
     """Auto-generate a draft rumen functional annotation from a taxonomy TSV.
 
-    Reads the combined taxonomy TSV produced by a PhyloSelect run and maps each
+    Reads the combined taxonomy TSV produced by a BranchManager run and maps each
     sequence to one of the broad ruminant microbiome functional groups defined
     in :data:`_RUMEN_FUNC_PALETTE`.
 

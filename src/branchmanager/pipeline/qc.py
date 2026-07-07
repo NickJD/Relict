@@ -1,6 +1,6 @@
 import logging
 
-from phyloselect.utils.fasta import read_fasta, write_fasta
+from branchmanager.utils.fasta import read_fasta, write_fasta
 
 logger = logging.getLogger(__name__)
 
