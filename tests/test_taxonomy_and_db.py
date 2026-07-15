@@ -17,6 +17,7 @@ if str(SRC) not in sys.path:
 
 from branchmanager.cli import _find_preferred_id_map, _load_partner_metadata_for_run, _load_performance_review_baseline, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_filing_cabinet, cmd_performance_review
 from branchmanager.db.interface import Database
+from branchmanager import mailroom as mailroom_module
 from branchmanager.pipeline import classify as classify_pipeline
 from branchmanager.pipeline import novelty as novelty_pipeline
 from branchmanager.pipeline import neighbourhood as neighbourhood_pipeline
@@ -1103,6 +1104,81 @@ class DatabaseBehaviourTests(unittest.TestCase):
 
 
 class OutputHelperTests(unittest.TestCase):
+    def test_mailroom_builds_paired_ab1_map_with_primer_provenance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reads = tmp / 'All_AB1'
+            reads.mkdir()
+            _write_minimal_ab1(reads / 'KKX994_123_123.ab1', 'ACGT' * 12, [35] * 48)
+            _write_minimal_ab1(reads / 'KKY011_456_456.ab1', 'TGCA' * 12, [35] * 48)
+            metadata = tmp / 'supplier.csv'
+            metadata.write_text(
+                'Sequencing ID,Isolate Number,Read\n'
+                'KKX994,SW_0016,Forward\n'
+                'KKY011,SW_0016,Reverse\n'
+            )
+
+            result = mailroom_module.prepare_ab1_map(
+                reads,
+                metadata,
+                tmp / 'mailroom',
+                dataset='UoG_01',
+                forward_primer='63F',
+                reverse_primer='1492R',
+            )
+
+            self.assertEqual(result['status'], 'PASS')
+            self.assertEqual(result['mapped_reads'], 2)
+            with open(result['ab1_map']) as handle:
+                rows = list(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual({row['primer'] for row in rows}, {'63F', '1492R'})
+            self.assertEqual({row['direction'] for row in rows}, {'forward', 'reverse'})
+            self.assertEqual({row['processing_mode'] for row in rows}, {'assemble'})
+            self.assertEqual({row['primer_assignment'] for row in rows}, {'configured_for_batch'})
+            self.assertTrue(all(row['dataset'] == 'UoG_01' for row in rows))
+
+    def test_mailroom_requires_review_when_primer_is_not_supplied(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reads = tmp / 'All_AB1'
+            reads.mkdir()
+            _write_minimal_ab1(reads / 'READ001_123.ab1', 'ACGT' * 12, [35] * 48)
+            metadata = tmp / 'supplier.tsv'
+            metadata.write_text(
+                'sequencing_id\tisolate_number\tread\n'
+                'READ001\tISO1\tForward\n'
+            )
+
+            result = mailroom_module.prepare_ab1_map(
+                reads, metadata, tmp / 'mailroom', dataset='Batch1',
+            )
+
+            self.assertEqual(result['status'], 'REVIEW_REQUIRED')
+            self.assertEqual(result['unresolved_primers'], 1)
+            self.assertIn('UNRESOLVED_PRIMER', Path(result['report']).read_text())
+            self.assertIn('\tunknown\tforward\tbest_read\tunresolved', Path(result['ab1_map']).read_text())
+
+    def test_mailroom_reports_missing_and_unmapped_ab1_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reads = tmp / 'All_AB1'
+            reads.mkdir()
+            _write_minimal_ab1(reads / 'EXTRA001_123.ab1', 'ACGT' * 12, [35] * 48)
+            metadata = tmp / 'supplier.csv'
+            metadata.write_text(
+                'Sequencing ID,Isolate Number,Read,Primer\n'
+                'MISSING001,ISO1,Forward,63F\n'
+            )
+
+            result = mailroom_module.prepare_ab1_map(
+                reads, metadata, tmp / 'mailroom', dataset='Batch1',
+            )
+
+            self.assertEqual(result['status'], 'FAIL')
+            report = Path(result['report']).read_text()
+            self.assertIn('READ_FILE_NOT_FOUND', report)
+            self.assertIn('UNMAPPED_AB1_FILE', report)
+
     def test_read_ab1_extracts_sequence_and_quality(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             ab1 = Path(tmpdir) / 'Iso001_27F.ab1'

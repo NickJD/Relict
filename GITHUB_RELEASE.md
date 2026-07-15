@@ -12,12 +12,14 @@ BranchManager is a substantially expanded marker-gene based candidate-selection 
 - IDs are preserved by default; generated shortened IDs are only used when requested.
 - Filing Cabinet and Performance Review default to `--sequence-domain bacteria`; use `--sequence-domain archaea`, `fungi`, or `mixed` as needed.
 - The Sanger/AB1 workflow now applies stricter QC by default and withholds `FAIL_QC` sequences from `assembled.fasta`.
+- Partner AB1 submissions use one Mailroom-generated batch map plus the cumulative project metadata ledger; the duplicate public `--read-metadata` route has been removed.
 
 ## Highlights
 
 - Local-clade PNG figures now distinguish confirmed sequenced isolates from primary and backup recommendations; force nearest cultured-baseline hits into bounded contexts; annotate leaf pident relative to P1; and include complete per-figure pairwise MSA-pident tables.
 
 - Added the core **Performance Review** (`performance-review`) for rolling partner-sequence assessment and candidate prioritisation.
+- Added **Mailroom** (`mailroom`) to inventory AB1 deliveries, extract ABIF metadata, reconcile supplier read IDs, and generate an auditable `ab1_map.tsv` before Onboarding.
 - Added baseline loading for cultured/reference collections such as Hungate via `--baseline-fasta` and `--baseline-dataset`.
 - Added multi-database taxonomic reporting for GTDB plus alternate references such as GG2, SILVA, and NCBI.
 - Added MWL matching using GTDB assignments as the authoritative taxonomy layer.
@@ -42,7 +44,7 @@ BranchManager is a substantially expanded marker-gene based candidate-selection 
 
 - Added `branchmanager paper-trail` for AB1 conversion, error trimming, review, and multi-primer assembly.
 - Supports AB1/ABI, FASTA, and FASTQ inputs, including gzipped files.
-- Supports read-level metadata and one-row-per-isolate sample maps.
+- Uses one explicit per-batch `--sample-map`, preferably one row per physical read; Onboarding generates the normalised Paper Trail hand-off internally.
 - Supports per-isolate handling modes:
   - `assemble` / `merge` / `consensus`
   - `best_read` / `highest_quality` / `select_best` / `independent`

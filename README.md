@@ -25,6 +25,7 @@ It combines Sanger/AB1 quality control, marker-gene taxonomic classification, ne
 
 | Stage | Purpose |
 |---|---|
+| **Mailroom** | Inventory an AB1 delivery, reconcile supplier read IDs, and prepare the per-batch map |
 | **Onboarding** | Validate partner IDs, metadata, and raw-file ownership before analysis |
 | **Paper Trail** | Read AB1 base calls, Phred scores, peak positions, dye channels, and mixed-peak evidence |
 | **Merge Meeting** | Trim primers and assemble multiple primer reads, or choose the best independent read |
@@ -160,6 +161,44 @@ branchmanager filing-cabinet \
 
 ---
 
+### `branchmanager mailroom`
+
+Prepare the immutable per-batch AB1 map before Onboarding. Mailroom scans every physical chromatogram, extracts ABIF sample/run/instrument and base-call evidence, reconciles supplier sequencing IDs, and reports missing, duplicated, ambiguous, or unmapped reads.
+
+```bash
+branchmanager mailroom \
+  --read-dir UoG/All_AB1 \
+  --metadata UoG/supplier_metadata.csv \
+  --dataset UoG_01 \
+  --forward-primer 63F \
+  --reverse-primer 1492R \
+  -o UoG/UoG_01
+```
+
+Only use `--forward-primer` and `--reverse-primer` after the oligonucleotides have been confirmed from the partner protocol or sequencing submission. Supplier metadata may instead contain a `primer` column. Mailroom uses embedded ABIF primer names when present, but never treats sequence-motif similarity as proof of the exact primer.
+
+Preferred supplier-metadata columns:
+
+```tsv
+sequencing_id	isolate_number	read	primer	processing_mode
+KKX994	SW_0016	Forward	63F	assemble
+KKY011	SW_0016	Reverse	1492R	assemble
+```
+
+`primer` and `processing_mode` are optional. With `--processing-mode auto`, paired/multi-read isolates use `assemble` and single-read isolates use `best_read`.
+
+| Output | Purpose |
+|---|---|
+| `ab1_map.tsv` | Validated one-row-per-read input for Onboarding |
+| `ab1_inventory.tsv` | Physical file and extracted ABIF metadata inventory |
+| `mailroom_report.tsv` | Missing, duplicate, ambiguous, unreadable, unmapped, and unresolved-primer findings |
+| `mailroom_summary.json` | Machine-readable counts and `PASS`, `REVIEW_REQUIRED`, or `FAIL` status |
+| `run_manifest.json` | Checksums, inputs, outputs, and stage status |
+
+Mailroom returns `REVIEW_REQUIRED` when files reconcile but primer names remain unresolved, and `FAIL` for structural/file errors. Correct the supplier metadata or confirm primers before Onboarding.
+
+---
+
 ### `branchmanager onboarding`
 
 Every partner dataset is onboarded from exactly one marker source. AB1 submissions use a sample map; FASTA-only submissions use the FASTA directly. Both paths validate sequence IDs against the same cumulative project metadata ledger.
@@ -167,7 +206,7 @@ Every partner dataset is onboarded from exactly one marker source. AB1 submissio
 ```bash
 # AB1 or multiple primer reads
 branchmanager onboarding \
-  --sample-map UoG_01_ab1_mapping.tsv \
+  --sample-map UoG/UoG_01/ab1_map.tsv \
   --read-dir UoG_01_AB1/ \
   --partner-metadata project_partner_metadata.tsv \
   --partner-id UoG --dataset UoG_01 \

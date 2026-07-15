@@ -3166,6 +3166,7 @@ def build_parser():
         description=(
             'BranchManager — marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation toolkit.\n\n'
             'Subcommands:\n'
+            '  mailroom           Inventory AB1 deliveries and build a batch map.\n'
             '  background-check   Pre-classify reference collections once and reuse the evidence.\n'
             '  filing-cabinet     Register the cultured baseline and backbone tree.\n'
             '  onboarding         Validate a partner submission before project state changes.\n'
@@ -3180,6 +3181,7 @@ def build_parser():
             '  org-chart          Extract a focused tree and iTOL files for a specific taxon.\n'
             '  label-maker        Regenerate iTOL annotation files from stored taxonomy.\n\n'
             'Typical workflow:\n'
+            '  P. branchmanager mailroom --read-dir All_AB1 --metadata supplier.csv --dataset QUB_01 --forward-primer 63F -o QUB_01\n'
             '  0. branchmanager background-check --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o background_check_out\n'
             '  1. branchmanager filing-cabinet --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments background_check_out/pipeline_taxonomy.tsv --build-tree -o filing_cabinet_out\n'
             '  2. branchmanager performance-review --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1 --ref gtdb.fna --mwl MWL.xlsx -o review_out\n'
@@ -3684,6 +3686,34 @@ def build_parser():
         type=int, default=2400,
         help='Maximum height in pixels for each visual-report PNG; larger reports are split into numbered pages (minimum: 600, default: 2400).')
 
+    mailroom_parser = sub.add_parser(
+        'mailroom',
+        help='Mailroom: inventory an AB1 delivery and build its batch map.',
+        description=(
+            'Reconcile a directory of AB1/ABI chromatograms with supplier metadata and write '
+            'a validated one-row-per-read ab1_map.tsv. Primer names are taken from supplier '
+            'metadata, embedded ABIF fields, or explicit batch-level forward/reverse settings. '
+            'Unresolved primers are reported for review and are never silently inferred as fact.'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    mailroom_parser.add_argument('--read-dir', required=True,
+        help='Directory containing the AB1/ABI files for one partner batch.')
+    mailroom_parser.add_argument('--metadata', required=True,
+        help='Supplier CSV/TSV with sequencing/read ID, isolate ID, and forward/reverse direction. Primer and processing-mode columns are optional.')
+    mailroom_parser.add_argument('--dataset', required=True,
+        help='Stable batch label written to every map row, for example UoG_01.')
+    mailroom_parser.add_argument('--forward-primer', default=None,
+        help='Confirmed primer name applied to forward rows lacking a supplied/embedded primer.')
+    mailroom_parser.add_argument('--reverse-primer', default=None,
+        help='Confirmed primer name applied to reverse rows lacking a supplied/embedded primer.')
+    mailroom_parser.add_argument('--processing-mode', choices=['auto', 'assemble', 'best_read'], default='auto',
+        help='Default read handling. Auto selects assemble for multi-read isolates and best_read for single-read isolates.')
+    mailroom_parser.add_argument('--recursive', action=argparse.BooleanOptionalAction, default=True,
+        help='Search the AB1 directory recursively (default: enabled).')
+    mailroom_parser.add_argument('-o', '--out', required=True,
+        help='Output directory for ab1_map.tsv, AB1 inventory, discrepancy report, and summary.')
+
     onboarding_parser = sub.add_parser(
         'onboarding',
         help='Onboarding: validate partner IDs, metadata, and either raw-read ownership or a supplied FASTA.',
@@ -4080,6 +4110,47 @@ def cmd_paper_trail(args):
         "Use in Performance Review:\n"
         f"  branchmanager performance-review --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
     )
+
+
+def cmd_mailroom(args):
+    from branchmanager.mailroom import prepare_ab1_map
+
+    manifest = RunManifest(args.out, 'mailroom')
+    manifest.add_input(args.read_dir, role='ab1_directory')
+    manifest.add_input(args.metadata, role='supplier_metadata')
+    try:
+        result = prepare_ab1_map(
+            args.read_dir,
+            args.metadata,
+            args.out,
+            dataset=args.dataset,
+            forward_primer=args.forward_primer,
+            reverse_primer=args.reverse_primer,
+            processing_mode=args.processing_mode,
+            recursive=args.recursive,
+        )
+        for role in ('ab1_map', 'inventory', 'report', 'summary'):
+            manifest.add_output(result[role], role=role)
+        manifest.add_stage(
+            'mailroom', result['status'],
+            detail=f"{result['mapped_reads']} mapped reads; {result['errors']} errors",
+        )
+        manifest.finish('COMPLETE' if result['status'] == 'PASS' else 'FAILED')
+    except Exception as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    print(
+        f"[mailroom] {result['status']}: {result['physical_ab1_files']} AB1 file(s), "
+        f"{result['mapped_reads']} mapped read(s), {result['isolates']} metadata isolate(s), "
+        f"{result['mapped_isolates']} with mapped reads, "
+        f"{result['errors']} error(s), {result['unresolved_primers']} unresolved primer(s).\n"
+        f"  Batch map : {result['ab1_map']}\n"
+        f"  Inventory : {result['inventory']}\n"
+        f"  Report    : {result['report']}\n"
+        f"  Summary   : {result['summary']}"
+    )
+    if result['status'] != 'PASS':
+        raise SystemExit(2)
 
 
 def cmd_onboarding(args):
@@ -4574,6 +4645,8 @@ def main(argv=None):
         cmd_background_check(args)
     elif args.command == 'paper-trail':
         cmd_paper_trail(args)
+    elif args.command == 'mailroom':
+        cmd_mailroom(args)
     elif args.command == 'onboarding':
         cmd_onboarding(args)
     elif args.command == 'status-meeting':

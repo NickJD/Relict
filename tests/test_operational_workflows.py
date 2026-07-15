@@ -392,6 +392,7 @@ class OperationalWorkflowTests(unittest.TestCase):
     def test_office_workflow_commands_are_primary_cli_entries(self):
         parser = build_parser()
         cases = (
+            (['mailroom', '--read-dir', 'reads', '--metadata', 'supplier.csv', '--dataset', 'QUB_01', '-o', 'out'], 'mailroom'),
             (['filing-cabinet', '--fasta', 'b.fa', '--db', 'p.db', '--dataset', 'Hungate'], 'filing-cabinet'),
             (['performance-review', '--input', 'q.fa', '--db', 'p.db', '--dataset', 'QUB', '-o', 'out'], 'performance-review'),
             (['quarterly-review', '--db', 'p.db', '--genome-budget', '3', '-o', 'out'], 'quarterly-review'),
