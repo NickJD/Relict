@@ -172,6 +172,21 @@ CREATE TABLE IF NOT EXISTS genome_records (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS sequence_removals (
+    removal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id TEXT NOT NULL,
+    original_dataset TEXT,
+    partner_id TEXT,
+    sequence_length INTEGER,
+    sequence_sha256 TEXT NOT NULL,
+    taxonomy TEXT,
+    reason TEXT NOT NULL,
+    source_request TEXT,
+    removed_records_json TEXT NOT NULL,
+    removed_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_genome_records_sequence ON genome_records(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_isolate_status_events_sequence ON isolate_status_events(sequence_id);
+CREATE INDEX IF NOT EXISTS idx_sequence_removals_sequence ON sequence_removals(sequence_id);
 """

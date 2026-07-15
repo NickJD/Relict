@@ -27,6 +27,7 @@ STAGE_LABELS = {
     'quarterly_review': 'Quarterly Review',
     'status_meeting': 'Status Meeting',
     'records_update': 'Records Update',
+    'exit_interview': 'Exit Interview',
     'annual_report': 'Annual Report',
     'assistant': 'Assistant to the Branch Manager',
 }

@@ -254,6 +254,157 @@ class Database:
         )
         return [dict(zip(keys, row)) for row in rows]
 
+    def plan_sequence_removals(
+        self, requests, *, allow_baseline=False, allow_genome_records=False,
+    ):
+        """Resolve removal requests and identify protected project records."""
+        planned = []
+        seen = set()
+        with self.connect() as conn:
+            cur = conn.cursor()
+            for request in requests or []:
+                requested_id = str(request.get('sequence_id') or '').strip()
+                reason = str(request.get('reason') or '').strip()
+                source_request = str(request.get('source_request') or '').strip()
+                row = {
+                    'requested_id': requested_id,
+                    'sequence_id': '',
+                    'dataset': '',
+                    'dataset_role': '',
+                    'partner_id': '',
+                    'sequence_length': '',
+                    'sequence_sha256': '',
+                    'taxonomy': '',
+                    'selected_for_genome_sequencing': False,
+                    'genome_already_sequenced': False,
+                    'genome_records': 0,
+                    'status': 'NOT_FOUND',
+                    'reason': reason,
+                    'source_request': source_request,
+                    '_sequence': '',
+                }
+                if not requested_id:
+                    row['status'] = 'INVALID_REQUEST'
+                    planned.append(row)
+                    continue
+                sequence_id = self._resolve_sequence_id_with_cursor(cur, requested_id)
+                if not sequence_id:
+                    planned.append(row)
+                    continue
+                if sequence_id in seen:
+                    row['sequence_id'] = sequence_id
+                    row['status'] = 'DUPLICATE_REQUEST'
+                    planned.append(row)
+                    continue
+                seen.add(sequence_id)
+                sequence_row = cur.execute(
+                    'SELECT s.sequence, s.length, s.dataset, '
+                    'COALESCE(m.partner_id, ""), COALESCE(m.selected_for_sequencing, 0), '
+                    'COALESCE(m.selected_for_wgs, 0), COALESCE(r.role, "unregistered") '
+                    'FROM sequences s LEFT JOIN sequencing_metadata m ON m.id=s.id '
+                    'LEFT JOIN dataset_roles r ON r.dataset=s.dataset WHERE s.id = ?',
+                    (sequence_id,),
+                ).fetchone()
+                if not sequence_row:
+                    planned.append(row)
+                    continue
+                sequence, length, dataset, partner_id, selected, sequenced, dataset_role = sequence_row
+                taxonomy_row = cur.execute(
+                    'SELECT taxonomy FROM taxonomy WHERE id = ? '
+                    'ORDER BY confidence DESC, rowid DESC LIMIT 1',
+                    (sequence_id,),
+                ).fetchone()
+                genome_count = cur.execute(
+                    'SELECT COUNT(*) FROM genome_records WHERE sequence_id = ?',
+                    (sequence_id,),
+                ).fetchone()[0]
+                sequence_text = str(sequence or '')
+                row.update({
+                    'sequence_id': sequence_id,
+                    'dataset': dataset or '',
+                    'dataset_role': dataset_role or 'unregistered',
+                    'partner_id': partner_id or '',
+                    'sequence_length': int(length if length is not None else len(sequence_text)),
+                    'sequence_sha256': hashlib.sha256(sequence_text.encode('utf-8')).hexdigest(),
+                    'taxonomy': taxonomy_row[0] if taxonomy_row else '',
+                    'selected_for_genome_sequencing': bool(selected),
+                    'genome_already_sequenced': bool(sequenced or genome_count),
+                    'genome_records': int(genome_count),
+                    'status': 'READY',
+                    '_sequence': sequence_text,
+                })
+                if dataset_role == 'baseline' and not allow_baseline:
+                    row['status'] = 'BLOCKED_BASELINE'
+                elif (sequenced or genome_count) and not allow_genome_records:
+                    row['status'] = 'BLOCKED_GENOME_RECORD'
+                planned.append(row)
+        return planned
+
+    def apply_sequence_removals(self, planned_rows, *, source_request=''):
+        """Remove planned sequences atomically while retaining an audit tombstone."""
+        rows = list(planned_rows or [])
+        invalid = [row for row in rows if row.get('status') != 'READY']
+        if invalid:
+            statuses = ', '.join(
+                f"{row.get('requested_id') or '<blank>'}:{row.get('status')}" for row in invalid
+            )
+            raise ValueError(f'Cannot apply an incomplete Exit Interview plan: {statuses}')
+        deletion_specs = (
+            ('classification_evidence', 'sequence_id = ?'),
+            ('taxonomy_alt', 'id = ?'),
+            ('taxonomy', 'id = ?'),
+            ('colours', 'id = ?'),
+            ('sequencing_metadata', 'id = ?'),
+            ('assessment_snapshots', 'sequence_id = ?'),
+            ('selection_round_members', 'sequence_id = ?'),
+            ('sequence_provenance', 'sequence_id = ?'),
+            ('isolate_status_events', 'sequence_id = ?'),
+            ('isolate_status', 'sequence_id = ?'),
+            ('genome_records', 'sequence_id = ?'),
+            ('seq_aliases', 'canonical_id = ?'),
+        )
+        with self.connect() as conn:
+            cur = conn.cursor()
+            for row in rows:
+                sequence_id = str(row['sequence_id'])
+                current = cur.execute(
+                    'SELECT sequence, dataset FROM sequences WHERE id = ?', (sequence_id,),
+                ).fetchone()
+                if not current:
+                    raise ValueError(f'Sequence {sequence_id!r} disappeared after the plan was created')
+                current_sha256 = hashlib.sha256(str(current[0] or '').encode('utf-8')).hexdigest()
+                if current_sha256 != row['sequence_sha256']:
+                    raise ValueError(f'Sequence {sequence_id!r} changed after the plan was created')
+
+                removed_counts = {}
+                cur.execute('DELETE FROM distances WHERE id = ? OR nearest = ?', (sequence_id, sequence_id))
+                removed_counts['distances'] = cur.rowcount
+                for table, predicate in deletion_specs:
+                    cur.execute(f'DELETE FROM {table} WHERE {predicate}', (sequence_id,))
+                    removed_counts[table] = cur.rowcount
+                cur.execute('DELETE FROM sequences WHERE id = ?', (sequence_id,))
+                removed_counts['sequences'] = cur.rowcount
+                if removed_counts['sequences'] != 1:
+                    raise RuntimeError(f'Exit Interview did not remove sequence {sequence_id!r}')
+
+                cur.execute(
+                    'INSERT INTO sequence_removals '
+                    '(sequence_id, original_dataset, partner_id, sequence_length, sequence_sha256, '
+                    'taxonomy, reason, source_request, removed_records_json) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        sequence_id, row.get('dataset', ''), row.get('partner_id', ''),
+                        row.get('sequence_length'), row.get('sequence_sha256', ''),
+                        row.get('taxonomy', ''), row.get('reason', ''),
+                        row.get('source_request') or source_request or '',
+                        json.dumps(removed_counts, sort_keys=True, separators=(',', ':')),
+                    ),
+                )
+                row['status'] = 'REMOVED'
+                row['removed_records'] = removed_counts
+            conn.commit()
+        return rows
+
     def _ensure_schema_up_to_date(self):
         """Apply idempotent migrations and fail if project state cannot be made current."""
         with self.connect() as conn:
@@ -337,6 +488,10 @@ class Database:
             cur.execute(
                 'INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)',
                 (3,),
+            )
+            cur.execute(
+                'INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)',
+                (4,),
             )
             conn.commit()
 

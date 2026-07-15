@@ -3175,6 +3175,7 @@ def build_parser():
             '  status-meeting     Import factual isolate lifecycle changes.\n'
             '  records-update     Import completed-genome, QC, GTDB, and ANI evidence.\n'
             '  quarterly-review   Nominate a later genome tranche from the complete project.\n'
+            '  exit-interview     Remove isolates from active project state with a retained audit.\n'
             '  annual-report      Produce the cumulative end-of-project report.\n'
             '  it-desk            Check dependencies and project inputs before production.\n'
             '  assistant          Run the complete raw-trace-to-Hiring-Panel workflow.\n'
@@ -3758,9 +3759,37 @@ def build_parser():
         help='Maximum estimated contamination for automatic QC pass (default: 5).')
     records_update_parser.add_argument('-o', '--out', required=True)
 
+    exit_interview_parser = sub.add_parser(
+        'exit-interview',
+        help='Exit Interview: withdraw sequences from active project analyses with an audit trail.',
+        description=(
+            'Preview or apply removal of one or more sequences from the project database. '
+            'Applying an Exit Interview removes active sequence, taxonomy, distance, assessment, '
+            'selection, provenance, status, and metadata records while retaining an immutable '
+            'tombstone. Baseline and genome-backed records are protected by default.'
+        ),
+    )
+    exit_source = exit_interview_parser.add_mutually_exclusive_group(required=True)
+    exit_source.add_argument('--sequence-id', action='append',
+        help='Sequence/isolate ID to remove; repeat for multiple IDs.')
+    exit_source.add_argument('--input',
+        help='CSV/TSV, optionally gzipped, with sequence_id and reason columns.')
+    exit_interview_parser.add_argument('--db', required=True)
+    exit_interview_parser.add_argument('--reason', default='',
+        help='Required reason for direct IDs, or fallback reason for input rows.')
+    exit_interview_parser.add_argument('--apply', action='store_true', default=False,
+        help='Apply the reviewed plan. Without this flag, Exit Interview is preview-only.')
+    exit_interview_parser.add_argument('--allow-baseline', action='store_true', default=False,
+        help='Explicitly allow removal from a registered cultured baseline.')
+    exit_interview_parser.add_argument('--allow-genome-records', action='store_true', default=False,
+        help='Explicitly allow removal of an isolate that has genome evidence.')
+    exit_interview_parser.add_argument('--backup', action=argparse.BooleanOptionalAction, default=True,
+        help='Write project_before_exit_interview.sqlite before applying (default: enabled).')
+    exit_interview_parser.add_argument('-o', '--out', required=True)
+
     annual_report_parser = sub.add_parser(
         'annual-report',
-        help='Annual Report: create the final dashboard, ledgers, and decision-change report.',
+        help='Annual Report: create a point-in-time project overview, ledgers, and decision-change report.',
     )
     annual_report_parser.add_argument('--db', required=True)
     annual_report_parser.add_argument('-o', '--out', required=True)
@@ -4247,6 +4276,136 @@ def _cmd_project_import(args, *, genomes: bool):
     print(f'[{command_label}] {len(rows) - rejected} row(s) imported; {rejected} rejected.\n  Report: {report}')
 
 
+def cmd_exit_interview(args):
+    """Preview or atomically apply an audited sequence withdrawal."""
+    import fcntl
+    import sqlite3
+    from branchmanager.personnel import (
+        load_exit_requests, write_departing_fasta, write_exit_interview_report,
+    )
+
+    output = Path(args.out).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[exit-interview] Project database does not exist: {original}')
+    requests = load_exit_requests(
+        args.sequence_id, input_path=args.input, default_reason=args.reason,
+    )
+    manifest = RunManifest(output, 'exit_interview')
+    manifest.add_input(original, role='project_database_before')
+    if args.input:
+        manifest.add_input(args.input, role='exit_interview_requests')
+
+    if not args.apply:
+        db = Database(str(original))
+        rows = db.plan_sequence_removals(
+            requests,
+            allow_baseline=bool(args.allow_baseline),
+            allow_genome_records=bool(args.allow_genome_records),
+        )
+        report = write_exit_interview_report(output / 'exit_interview_plan.tsv', rows)
+        manifest.add_output(report, role='exit_interview_plan')
+        ready = sum(row.get('status') == 'READY' for row in rows)
+        blocked = len(rows) - ready
+        status = 'COMPLETE' if blocked == 0 else 'COMPLETE_WITH_WARNINGS'
+        manifest.add_stage('exit_interview', status, detail=f'{ready} ready; {blocked} blocked')
+        manifest.finish(status)
+        print(
+            f'[exit-interview] Preview only: {ready} sequence(s) ready; {blocked} blocked.\n'
+            f'  Plan: {report}\n'
+            '  Review the plan, then repeat the command with --apply.'
+        )
+        return
+
+    staged_path = output / '.exit_interview_project.sqlite'
+    lock_path = original.with_name(original.name + '.lock')
+    blocked_rows = []
+    report = ''
+    removed_count = 0
+    with open(lock_path, 'a+') as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            staged_path.unlink(missing_ok=True)
+            with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged_path)) as target:
+                source.backup(target)
+            db = Database(str(staged_path))
+            db.initialise()
+            rows = db.plan_sequence_removals(
+                requests,
+                allow_baseline=bool(args.allow_baseline),
+                allow_genome_records=bool(args.allow_genome_records),
+            )
+            blocked_rows = [row for row in rows if row.get('status') != 'READY']
+            if blocked_rows:
+                report = write_exit_interview_report(output / 'exit_interview_plan.tsv', rows)
+                manifest.add_output(report, role='exit_interview_plan')
+                manifest.add_stage(
+                    'exit_interview', 'COMPLETE_WITH_WARNINGS',
+                    detail=f'0 removed; {len(blocked_rows)} blocked',
+                )
+                manifest.finish('COMPLETE_WITH_WARNINGS')
+            else:
+                archive = write_departing_fasta(output / 'departing_sequences.fasta', rows)
+                manifest.add_output(archive, role='departing_sequences')
+                if args.backup:
+                    backup = output / 'project_before_exit_interview.sqlite'
+                    backup.unlink(missing_ok=True)
+                    with sqlite3.connect(str(original)) as source, sqlite3.connect(str(backup)) as target:
+                        source.backup(target)
+                    manifest.add_output(backup, role='project_database_backup')
+                db.apply_sequence_removals(
+                    rows, source_request=str(Path(args.input).resolve()) if args.input else 'command_line',
+                )
+                report = write_exit_interview_report(output / 'exit_interview_report.tsv', rows)
+                manifest.add_output(report, role='exit_interview_report')
+                with db.connect() as conn:
+                    integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
+                    remaining = conn.execute(
+                        'SELECT COUNT(*) FROM sequences WHERE id IN ('
+                        + ','.join('?' for _ in rows) + ')',
+                        tuple(row['sequence_id'] for row in rows),
+                    ).fetchone()[0]
+                if integrity != 'ok':
+                    raise RuntimeError(f'staged Exit Interview database failed integrity_check: {integrity}')
+                if remaining:
+                    raise RuntimeError(f'{remaining} planned sequence(s) remained after Exit Interview')
+                removed_count = len(rows)
+                manifest.add_stage('exit_interview', 'COMPLETE', detail=f'{removed_count} removed')
+                manifest.finish('COMPLETE')
+                db.record_project_run(
+                    f'exit-interview:{manifest.data["started_at"]}', 'exit_interview', 'COMPLETE',
+                    manifest_path=str(manifest.json_path), started_at=manifest.data['started_at'],
+                    completed_at=manifest.data['completed_at'],
+                )
+                publish_tmp = original.with_name(original.name + '.publishing')
+                publish_tmp.unlink(missing_ok=True)
+                with sqlite3.connect(str(staged_path)) as source, sqlite3.connect(str(publish_tmp)) as target:
+                    source.backup(target)
+                    if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                        raise RuntimeError('published Exit Interview database failed integrity_check')
+                os.replace(publish_tmp, original)
+                staged_path.unlink(missing_ok=True)
+        except BaseException as exc:
+            if not blocked_rows:
+                manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            staged_path.unlink(missing_ok=True)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    if blocked_rows:
+        print(
+            f'[exit-interview] No changes applied; {len(blocked_rows)} request(s) are blocked.\n'
+            f'  Plan: {report}'
+        )
+        raise SystemExit(2)
+    print(
+        f'[exit-interview] Removed {removed_count} sequence(s) from active project state.\n'
+        f'  Audit report: {report}\n'
+        f'  Recovery FASTA: {output / "departing_sequences.fasta"}'
+    )
+
+
 def cmd_annual_report(args):
     from branchmanager.reporting import write_annual_report
 
@@ -4653,6 +4812,8 @@ def main(argv=None):
         _cmd_project_import(args, genomes=False)
     elif args.command == 'records-update':
         _cmd_project_import(args, genomes=True)
+    elif args.command == 'exit-interview':
+        cmd_exit_interview(args)
     elif args.command == 'annual-report':
         cmd_annual_report(args)
     elif args.command == 'it-desk':

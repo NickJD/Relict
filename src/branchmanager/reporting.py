@@ -1,4 +1,4 @@
-"""Cumulative decision deltas and end-of-project Annual Reports."""
+"""Cumulative project overviews and decision deltas."""
 
 from __future__ import annotations
 
@@ -128,7 +128,10 @@ def write_annual_report(db, outdir: str | Path) -> dict:
     output.mkdir(parents=True, exist_ok=True)
     with db.connect() as conn:
         dataset_rows = conn.execute(
-            'SELECT dataset, COUNT(*) FROM sequences GROUP BY dataset ORDER BY dataset'
+            'SELECT s.dataset, COALESCE(r.role, "unregistered"), '
+            'COALESCE(r.genomes_available, 0), COUNT(*) FROM sequences s '
+            'LEFT JOIN dataset_roles r ON r.dataset=s.dataset '
+            'GROUP BY s.dataset, r.role, r.genomes_available ORDER BY s.dataset'
         ).fetchall()
         status_rows = conn.execute(
             'SELECT status, COUNT(*) FROM isolate_status GROUP BY status ORDER BY status'
@@ -153,6 +156,43 @@ def write_annual_report(db, outdir: str | Path) -> dict:
             'LEFT JOIN isolate_status i ON i.sequence_id=s.id '
             'LEFT JOIN sequence_provenance p ON p.sequence_id=s.id ORDER BY s.id'
         ).fetchall()
+        removal_rows = conn.execute(
+            'SELECT sequence_id, original_dataset, partner_id, sequence_length, '
+            'taxonomy, reason, removed_at FROM sequence_removals '
+            'ORDER BY removed_at, removal_id'
+        ).fetchall()
+
+    active = {
+        str(row[0]): {
+            'dataset': str(row[1] or ''), 'partner_id': str(row[2] or ''),
+            'status': str(row[3] or ''), 'marker_qc': str(row[4] or ''),
+        }
+        for row in isolate_rows
+    }
+    dataset_roles = db.get_dataset_roles()
+    latest_assessments = db.get_latest_assessment_rows()
+    candidate_rows = []
+    recommendation_counts = {}
+    for sequence_id, metadata in active.items():
+        if dataset_roles.get(metadata['dataset'], {}).get('role') != 'candidate':
+            continue
+        assessment = latest_assessments.get(sequence_id, {})
+        decision = build_selection_decision(assessment) if assessment else {
+            'decision': 'NOT YET ASSESSED', 'evidence_quality': 'NA',
+            'decision_reason': 'no stored Performance Review assessment',
+        }
+        recommendation = decision['decision']
+        recommendation_counts[recommendation] = recommendation_counts.get(recommendation, 0) + 1
+        candidate_rows.append((
+            sequence_id, metadata['dataset'], metadata['partner_id'], metadata['status'],
+            metadata['marker_qc'], recommendation, decision.get('evidence_quality', 'NA'),
+            assessment.get('sequencing_set_role', 'NA'), assessment.get('taxonomy', 'NA'),
+            assessment.get('nearest_hit', 'NA'), assessment.get('nearest_identity', 'NA'),
+            assessment.get('project_nearest_hit', 'NA'),
+            assessment.get('project_nearest_identity', 'NA'),
+            assessment.get('investigation_score', 'NA'),
+            decision.get('decision_reason', ''),
+        ))
 
     isolate_path = output / 'project_isolate_ledger.tsv'
     with open(isolate_path, 'w') as handle:
@@ -164,10 +204,29 @@ def write_annual_report(db, outdir: str | Path) -> dict:
         handle.write('GenomeID\tSequenceID\tAccession\tGenomeStatus\tGenomeQCPass\tCompleteness\tContamination\tGTDBTaxonomy\tANICluster\n')
         for row in genome_rows:
             handle.write('\t'.join('NA' if value is None else str(value) for value in row) + '\n')
+    candidate_path = output / 'project_candidate_overview.tsv'
+    with open(candidate_path, 'w') as handle:
+        handle.write(
+            'SequenceID\tDataset\tPartnerID\tOperationalStatus\tMarkerQC\tRecommendation\t'
+            'EvidenceQuality\tSequencingSetRole\tGTDBTaxonomy\tBaselineNearestHit\t'
+            'BaselineNearestIdentity\tProjectNearestHit\tProjectNearestIdentity\t'
+            'InvestigationScore\tRecommendationReason\n'
+        )
+        for row in candidate_rows:
+            handle.write('\t'.join(str(value) for value in row) + '\n')
+    removals_path = output / 'sequence_removal_ledger.tsv'
+    with open(removals_path, 'w') as handle:
+        handle.write('SequenceID\tOriginalDataset\tPartnerID\tSequenceLength\tTaxonomy\tReason\tRemovedAt\n')
+        for row in removal_rows:
+            handle.write('\t'.join('NA' if value is None else str(value) for value in row) + '\n')
     changes_path = write_decision_changes(db, output / 'decision_changes.tsv')
 
+    baseline_count = sum(row[3] for row in dataset_rows if row[1] == 'baseline')
+    candidate_count = sum(row[3] for row in dataset_rows if row[1] == 'candidate')
     cards = [
-        ('Marker sequences', len(isolate_rows)),
+        ('Cultured baseline markers', baseline_count),
+        ('Active partner candidates', candidate_count),
+        ('Withdrawn sequences', len(removal_rows)),
         ('QC-passed genomes', sum(bool(row[4]) for row in genome_rows)),
         ('Genome QC failures', sum(row[3] == 'GENOME_QC_FAILED' for row in genome_rows)),
         ('Selection rounds', len(round_rows)),
@@ -179,22 +238,27 @@ def write_annual_report(db, outdir: str | Path) -> dict:
 
     report = output / 'annual_report.html'
     report.write_text(
-        '<!doctype html><html><head><meta charset="utf-8"><title>BranchManager Annual Report</title>'
+        '<!doctype html><html><head><meta charset="utf-8"><title>BranchManager Project Overview</title>'
         '<style>body{font:15px system-ui;margin:32px;color:#17202a;max-width:1200px}'
         'h1,h2{color:#123b2d}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}'
         '.card{border:1px solid #cad5cf;padding:14px;border-radius:6px}.card b{font-size:26px;display:block}'
         'table{border-collapse:collapse;width:100%;margin:10px 0 28px}th,td{border-bottom:1px solid #d9e1dd;text-align:left;padding:7px}th{background:#eef4f1}</style>'
-        '</head><body><h1>Annual Report</h1><p>BranchManager final cumulative marker-to-genome project report.</p>'
+        '</head><body><h1>Cumulative Project Overview</h1><p>BranchManager point-in-time marker-to-genome project report.</p>'
         '<div class="cards">' + ''.join(f'<div class="card"><b>{value}</b>{html.escape(label)}</div>' for label, value in cards) + '</div>'
-        '<h2>Datasets</h2>' + table(('Dataset', 'Sequences'), dataset_rows) +
+        '<h2>Datasets</h2>' + table(('Dataset', 'Role', 'Genomes available', 'Sequences'), dataset_rows) +
         '<h2>Isolate lifecycle</h2>' + table(('Status', 'Count'), status_rows) +
+        '<h2>Current recommendations</h2>' + table(('Recommendation', 'Candidates'), sorted(recommendation_counts.items())) +
         '<h2>Workflow runs</h2>' + table(('Run', 'Workflow', 'Dataset', 'Status', 'Started', 'Completed', 'Manifest'), run_rows) +
         '<h2>Selection rounds</h2>' + table(('Round', 'Mode', 'Created'), round_rows) +
+        '<h2>Exit Interviews</h2>' + table(('Sequence', 'Dataset', 'Partner', 'Length', 'Taxonomy', 'Reason', 'Removed'), removal_rows) +
         '<p>Detailed ledgers: <a href="project_isolate_ledger.tsv">isolates</a>, '
+        '<a href="project_candidate_overview.tsv">current candidate assessments</a>, '
         '<a href="project_genome_ledger.tsv">genomes</a>, '
+        '<a href="sequence_removal_ledger.tsv">Exit Interviews</a>, '
         '<a href="decision_changes.tsv">latest decision changes</a>.</p></body></html>\n'
     )
     return {
         'html': str(report), 'isolates': str(isolate_path), 'genomes': str(genome_path),
+        'candidates': str(candidate_path), 'removals': str(removals_path),
         'decision_changes': changes_path,
     }

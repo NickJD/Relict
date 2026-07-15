@@ -12,6 +12,7 @@ from branchmanager.db.interface import Database
 from branchmanager.it_desk import run_it_desk_checks, write_it_desk_report
 from branchmanager.onboarding import validate_submission, write_onboarding_outputs
 from branchmanager.marker_provenance import load_marker_provenance, marker_qc_flag
+from branchmanager.personnel import load_exit_requests
 from branchmanager.pipeline.classify import _parse_vsearch_match
 from branchmanager.pipeline.tree import _orient_tree_input_fasta
 from branchmanager.pipeline.workflow_helpers import build_selection_decision
@@ -218,9 +219,79 @@ class OperationalWorkflowTests(unittest.TestCase):
             db.record_project_run('performance-review:1', 'performance_review', 'COMPLETE', dataset='Batch1')
             outputs = write_annual_report(db, root / 'annual_report')
             self.assertEqual(Path(outputs['html']).name, 'annual_report.html')
-            self.assertIn('Annual Report', Path(outputs['html']).read_text())
+            self.assertIn('Cumulative Project Overview', Path(outputs['html']).read_text())
             self.assertIn('ISO1', Path(outputs['isolates']).read_text())
+            self.assertTrue(Path(outputs['candidates']).is_file())
+            self.assertTrue(Path(outputs['removals']).is_file())
             self.assertTrue(Path(outputs['decision_changes']).is_file())
+
+    def test_exit_interview_removes_active_records_and_retains_audit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('ISO1', 'ACGT'), ('ISO2', 'ACGA')], dataset='Batch1')
+            db.upsert_dataset_role('Batch1', 'candidate')
+            db.insert_taxonomy([('ISO1', 'd__Bacteria;s__Example one', 0.99, 'Batch1')])
+            db.insert_distances([('ISO2', 'Batch1', 'ISO1', 99.0)])
+            db.upsert_classification_evidence([{
+                'sequence_id': 'ISO1', 'ref_db': 'GTDB', 'best_hit': 'REF1', 'identity': 99.0,
+            }])
+            db.upsert_sequencing_metadata([{
+                'id': 'ISO1', 'partner_id': 'QUB', 'dataset': 'Batch1',
+                'selected_for_sequencing': True, 'selected_for_wgs': False,
+            }])
+            db.save_assessment_snapshot('review:1', [{'id': 'ISO1', 'taxonomy': 'example'}], dataset='Batch1')
+            db.save_selection_round('round:1', [{'sequence_id': 'ISO1', 'role': 'PRIMARY'}])
+            db.update_isolate_status('ISO1', 'PROPOSED', detail='test')
+
+            requests = load_exit_requests(['ISO1'], default_reason='supplier withdrew isolate')
+            planned = db.plan_sequence_removals(requests)
+            self.assertEqual(planned[0]['status'], 'READY')
+            db.apply_sequence_removals(planned)
+
+            self.assertNotIn('ISO1', db.get_all_ids())
+            self.assertIn('ISO2', db.get_all_ids())
+            with db.connect() as conn:
+                for table, column in (
+                    ('taxonomy', 'id'), ('classification_evidence', 'sequence_id'),
+                    ('sequencing_metadata', 'id'), ('assessment_snapshots', 'sequence_id'),
+                    ('selection_round_members', 'sequence_id'), ('isolate_status', 'sequence_id'),
+                    ('seq_aliases', 'canonical_id'),
+                ):
+                    self.assertEqual(
+                        conn.execute(f'SELECT COUNT(*) FROM {table} WHERE {column} = ?', ('ISO1',)).fetchone()[0],
+                        0,
+                    )
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM distances').fetchone()[0], 0)
+                removal = conn.execute(
+                    'SELECT sequence_id, original_dataset, reason FROM sequence_removals'
+                ).fetchone()
+            self.assertEqual(removal, ('ISO1', 'Batch1', 'supplier withdrew isolate'))
+
+    def test_exit_interview_protects_baselines_and_genome_backed_isolates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('BASE1', 'ACGT')], dataset='Hungate')
+            db.insert_sequences([('ISO1', 'ACGA')], dataset='Batch1')
+            db.upsert_dataset_role('Hungate', 'baseline', genomes_available=True)
+            db.upsert_dataset_role('Batch1', 'candidate')
+            db.upsert_genome_records([{
+                'genome_id': 'G1', 'sequence_id': 'ISO1', 'genome_status': 'SEQUENCED',
+            }])
+            requests = load_exit_requests(
+                ['BASE1', 'ISO1'], default_reason='test protection',
+            )
+            planned = db.plan_sequence_removals(requests)
+            self.assertEqual(
+                [row['status'] for row in planned],
+                ['BLOCKED_BASELINE', 'BLOCKED_GENOME_RECORD'],
+            )
+            allowed = db.plan_sequence_removals(
+                requests, allow_baseline=True, allow_genome_records=True,
+            )
+            self.assertEqual([row['status'] for row in allowed], ['READY', 'READY'])
 
     def test_run_cmd_never_invokes_a_shell(self):
         completed = subprocess.CompletedProcess(['tool'], 0, stdout=b'', stderr=b'')
@@ -401,6 +472,7 @@ class OperationalWorkflowTests(unittest.TestCase):
             (['onboarding', '--fasta', 'markers.fasta', '--partner-metadata', 'meta.tsv', '-o', 'out'], 'onboarding'),
             (['status-meeting', '--db', 'p.db', '--input', 'status.tsv', '-o', 'out'], 'status-meeting'),
             (['records-update', '--db', 'p.db', '--input', 'genomes.tsv', '-o', 'out'], 'records-update'),
+            (['exit-interview', '--db', 'p.db', '--sequence-id', 'ISO1', '--reason', 'withdrawn', '-o', 'out'], 'exit-interview'),
             (['annual-report', '--db', 'p.db', '-o', 'out'], 'annual-report'),
             (['it-desk'], 'it-desk'),
             (['assistant', '--sample-map', 'map.tsv', '--partner-metadata', 'meta.tsv', '--db', 'p.db', '--dataset', 'QUB', '--ref', 'gtdb.fa', '-o', 'out'], 'assistant'),
