@@ -81,7 +81,7 @@ process_ab1_partner() {
     --read-dir "$reads" -o "$out/01_onboarding"
 
   python "$BM" paper-trail \
-    --read-metadata "$out/01_onboarding/normalised_read_map.tsv" \
+    --sample-map "$out/01_onboarding/normalised_read_map.tsv" \
     --screen-ref "$GTDB" --min-quality 20 --min-mean-quality 25 \
     --min-read-length 300 --min-length 800 --min-overlap 40 \
     --threads 10 -o "$out/02_paper_trail_merge_meeting"

@@ -1172,7 +1172,7 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('biopython_pairwise_overlap', report)
             self.assertIn('ambiguous_overlap_conflicts_1', report)
 
-    def test_paper_trail_uses_read_metadata_when_filenames_do_not_encode_primer(self):
+    def test_paper_trail_uses_batch_map_when_filenames_do_not_encode_primer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             fwd = tmp / 'well_A01.ab1'
@@ -1189,7 +1189,7 @@ class OutputHelperTests(unittest.TestCase):
             out = paper_trail_pipeline.run_paper_trail(
                 [str(tmp)],
                 tmp / 'out',
-                read_metadata=str(meta),
+                sample_map=str(meta),
                 min_length=8,
                 min_overlap=8,
                 min_overlap_identity=0.90,
@@ -1393,7 +1393,7 @@ class OutputHelperTests(unittest.TestCase):
             out = paper_trail_pipeline.run_paper_trail(
                 [str(reads)],
                 tmp / 'out',
-                read_metadata=str(mapping),
+                sample_map=str(mapping),
                 min_length=8,
                 min_overlap=8,
                 min_overlap_identity=0.90,

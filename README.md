@@ -213,15 +213,16 @@ branchmanager performance-review \
   -o batch1_out
 ```
 
-If filenames are structured like `Iso001_27F.ab1` and `Iso001_907R.ab1`, BranchManager infers `Iso001` as the sequence ID, keeps `27F` forward, and reverse-complements `907R` before assembly. If filenames are not informative, provide `--read-metadata` as CSV/TSV:
+If filenames are structured like `Iso001_27F.ab1` and `Iso001_907R.ab1`, BranchManager can infer the read information. Production partner submissions should nevertheless use one explicit `--sample-map` per batch, preferably with one row per physical read:
 
 ```tsv
-file	sequence_id	primer	direction
-well_A01.ab1	Iso001	27F	forward
-well_A02.ab1	Iso001	907R	reverse
+sequence_id	dataset	read_file	primer	direction	processing_mode
+Iso001	UoG_01	well_A01.ab1	27F	forward	assemble
+Iso001	UoG_01	well_A02.ab1	907R	reverse	assemble
+Iso002	UoG_01	well_B01.ab1	27F	forward	best_read
 ```
 
-For partner submissions, a simpler one-row-per-isolate sample map can be used instead. Relative paths are resolved from the mapping file location, so this can be kept next to the chromatograms. Add `processing_mode` (or `mode`, `assembly_mode`, `tags`, or `flags`) when a specific isolate should use a different handling strategy:
+Multiple rows may share the same `sequence_id` when an isolate has multiple primer reads. Relative paths are resolved from the batch-map location. A wide one-row-per-isolate representation is also accepted when laboratories naturally supply separate primer columns:
 
 ```tsv
 isolate_id	27F	907R	processing_mode
@@ -229,19 +230,13 @@ Iso001	well_A01.ab1	well_A02.ab1	assemble
 Iso002	well_B01.ab1	well_B02.ab1	best_read
 ```
 
-or:
-
-```tsv
-isolate_id	ab1_files	tags
-Iso001	well_A01.ab1;well_A02.ab1	assemble
-Iso002	well_B01.ab1;well_B02.ab1	highest_quality
-```
-
 Run it with:
 
 ```bash
 branchmanager paper-trail --sample-map sample_reads.tsv -o paper_trail_out
 ```
+
+Onboarding writes `normalised_read_map.tsv` as the validated hand-off to Paper Trail. It is a generated run artefact, not another source ledger and not a file users should maintain.
 
 `assemble`/`merge`/`consensus` orients the primer reads and tries to build one longer sequence. `best_read`/`highest_quality`/`select_best`/`independent` converts each read independently and writes only the highest-quality passing read for that isolate.
 

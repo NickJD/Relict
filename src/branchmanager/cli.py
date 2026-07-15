@@ -3601,7 +3601,7 @@ def build_parser():
             'PBAS/PCON tags, quality-trimmed, oriented by primer direction, and optionally '
             'assembled into one consensus 16S sequence per isolate. For example, 27F reads '
             'are kept forward and 907R reads are reverse-complemented before overlap assembly.\n\n'
-            'If --sample-map/--read-metadata are omitted, sequence IDs and primer names are '
+            'If --sample-map is omitted, sequence IDs and primer names are '
             'inferred from filenames such as Iso001_27F.ab1 and Iso001_907R.ab1.'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3615,17 +3615,9 @@ def build_parser():
     paper_trail_parser.add_argument(
         '--sample-map', required=False, default=None,
         help=(
-            'Optional CSV/TSV one row per isolate/sample. Use sequence_id/isolate_id/sample_id plus '
-            'an ab1_files/read_files column containing ; separated files, or separate primer columns '
-            'such as 27F and 907R. Add processing_mode/tags=assemble or best_read to override '
-            'per-isolate handling. Relative paths are resolved next to the mapping file.'
-        ),
-    )
-    paper_trail_parser.add_argument(
-        '--read-metadata', required=False, default=None,
-        help=(
-            'Optional CSV/TSV mapping read files to sequence_id, primer, and direction. '
-            'Columns: file/read_file, sequence_id, primer, direction. Also accepts the same sample-level format as --sample-map.'
+            'One CSV/TSV per partner batch. Prefer one row per read with sequence_id, read_file, '
+            'primer, direction, and processing_mode. Multiple rows may share a sequence_id when '
+            'different primer reads belong to one isolate. Relative paths are resolved next to the map.'
         ),
     )
     paper_trail_parser.add_argument(
@@ -3701,8 +3693,8 @@ def build_parser():
         help='CSV/TSV mapping isolate IDs to raw read files for an AB1/primer-read submission.')
     onboarding_inputs.add_argument('--fasta',
         help='Partner-supplied marker FASTA to validate without running Paper Trail/Merge Meeting.')
-    onboarding_parser.add_argument('--partner-metadata', default=None,
-        help='Cumulative project metadata CSV/TSV. Required with --fasta; defaults to --sample-map for AB1 submissions.')
+    onboarding_parser.add_argument('--partner-metadata', required=True,
+        help='Cumulative project metadata CSV/TSV. Required for every submission and updated as selection/genome statuses change.')
     onboarding_parser.add_argument('--partner-id', default=None,
         help='Expected partner acronym for this submission, used to validate cumulative-ledger ownership.')
     onboarding_parser.add_argument('--dataset', default=None,
@@ -4000,9 +3992,8 @@ def cmd_paper_trail(args):
     primers = getattr(args, 'primers', None) or _paper_trail_module.DEFAULT_PRIMERS
     inputs = getattr(args, 'input', None) or []
     sample_map = getattr(args, 'sample_map', None)
-    read_metadata = getattr(args, 'read_metadata', None)
-    if not inputs and not sample_map and not read_metadata:
-        raise SystemExit('[paper-trail] Provide --input and/or --sample-map/--read-metadata.')
+    if not inputs and not sample_map:
+        raise SystemExit('[paper-trail] Provide --input and/or --sample-map.')
     primer_sequences = dict(_paper_trail_module.DEFAULT_PRIMER_SEQUENCES)
     for specification in getattr(args, 'primer_sequences', None) or []:
         if '=' not in str(specification):
@@ -4013,7 +4004,7 @@ def cmd_paper_trail(args):
             raise SystemExit('[PAPER TRAIL] --primer-sequence requires a name and at least 12 bases.')
         primer_sequences[name.strip().upper()] = sequence
     manifest = RunManifest(outdir, 'paper_trail')
-    for source in [sample_map, read_metadata, getattr(args, 'screen_ref', None), getattr(args, 'screen_taxa', None)]:
+    for source in [sample_map, getattr(args, 'screen_ref', None), getattr(args, 'screen_taxa', None)]:
         if source:
             manifest.add_input(source)
     for source in inputs:
@@ -4026,7 +4017,6 @@ def cmd_paper_trail(args):
         outputs = _paper_trail_module.run_paper_trail(
             inputs,
             outdir,
-            read_metadata=read_metadata,
             sample_map=sample_map,
             primers=primers,
             primer_sequences=primer_sequences,
@@ -4266,8 +4256,8 @@ def cmd_assistant(args):
         paper_trail_dir = root / '02_paper_trail_merge_meeting'
         if args.sample_map:
             trace_args = argparse.Namespace(
-                command='paper-trail', input=[], out=str(paper_trail_dir), sample_map=None,
-                read_metadata=str(onboarding_dir / 'normalised_read_map.tsv'), primers=args.primers,
+                command='paper-trail', input=[], out=str(paper_trail_dir),
+                sample_map=str(onboarding_dir / 'normalised_read_map.tsv'), primers=args.primers,
                 primer_sequences=args.primer_sequences, trim_primers=args.trim_primers,
                 min_quality=args.min_quality, window=args.window, min_length=args.min_length,
                 min_mean_quality=args.min_mean_quality,

@@ -631,7 +631,7 @@ def _metadata_key_variants(value: str | Path) -> list[str]:
     return variants
 
 
-def _load_read_metadata(
+def _load_sample_map(
     path: Optional[str | Path],
     primers: Iterable[str] = DEFAULT_PRIMERS,
 ) -> tuple[dict[str, dict[str, str]], list[Path]]:
@@ -2133,7 +2133,6 @@ def run_paper_trail(
     inputs: Iterable[str | Path],
     outdir: str | Path,
     *,
-    read_metadata: Optional[str | Path] = None,
     sample_map: Optional[str | Path] = None,
     primers: Iterable[str] = DEFAULT_PRIMERS,
     primer_sequences: Optional[dict[str, str]] = None,
@@ -2176,10 +2175,7 @@ def run_paper_trail(
     effective_primer_sequences = dict(DEFAULT_PRIMER_SEQUENCES)
     for name, sequence in (primer_sequences or {}).items():
         effective_primer_sequences[str(name).upper()] = str(sequence).upper()
-    metadata, listed_files = _load_read_metadata(read_metadata, primers)
-    sample_metadata, sample_files = _load_read_metadata(sample_map, primers)
-    metadata.update(sample_metadata)
-    listed_files.extend(sample_files)
+    metadata, listed_files = _load_sample_map(sample_map, primers)
     files = _collect_input_files(inputs or [], recursive=recursive)
     seen_files = {str(path) for path in files}
     for path in listed_files:

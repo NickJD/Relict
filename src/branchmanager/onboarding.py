@@ -131,9 +131,9 @@ def validate_submission(
     expected_partner = str(expected_partner_id or '').strip()
     submission_dataset = str(dataset or '').strip()
 
-    metadata_path = partner_metadata or sample_map
+    metadata_path = partner_metadata
     if metadata_path is None:
-        raise ValueError('partner_metadata is required for FASTA submissions')
+        raise ValueError('partner_metadata is required for every submission')
     metadata_rows = _read_table(metadata_path)
     for line_number, row in enumerate(metadata_rows, start=2):
         sequence_id = _row_value(row, *SEQUENCE_ID_COLUMNS)

@@ -28,10 +28,19 @@ class OperationalWorkflowTests(unittest.TestCase):
             (root / 'well_A.ab1').write_bytes(b'ABIF-placeholder')
             mapping = root / 'mapping.tsv'
             mapping.write_text(
-                'sequence_id\tpartner_id\talready_sequenced\t27F\n'
-                'ISO1\tQUB\tno\twell_A.ab1\n'
+                'sequence_id\t27F\n'
+                'ISO1\twell_A.ab1\n'
             )
-            result = validate_submission(mapping, primers=['27F'])
+            metadata = root / 'project_metadata.tsv'
+            metadata.write_text(
+                'sequence_id\tpartner_id\talready_sequenced\n'
+                'ISO1\tQUB\tno\n'
+            )
+            result = validate_submission(
+                mapping,
+                partner_metadata=metadata,
+                primers=['27F'],
+            )
             self.assertEqual(result['status'], 'PASS')
             outputs = write_onboarding_outputs(root / 'out', result)
             self.assertEqual(Path(outputs['report']).name, 'onboarding_report.tsv')
@@ -387,7 +396,7 @@ class OperationalWorkflowTests(unittest.TestCase):
             (['performance-review', '--input', 'q.fa', '--db', 'p.db', '--dataset', 'QUB', '-o', 'out'], 'performance-review'),
             (['quarterly-review', '--db', 'p.db', '--genome-budget', '3', '-o', 'out'], 'quarterly-review'),
             (['paper-trail', '--input', 'reads', '-o', 'out'], 'paper-trail'),
-            (['onboarding', '--sample-map', 'map.tsv', '-o', 'out'], 'onboarding'),
+            (['onboarding', '--sample-map', 'map.tsv', '--partner-metadata', 'meta.tsv', '-o', 'out'], 'onboarding'),
             (['onboarding', '--fasta', 'markers.fasta', '--partner-metadata', 'meta.tsv', '-o', 'out'], 'onboarding'),
             (['status-meeting', '--db', 'p.db', '--input', 'status.tsv', '-o', 'out'], 'status-meeting'),
             (['records-update', '--db', 'p.db', '--input', 'genomes.tsv', '-o', 'out'], 'records-update'),
@@ -412,6 +421,18 @@ class OperationalWorkflowTests(unittest.TestCase):
         for command in retired:
             with self.subTest(command=command), self.assertRaises(SystemExit):
                 parser.parse_args([command])
+
+    def test_duplicate_read_metadata_input_is_not_exposed(self):
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                'paper-trail', '--read-metadata', 'reads.tsv', '-o', 'out',
+            ])
+
+    def test_onboarding_requires_cumulative_partner_metadata(self):
+        parser = build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(['onboarding', '--sample-map', 'batch.tsv', '-o', 'out'])
 
     def test_colour_options_use_british_spelling(self):
         parser = build_parser()
