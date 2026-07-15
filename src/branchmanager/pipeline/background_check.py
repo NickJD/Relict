@@ -10,15 +10,15 @@ Output files written to *outdir*
   {dataset}_classification.tsv   Full vsearch matches (ID, BestHit, Identity,
                                   Taxon, Confidence).  Human readable.
   {dataset}_taxonomy.tsv         Condensed (ID, Taxon, Confidence).  Passable
-                                  directly to ``branchmanager preload --taxa-assignments``.
+                                  directly to ``branchmanager filing-cabinet --taxa-assignments``.
   {dataset}_taxonomic_disagreement.tsv
                                   High-quality candidate hits that resolve to
                                   multiple different taxonomies.
   combined_taxonomy.tsv          All datasets merged with Dataset column.
   pipeline_taxonomy.tsv          All datasets merged without Dataset column;
-                                  passable directly to ``branchmanager preload`` or
-                                  ``branchmanager run`` via ``--taxa-assignments``.
-  preclassify_summary.txt        Plain-text human-readable classification
+                                  passable directly to ``branchmanager filing-cabinet`` or
+                                  ``branchmanager performance-review`` via ``--taxa-assignments``.
+  background_check_summary.txt  Plain-text human-readable classification
                                   summary (counts, dataset labels, top hits).
 """
 
@@ -36,9 +36,6 @@ from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Known 16S dataset registry
-# ---------------------------------------------------------------------------
 KNOWN_DATASETS: Dict[str, dict] = {
     "hungate16s": {
         "label": "Hungate16S",
@@ -46,63 +43,54 @@ KNOWN_DATASETS: Dict[str, dict] = {
                        "gene sequences from rumen bacteria and archaea",
         "url": "https://www.nature.com/articles/nbt.4387",
         "typical_min_len": 1200,
-        "color": "#e6ab02",
     },
     "hungate": {
         "label": "Hungate16S",
         "description": "Alias for hungate16s",
         "url": "https://www.nature.com/articles/nbt.4387",
         "typical_min_len": 1200,
-        "color": "#e6ab02",
     },
     "silva": {
         "label": "SILVA",
         "description": "SILVA ribosomal RNA gene database project",
         "url": "https://www.arb-silva.de",
         "typical_min_len": 1000,
-        "color": "#1b9e77",
     },
     "rdp": {
         "label": "RDP",
         "description": "Ribosomal Database Project",
         "url": "https://rdp.cme.msu.edu",
         "typical_min_len": 1000,
-        "color": "#7570b3",
     },
     "homd": {
         "label": "HOMD",
         "description": "Human Oral Microbiome Database",
         "url": "https://www.homd.org",
         "typical_min_len": 900,
-        "color": "#d95f02",
     },
     "greengenes2": {
         "label": "GreenGenes2",
         "description": "GreenGenes2 16S rRNA reference database",
         "url": "https://greengenes2.ucsd.edu",
         "typical_min_len": 1000,
-        "color": "#66a61e",
     },
     "gg2": {
         "label": "GreenGenes2",
         "description": "Alias for greengenes2",
         "url": "https://greengenes2.ucsd.edu",
         "typical_min_len": 1000,
-        "color": "#66a61e",
     },
     "ncbi16s": {
         "label": "NCBI16S",
         "description": "NCBI 16S rRNA RefSeq collection",
         "url": "https://www.ncbi.nlm.nih.gov/refseq/targetedloci/",
         "typical_min_len": 900,
-        "color": "#a6761d",
     },
     "gtdb": {
         "label": "GTDB",
         "description": "Genome Taxonomy Database 16S rRNA representative sequences",
         "url": "https://gtdb.ecogenomic.org",
         "typical_min_len": 1000,
-        "color": "#386cb0",
     },
 }
 
@@ -125,24 +113,11 @@ def resolve_dataset_meta(name: str) -> dict:
             "description": f"User-supplied dataset '{name}'",
             "url": "",
             "typical_min_len": 900,
-            "color": _name_to_color(name),
         }
     return meta
 
 
-def _name_to_color(name: str) -> str:
-    """Deterministic hex color derived from *name*."""
-    import hashlib
-    h = hashlib.md5(name.encode()).hexdigest()
-    r = int(h[0:2], 16) | 0x40
-    g = int(h[2:4], 16) | 0x40
-    b = int(h[4:6], 16) | 0x40
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-# ---------------------------------------------------------------------------
 # ID normalisation helpers  (mirrors logic in pipeline/classify.py)
-# ---------------------------------------------------------------------------
 
 def _norm_id(x: str) -> str:
     x = x.split()[0]
@@ -171,9 +146,7 @@ def _canon_id(x: Optional[str]) -> Optional[str]:
     return y
 
 
-# ---------------------------------------------------------------------------
 # Core classification logic
-# ---------------------------------------------------------------------------
 
 def _load_taxa_map(taxa_tsv: Optional[str]) -> dict:
     """Load a FeatureID→(Taxon, Confidence) mapping from *taxa_tsv*.
@@ -195,9 +168,9 @@ def _load_taxa_map(taxa_tsv: Optional[str]) -> dict:
                 if k:
                     taxa_map[k] = (tax, conf)
             rows_loaded += 1
-        logger.info("[PRECLASSIFY] Loaded %d taxonomy assignment rows from %s", rows_loaded, taxa_tsv)
+        logger.info("[BACKGROUND CHECK] Loaded %d taxonomy assignment rows from %s", rows_loaded, taxa_tsv)
     except Exception as exc:
-        logger.warning("[PRECLASSIFY] Failed to load taxa_tsv %s: %s", taxa_tsv, exc)
+        logger.warning("[BACKGROUND CHECK] Failed to load taxa_tsv %s: %s", taxa_tsv, exc)
     return taxa_map
 
 
@@ -222,9 +195,7 @@ def _is_fasta_file(path: str) -> bool:
     return p.endswith(('.fasta', '.fa', '.fna', '.ffn', '.faa', '.frn'))
 
 
-# ---------------------------------------------------------------------------
 # Retry cascade configuration
-# ---------------------------------------------------------------------------
 # Sequences unclassified at round 1 are re-searched with progressively relaxed
 # parameters.  The main cause of NCBI BLAST succeeding where vsearch fails is
 # the --query_cov filter (NCBI has none by default) and vsearch's --maxrejects
@@ -278,12 +249,12 @@ def _run_vsearch_pass(
         cmd_list += ["--threads", str(int(threads))]
 
     logger.info(
-        "[PRECLASSIFY] vsearch %s for '%s' (qcov=%s, maxrejects=%d, id≥%.2f)",
+        "[BACKGROUND CHECK] vsearch %s for '%s' (qcov=%s, maxrejects=%d, id≥%.2f)",
         round_label, dataset_name,
         f"{query_cov:.0%}" if query_cov > 0 else "none",
         max_rejects, min_identity,
     )
-    logger.debug("[PRECLASSIFY] cmd: %s", " ".join(shlex.quote(a) for a in cmd_list))
+    logger.debug("[BACKGROUND CHECK] cmd: %s", " ".join(shlex.quote(a) for a in cmd_list))
 
     result = subprocess.run(cmd_list, shell=False)
     if result.returncode != 0:
@@ -510,7 +481,6 @@ def _write_fasta_subset(source_fasta: str, target_ids: set, out_path: str) -> in
     written = 0
     open_fn = gzip.open if str(source_fasta).endswith(".gz") else open
     inside = False
-    buf: List[str] = []
     try:
         with open_fn(source_fasta, "rt") as fh:  # type: ignore[call-overload]
             with open(out_path, "w") as out:
@@ -525,7 +495,7 @@ def _write_fasta_subset(source_fasta: str, target_ids: set, out_path: str) -> in
                     elif inside:
                         out.write(raw + "\n")
     except Exception as exc:
-        logger.warning("[PRECLASSIFY] _write_fasta_subset failed: %s", exc)
+        logger.warning("[BACKGROUND CHECK] _write_fasta_subset failed: %s", exc)
     return written
 
 
@@ -569,7 +539,6 @@ def classify_fasta(
 
     Path(outdir).mkdir(parents=True, exist_ok=True)
 
-    # ── Normalise query FASTA ────────────────────────────────────────────────
     norm_query = os.path.join(outdir, f"{dataset_name}_input_norm.fasta")
     input_ids: Dict[str, int] = {}  # id → sequence length
     try:
@@ -586,12 +555,12 @@ def classify_fasta(
             rid = hdr.split()[0].lstrip(">")
             input_ids[rid] = len(seq)
         logger.info(
-            "[PRECLASSIFY] Normalised %d sequences from '%s' → %s",
+            "[BACKGROUND CHECK] Normalised %d sequences from '%s' → %s",
             len(records), dataset_name, norm_query,
         )
     except Exception as exc:
         logger.warning(
-            "[PRECLASSIFY] Could not normalise query FASTA (%s); using original: %s",
+            "[BACKGROUND CHECK] Could not normalise query FASTA (%s); using original: %s",
             exc, fasta_path,
         )
         norm_query = fasta_path
@@ -617,17 +586,15 @@ def classify_fasta(
 
     n_input = len(input_ids)
 
-    # ── Decompress reference if gzipped ─────────────────────────────────────
     ref_to_use = ref_fasta
     if str(ref_fasta).endswith(".gz"):
         ref_unc = os.path.join(outdir, f"{dataset_name}_ref_uncompressed.fasta")
         if not os.path.exists(ref_unc):
-            logger.info("[PRECLASSIFY] Decompressing reference %s → %s", ref_fasta, ref_unc)
+            logger.info("[BACKGROUND CHECK] Decompressing reference %s → %s", ref_fasta, ref_unc)
             recs = list(read_fasta(ref_fasta))
             write_fasta(recs, ref_unc)
         ref_to_use = ref_unc
 
-    # ── Round 1: initial vsearch pass ───────────────────────────────────────
     matches_r1 = os.path.join(outdir, f"{dataset_name}_matches.tsv")
     best_hit: Dict[str, Tuple[str, float]] = _run_vsearch_pass(
         query_fasta=norm_query,
@@ -646,11 +613,10 @@ def classify_fasta(
     classify_round: Dict[str, str] = {qid: "round1" for qid in best_hit}
 
     logger.info(
-        "[PRECLASSIFY] Round 1: %d/%d sequences classified",
+        "[BACKGROUND CHECK] Round 1: %d/%d sequences classified",
         len(best_hit), n_input,
     )
 
-    # ── Retry cascade: re-run on unclassified sequences with relaxed params ─
     # Each retry uses a lower --query_cov and higher --maxrejects.
     # This mirrors NCBI BLAST's behaviour (no query-coverage filter by default)
     # and gives N-rich / partial sequences more chances to find a valid hit.
@@ -681,8 +647,9 @@ def classify_fasta(
                 round_label=round_label,
             )
         except Exception as exc:
-            logger.warning("[PRECLASSIFY] %s failed: %s — skipping", round_label, exc)
-            continue
+            raise RuntimeError(
+                f'preclassification retry {round_label} failed for {dataset_name}: {exc}'
+            ) from exc
 
         _extend_candidate_hits(
             candidate_hits_by_query,
@@ -697,21 +664,20 @@ def classify_fasta(
                 newly_found += 1
 
         logger.info(
-            "[PRECLASSIFY] %s: %d/%d newly classified (qcov=%s, maxrejects=%d)",
+            "[BACKGROUND CHECK] %s: %d/%d newly classified (qcov=%s, maxrejects=%d)",
             round_label, newly_found, n_sub,
             f"{retry_qcov:.0%}" if retry_qcov > 0 else "none",
             retry_rejects,
         )
 
     logger.info(
-        "[PRECLASSIFY] All rounds complete: %d/%d classified, %d remain unclassified",
+        "[BACKGROUND CHECK] All rounds complete: %d/%d classified, %d remain unclassified",
         len(best_hit), n_input, n_input - len(best_hit),
     )
 
-    # ── Parse vsearch matches — select best hit per query ───────────────────
     if taxa_tsv and _is_fasta_file(taxa_tsv):
         logger.info(
-            "[PRECLASSIFY] --taxa points to a FASTA file (%s); "
+            "[BACKGROUND CHECK] --taxa points to a FASTA file (%s); "
             "taxonomy will be parsed from reference FASTA headers instead.",
             taxa_tsv,
         )
@@ -727,11 +693,11 @@ def classify_fasta(
             taxa_map, _warn = _load_taxa_map_from_reference_fasta(ref_to_use)
             if taxa_map:
                 logger.info(
-                    "[PRECLASSIFY] Parsed taxonomy from reference FASTA headers (%d entries)",
+                    "[BACKGROUND CHECK] Parsed taxonomy from reference FASTA headers (%d entries)",
                     len(taxa_map) // 3,
                 )
         except Exception as exc:
-            logger.warning("[PRECLASSIFY] Could not parse taxa from FASTA headers: %s", exc)
+            logger.warning("[BACKGROUND CHECK] Could not parse taxa from FASTA headers: %s", exc)
 
     # best_hit is already fully populated by the retry cascade above.
     # Resolve taxonomy for each best hit.
@@ -756,7 +722,6 @@ def classify_fasta(
 
     written = len(full_rows)
 
-    # ── Write full classification TSV ────────────────────────────────────────
     with open(classification_tsv, "w", newline="") as cf:
         cf.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\tClassifiedRound\n")
         for qid, sid, pct, tax, conf in full_rows:
@@ -767,11 +732,10 @@ def classify_fasta(
                 f"{classify_round.get(qid, 'round1')}\n"
             )
     logger.info(
-        "[PRECLASSIFY] Wrote %d classification rows for dataset '%s' → %s",
+        "[BACKGROUND CHECK] Wrote %d classification rows for dataset '%s' → %s",
         written, dataset_name, classification_tsv,
     )
 
-    # ── Write condensed taxonomy TSV ─────────────────────────────────────────
     with open(taxonomy_tsv, "w", newline="") as tf:
         tf.write("ID\tTaxon\tConfidence\n")
         for qid, tax, conf in tax_rows:
@@ -779,9 +743,8 @@ def classify_fasta(
                 f"{qid}\t{tax if tax is not None else 'NA'}\t"
                 f"{conf if conf is not None else 'NA'}\n"
             )
-    logger.info("[PRECLASSIFY] Wrote condensed taxonomy → %s", taxonomy_tsv)
+    logger.info("[BACKGROUND CHECK] Wrote condensed taxonomy → %s", taxonomy_tsv)
 
-    # ── Write unclassified sequences TSV ────────────────────────────────────
     # Sequences with NO hit across ALL retry rounds.
     n_retry_rounds = len(_RETRY_ROUNDS)
     unclassified_ids = [
@@ -810,11 +773,10 @@ def classify_fasta(
             )
     n_unclassified = len(unclassified_ids)
     logger.info(
-        "[PRECLASSIFY] %d/%d sequences unclassified after all rounds → %s",
+        "[BACKGROUND CHECK] %d/%d sequences unclassified after all rounds → %s",
         n_unclassified, n_input, unclassified_tsv,
     )
 
-    # ── Write low-confidence sequences TSV ──────────────────────────────────
     low_conf_rows = [
         (qid, sid, pct, tax, conf)
         for qid, sid, pct, tax, conf in full_rows
@@ -839,11 +801,10 @@ def classify_fasta(
             )
     n_low_conf = len(low_conf_rows)
     logger.info(
-        "[PRECLASSIFY] %d sequences have low-confidence hits (<%d%%) → %s",
+        "[BACKGROUND CHECK] %d sequences have low-confidence hits (<%d%%) → %s",
         n_low_conf, int(low_confidence_threshold * 100), low_conf_tsv,
     )
 
-    # ── Write high-quality taxonomic disagreement TSV ───────────────────────
     taxonomic_disagreement_rows = _build_taxonomic_disagreement_rows(
         candidate_hits_by_query=candidate_hits_by_query,
         best_hit=best_hit,
@@ -859,7 +820,7 @@ def classify_fasta(
     )
     n_taxonomic_disagreements = len(taxonomic_disagreement_rows)
     logger.info(
-        "[PRECLASSIFY] %d sequences have high-quality taxonomic disagreement → %s",
+        "[BACKGROUND CHECK] %d sequences have high-quality taxonomic disagreement → %s",
         n_taxonomic_disagreements, tax_disagree_tsv,
     )
 
@@ -881,14 +842,12 @@ def classify_fasta(
     }
 
 
-# ---------------------------------------------------------------------------
 # Multi-dataset orchestration
-# ---------------------------------------------------------------------------
 
 DatasetSpec = Tuple[str, str]  # (dataset_name, fasta_path)
 
 
-def run_preclassify(
+def run_background_check(
     datasets: List[DatasetSpec],
     ref_fasta: str,
     outdir: str,
@@ -942,7 +901,7 @@ def run_preclassify(
         meta = resolve_dataset_meta(ds_name)
         dataset_metas[ds_name] = meta
         logger.info(
-            "[PRECLASSIFY] Processing dataset '%s' (%s) from %s",
+            "[BACKGROUND CHECK] Processing dataset '%s' (%s) from %s",
             ds_name, meta["label"], fasta_path,
         )
         try:
@@ -960,7 +919,7 @@ def run_preclassify(
             )
             results[ds_name] = res
         except Exception as exc:
-            logger.error("[PRECLASSIFY] Failed to classify dataset '%s': %s", ds_name, exc)
+            logger.error("[BACKGROUND CHECK] Failed to classify dataset '%s': %s", ds_name, exc)
 
     # Build combined taxonomy TSV (with Dataset column — human-readable)
     combined_path = os.path.join(outdir, "combined_taxonomy.tsv")
@@ -982,25 +941,25 @@ def run_preclassify(
                         seen_ids.add(qid)
                         combined_rows.append((qid, ds_name, tax, conf))
         except Exception as exc:
-            logger.warning("[PRECLASSIFY] Could not read taxonomy for dataset '%s': %s", ds_name, exc)
+            logger.warning("[BACKGROUND CHECK] Could not read taxonomy for dataset '%s': %s", ds_name, exc)
 
     with open(combined_path, "w", newline="") as fh:
         fh.write("ID\tDataset\tTaxon\tConfidence\n")
         for qid, ds_name, tax, conf in combined_rows:
             fh.write(f"{qid}\t{ds_name}\t{tax}\t{conf}\n")
-    logger.info("[PRECLASSIFY] Wrote combined taxonomy (%d rows) → %s", len(combined_rows), combined_path)
+    logger.info("[BACKGROUND CHECK] Wrote combined taxonomy (%d rows) → %s", len(combined_rows), combined_path)
 
     # Pipeline-compatible taxonomy (without Dataset column)
-    # Pass directly as --taxa-assignments to ``branchmanager preload`` or ``branchmanager run``.
+    # Pass directly as --taxa-assignments to Filing Cabinet or Performance Review.
     pipeline_combined_path = os.path.join(outdir, "pipeline_taxonomy.tsv")
     with open(pipeline_combined_path, "w", newline="") as fh:
         fh.write("ID\tTaxon\tConfidence\n")
         for qid, _, tax, conf in combined_rows:
             fh.write(f"{qid}\t{tax}\t{conf}\n")
-    logger.info("[PRECLASSIFY] Wrote pipeline-ready taxonomy → %s", pipeline_combined_path)
+    logger.info("[BACKGROUND CHECK] Wrote pipeline-ready taxonomy → %s", pipeline_combined_path)
 
     # Dataset summary CSV
-    summary_csv_path = os.path.join(outdir, "classification_summary.csv")
+    summary_csv_path = os.path.join(outdir, "background_check_datasets.csv")
     _write_dataset_summary_csv(
         csv_path=summary_csv_path,
         datasets=datasets,
@@ -1008,10 +967,10 @@ def run_preclassify(
         dataset_metas=dataset_metas,
         low_confidence_threshold=low_confidence_threshold,
     )
-    logger.info("[PRECLASSIFY] Wrote dataset summary CSV → %s", summary_csv_path)
+    logger.info("[BACKGROUND CHECK] Wrote dataset summary CSV → %s", summary_csv_path)
 
     # Human-readable summary
-    summary_path = os.path.join(outdir, "preclassify_summary.txt")
+    summary_path = os.path.join(outdir, "background_check_summary.txt")
     _write_summary(
         summary_path=summary_path,
         datasets=datasets,
@@ -1025,14 +984,12 @@ def run_preclassify(
         summary_csv_path=summary_csv_path,
         low_confidence_threshold=low_confidence_threshold,
     )
-    logger.info("[PRECLASSIFY] Wrote human-readable summary → %s", summary_path)
+    logger.info("[BACKGROUND CHECK] Wrote human-readable summary → %s", summary_path)
 
     return pipeline_combined_path
 
 
-# ---------------------------------------------------------------------------
 # Dataset summary CSV writer
-# ---------------------------------------------------------------------------
 
 # Confidence tier boundaries (identity %)
 # High   : ≥ high_threshold   (default 97 %) – reliable species-level assignment
@@ -1049,7 +1006,7 @@ def _write_dataset_summary_csv(
     dataset_metas: Dict[str, dict],
     low_confidence_threshold: float = 0.97,
 ) -> None:
-    """Write ``classification_summary.csv`` — one row per dataset.
+    """Write ``background_check_datasets.csv`` — one row per dataset.
 
     Columns
     -------
@@ -1120,7 +1077,7 @@ def _write_dataset_summary_csv(
                     else:
                         n_low += 1
         except Exception as exc:
-            logger.warning("[PRECLASSIFY] summary CSV: could not read %s: %s", class_tsv, exc)
+            logger.warning("[BACKGROUND CHECK] summary CSV: could not read %s: %s", class_tsv, exc)
 
         n_classified = n_high + n_med + n_low
 
@@ -1140,9 +1097,7 @@ def _write_dataset_summary_csv(
         writer.writerows(rows)
 
 
-# ---------------------------------------------------------------------------
 # Summary writer
-# ---------------------------------------------------------------------------
 
 def _write_summary(
     summary_path: str,
@@ -1208,9 +1163,9 @@ def _write_summary(
                     return f"{n / _ni * 100:.1f}%"
                 return "?"
 
-            lines.append(f"  │")
+            lines.append("  │")
             lines.append(f"  │  Input sequences                    : {n_input}")
-            lines.append(f"  │")
+            lines.append("  │")
 
             # High-confidence — the "good" classifications
             if isinstance(n_high, int) and isinstance(n_classified, int):
@@ -1269,7 +1224,7 @@ def _write_summary(
                 )
             elif isinstance(n_unclass, int):
                 lines.append(
-                    f"  │     Unclassified (no hit)               : 0"
+                    "  │     Unclassified (no hit)               : 0"
                 )
 
             # High-quality hits that resolve to different taxonomies.
@@ -1280,10 +1235,10 @@ def _write_summary(
                 )
             elif isinstance(n_tax_dis, int):
                 lines.append(
-                    f"  │     Potential taxonomic disagreement    : 0"
+                    "  │     Potential taxonomic disagreement    : 0"
                 )
 
-            lines.append(f"  │")
+            lines.append("  │")
             lines.append(f"  │  Classification TSV   : {class_tsv}")
             lines.append(f"  │  Taxonomy TSV         : {tax_tsv_path}")
             if isinstance(n_unclass, int) and n_unclass > 0:
@@ -1300,9 +1255,7 @@ def _write_summary(
 
     # Overall totals — all percentages over total input
     total_input   = sum(int(r.get("n_input", 0))          for r in results.values() if isinstance(r, dict))
-    total_class   = sum(int(r.get("n_classified", 0))     for r in results.values() if isinstance(r, dict))
     total_unclass = sum(int(r.get("n_unclassified", 0))   for r in results.values() if isinstance(r, dict))
-    total_low_all = sum(int(r.get("n_low_confidence", 0)) for r in results.values() if isinstance(r, dict))
     total_tax_dis = sum(int(r.get("n_taxonomic_disagreements", 0)) for r in results.values() if isinstance(r, dict))
 
     # Compute medium/low split from classification TSVs
@@ -1359,7 +1312,7 @@ def _write_summary(
             f"{total_unclass}  ({_gpct(total_unclass)})  ← review *_unclassified.tsv"
         )
     else:
-        lines.append(f"  ✓  Unclassified     (no hit, all rounds)     : 0")
+        lines.append("  ✓  Unclassified     (no hit, all rounds)     : 0")
     if total_tax_dis:
         lines.append(
             f"  !  Potential taxonomic disagreements         : "
@@ -1378,23 +1331,23 @@ def _write_summary(
     lines.append("How to use these outputs with BranchManager")
     lines.append("─" * 70)
     lines.append(
-        "\n1. Preload a classified dataset (taxonomy pre-computed, no re-classification):\n"
-        "   branchmanager preload \\\n"
+        "\n1. Register a classified dataset in the Filing Cabinet (no re-classification):\n"
+        "   branchmanager filing-cabinet \\\n"
         "     --fasta <original_fasta.fasta> \\\n"
         f"     --taxa-assignments {pipeline_combined_path} \\\n"
         "     --db my_project.db \\\n"
         "     --dataset <dataset_name> \\\n"
-        "     -o preload_out/\n"
+        "     -o filing_cabinet_out/\n"
     )
     lines.append(
-        "2. Run the main pipeline using the pre-classified taxonomy:\n"
-        "   branchmanager run \\\n"
+        "2. Run Performance Review using the pre-classified taxonomy:\n"
+        "   branchmanager performance-review \\\n"
         "     --input my_samples.fasta \\\n"
         "     --ref <ref.fasta> \\\n"
         f"     --taxa-assignments {pipeline_combined_path} \\\n"
         "     --db my_project.db \\\n"
         "     --dataset Batch1 \\\n"
-        "     -o run_out/\n"
+        "     -o performance_review_out/\n"
         "   (The --taxa-assignments flag prevents on-the-fly re-classification.)\n"
     )
     lines.append("=" * 70)

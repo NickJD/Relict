@@ -23,21 +23,69 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Optional
 
 from branchmanager.taxonomy import parse_reference_header_taxonomy, reference_lookup_keys
 from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
-from branchmanager.utils.fasta import read_fasta, write_fasta
+from branchmanager.utils.fasta import read_fasta
 from branchmanager.utils.subprocess import run_cmd
 from branchmanager.pipeline.tree import is_ref_anchor
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl'
+
+
+def _parse_vsearch_match(parts: list[str]) -> Optional[dict]:
+    if len(parts) < 3:
+        return None
+    try:
+        identity = float(parts[2])
+    except (TypeError, ValueError):
+        return None
+    result = {
+        'query': parts[0], 'target': parts[1], 'identity': identity,
+        'alignment_length': None, 'mismatches': None, 'gaps': None,
+        'query_length': None, 'target_length': None,
+        'query_coverage': None, 'target_coverage': None,
+    }
+    if len(parts) >= 12:
+        try:
+            result.update({
+                'alignment_length': int(float(parts[3])),
+                'mismatches': int(float(parts[4])),
+                'gaps': int(float(parts[5])),
+                'query_length': int(float(parts[10])),
+                'target_length': int(float(parts[11])),
+            })
+            if result['query_length']:
+                result['query_coverage'] = 100.0 * result['alignment_length'] / result['query_length']
+            if result['target_length']:
+                result['target_coverage'] = 100.0 * result['alignment_length'] / result['target_length']
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return result
+
+
+def _alignment_columns(hit: Optional[dict]) -> list[str]:
+    if not hit:
+        return ['NA'] * 7
+    def number(key, digits=2):
+        value = hit.get(key)
+        return 'NA' if value is None else f'{float(value):.{digits}f}'
+    def integer(key):
+        value = hit.get(key)
+        return 'NA' if value is None else str(int(value))
+    return [
+        number('query_coverage'), number('target_coverage'), integer('alignment_length'),
+        integer('query_length'), integer('target_length'), integer('mismatches'), integer('gaps'),
+    ]
+
+
 # ID normalisation helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _norm_id(x: str) -> str:
     """
@@ -76,9 +124,7 @@ def _canon_id(x: str) -> str:
     return y
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Taxonomy map loading
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _load_taxa_map(taxa_tsv: str) -> dict[str, tuple[str, Optional[float]]]:
     """
@@ -195,9 +241,7 @@ def _lookup_tax(sid: str, taxa_map: dict) -> tuple[Optional[str], Optional[float
     return None, None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Reference decompression
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _ensure_uncompressed(ref_fasta: str, outdir: str, out_name: str = "ref_uncompressed.fasta") -> str:
     """Decompress *ref_fasta* to *outdir/<out_name>* if it is gzipped.
@@ -347,9 +391,7 @@ def write_reference_taxonomy_warnings(outdir: str, warning_rows):
     return str(path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Main classification function
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_classification(
     input_fasta: str,
@@ -388,7 +430,6 @@ def run_classification(
 
     ref_to_use = _ensure_uncompressed(ref_fasta, outdir)
 
-    # ── Build taxa lookup map once ────────────────────────────────────────────
     taxa_map: dict = {}
     if taxa_tsv:
         try:
@@ -411,16 +452,16 @@ def run_classification(
             logger.warning('[CLASSIFY] Failed to parse taxonomy from reference FASTA headers: %s', e)
             taxa_map = {}
 
-    # ── Run VSEARCH ───────────────────────────────────────────────────────────
     matches_path = os.path.join(outdir, "matches.tsv")
     thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
 
     cmd = (
-        f"vsearch --usearch_global {input_fasta}"
-        f" --db {ref_to_use}"
+        f"vsearch --usearch_global {shlex.quote(str(input_fasta))}"
+        f" --db {shlex.quote(str(ref_to_use))}"
         f" --id 0.8"
         f" --strand both"
-        f" --blast6out {matches_path}"
+        f" --blast6out {shlex.quote(str(matches_path))}"
+        f" --userfields {VSEARCH_USERFIELDS}"
         f" --maxaccepts 1 --maxhits 1"
         f" --query_cov 0.7"   # require 70% query coverage
         f"{thread_flag}"
@@ -429,7 +470,6 @@ def run_classification(
     run_cmd(cmd)
     logger.info("[CLASSIFY] vsearch done → %s", matches_path)
 
-    # ── Parse matches and write taxonomy table ────────────────────────────────
     # Build a dict of all query sequences present in the input FASTA so we
     # can emit a row for every sequence (including those with no hit).
     all_query_ids = [
@@ -438,7 +478,7 @@ def run_classification(
     ]
 
     # Parse best hits from matches file
-    best_hits: dict[str, tuple[str, float]] = {}  # query_id -> (hit_id, pct_identity)
+    best_hits: dict[str, dict] = {}
     try:
         with open(matches_path) as fh:
             for line in fh:
@@ -446,16 +486,13 @@ def run_classification(
                 if not line:
                     continue
                 parts = line.split("\t")
-                if len(parts) < 3:
-                    continue
-                qid, sid = parts[0], parts[1]
-                try:
-                    pct = float(parts[2])
-                except ValueError:
+                hit = _parse_vsearch_match(parts)
+                if not hit:
                     continue
                 # Keep highest identity hit (should only be one since maxhits=1)
-                if qid not in best_hits or pct > best_hits[qid][1]:
-                    best_hits[qid] = (sid, pct)
+                qid = hit['query']
+                if qid not in best_hits or hit['identity'] > best_hits[qid]['identity']:
+                    best_hits[qid] = hit
     except FileNotFoundError:
         logger.warning("[CLASSIFY] matches.tsv not found — classification may have failed")
 
@@ -463,13 +500,14 @@ def run_classification(
     written = 0
     no_hit = 0
     with open(output, "w") as out_fh:
-        out_fh.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\n")
+        out_fh.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\tQueryCoverage\tTargetCoverage\tAlignmentLength\tQueryLength\tTargetLength\tMismatches\tGaps\n")
         for qid in all_query_ids:
             if qid not in best_hits:
-                out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\n")
+                out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\t" + '\t'.join(_alignment_columns(None)) + "\n")
                 no_hit += 1
                 continue
-            sid, pct = best_hits[qid]
+            hit = best_hits[qid]
+            sid, pct = hit['target'], hit['identity']
             tax, conf = _lookup_tax(sid, taxa_map)
             # Use alignment identity as confidence proxy when the taxa source
             # has no confidence column (e.g. taxonomy parsed from FASTA headers).
@@ -478,7 +516,7 @@ def run_classification(
             out_fh.write(
                 f"{qid}\t{sid}\t{pct:.2f}"
                 f"\t{tax if tax is not None else 'NA'}"
-                f"\t{conf:.4f}\n"
+                f"\t{conf:.4f}\t" + '\t'.join(_alignment_columns(hit)) + "\n"
             )
             written += 1
 
@@ -489,9 +527,7 @@ def run_classification(
     return output
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Multi-database classification
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _derive_db_name(fasta_path: str) -> str:
     """Derive a short, filesystem-safe name from a reference FASTA path.
@@ -574,11 +610,12 @@ def run_classification_single(
     # Run vsearch
     thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
     cmd = (
-        f"vsearch --usearch_global {input_fasta}"
-        f" --db {ref_to_use}"
+        f"vsearch --usearch_global {shlex.quote(str(input_fasta))}"
+        f" --db {shlex.quote(str(ref_to_use))}"
         f" --id 0.8"
         f" --strand both"
-        f" --blast6out {matches_path}"
+        f" --blast6out {shlex.quote(str(matches_path))}"
+        f" --userfields {VSEARCH_USERFIELDS}"
         f" --maxaccepts 1 --maxhits 1"
         f" --query_cov 0.7"
         f"{thread_flag}"
@@ -590,7 +627,7 @@ def run_classification_single(
     all_query_ids = [h for h, _ in read_fasta(input_fasta) if not is_ref_anchor(h)]
 
     # Parse best hits from matches file
-    best_hits: dict[str, tuple[str, float]] = {}
+    best_hits: dict[str, dict] = {}
     try:
         with open(matches_path) as fh:
             for line in fh:
@@ -598,15 +635,12 @@ def run_classification_single(
                 if not line:
                     continue
                 parts = line.split("\t")
-                if len(parts) < 3:
+                hit = _parse_vsearch_match(parts)
+                if not hit:
                     continue
-                qid, sid = parts[0], parts[1]
-                try:
-                    pct = float(parts[2])
-                except ValueError:
-                    continue
-                if qid not in best_hits or pct > best_hits[qid][1]:
-                    best_hits[qid] = (sid, pct)
+                qid = hit['query']
+                if qid not in best_hits or hit['identity'] > best_hits[qid]['identity']:
+                    best_hits[qid] = hit
     except FileNotFoundError:
         logger.warning("[CLASSIFY][%s] matches file not found", db_name)
 
@@ -614,20 +648,28 @@ def run_classification_single(
     written = 0
     no_hit = 0
     with open(output, "w") as out_fh:
-        out_fh.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\n")
+        out_fh.write("ID\tBestHit\tIdentity\tTaxon\tConfidence\tQueryCoverage\tTargetCoverage\tAlignmentLength\tQueryLength\tTargetLength\tMismatches\tGaps\n")
         for qid in all_query_ids:
             if qid not in best_hits:
-                out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\n")
-                results[qid] = ('NA', 0.0, 'NA', 'NA')
+                out_fh.write(f"{qid}\tNA\t0.0\tNA\tNA\t" + '\t'.join(_alignment_columns(None)) + "\n")
+                results[qid] = ('NA', 0.0, 'NA', 'NA', None, None, None, None, None, None, None)
                 no_hit += 1
                 continue
-            sid, pct = best_hits[qid]
+            hit = best_hits[qid]
+            sid, pct = hit['target'], hit['identity']
             tax, conf = _lookup_tax(sid, taxa_map)
             if conf is None:
                 conf = round(pct / 100.0, 4)
             tax_str = tax if tax is not None else 'NA'
-            out_fh.write(f"{qid}\t{sid}\t{pct:.2f}\t{tax_str}\t{conf:.4f}\n")
-            results[qid] = (sid, pct, tax_str, conf)
+            out_fh.write(
+                f"{qid}\t{sid}\t{pct:.2f}\t{tax_str}\t{conf:.4f}\t"
+                + '\t'.join(_alignment_columns(hit)) + "\n"
+            )
+            results[qid] = (
+                sid, pct, tax_str, conf, hit.get('query_coverage'), hit.get('target_coverage'),
+                hit.get('alignment_length'), hit.get('query_length'), hit.get('target_length'),
+                hit.get('mismatches'), hit.get('gaps'),
+            )
             written += 1
 
     logger.info(
@@ -707,15 +749,18 @@ def _write_merged_taxonomy(
     db_names = [primary_name] + [n for n in all_results if n != primary_name]
 
     with open(output, 'w') as fh:
-        header = ['ID', 'BestHit', 'Identity', 'Taxon', 'Confidence']
+        metric_names = ['QueryCoverage', 'TargetCoverage', 'AlignmentLength', 'QueryLength', 'TargetLength', 'Mismatches', 'Gaps']
+        header = ['ID', 'BestHit', 'Identity', 'Taxon', 'Confidence', *metric_names]
         for name in db_names[1:]:
             safe = _re.sub(r'[^A-Za-z0-9]+', '_', name).strip('_')
             header += [f'BestHit_{safe}', f'Identity_{safe}', f'Taxon_{safe}', f'Confidence_{safe}']
+            header += [f'{metric}_{safe}' for metric in metric_names]
         fh.write('\t'.join(header) + '\n')
 
         primary_res = all_results.get(primary_name, {})
         for qid in all_query_ids:
-            hit, pct, tax, conf = primary_res.get(qid, ('NA', 0.0, 'NA', 'NA'))
+            result = primary_res.get(qid, ('NA', 0.0, 'NA', 'NA', None, None, None, None, None, None, None))
+            hit, pct, tax, conf = result[:4]
             row = [
                 qid,
                 str(hit),
@@ -723,14 +768,17 @@ def _write_merged_taxonomy(
                 str(tax),
                 f"{conf:.4f}" if isinstance(conf, float) else str(conf),
             ]
+            row += ['NA' if value is None else (f'{value:.2f}' if isinstance(value, float) else str(value)) for value in result[4:11]]
             for name in db_names[1:]:
-                a_hit, a_pct, a_tax, a_conf = all_results.get(name, {}).get(qid, ('NA', 0.0, 'NA', 'NA'))
+                alt_result = all_results.get(name, {}).get(qid, ('NA', 0.0, 'NA', 'NA', None, None, None, None, None, None, None))
+                a_hit, a_pct, a_tax, a_conf = alt_result[:4]
                 row += [
                     str(a_hit),
                     f"{a_pct:.2f}" if isinstance(a_pct, float) else str(a_pct),
                     str(a_tax),
                     f"{a_conf:.4f}" if isinstance(a_conf, float) else str(a_conf),
                 ]
+                row += ['NA' if value is None else (f'{value:.2f}' if isinstance(value, float) else str(value)) for value in alt_result[4:11]]
             fh.write('\t'.join(row) + '\n')
 
     logger.info("[CLASSIFY] Wrote merged multi-db taxonomy → %s", output)

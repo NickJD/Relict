@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 from xml.etree import ElementTree as ET
 
-from branchmanager.taxonomy import normalize_taxon_name, parse_taxon_string
+from branchmanager.taxonomy import normalise_taxon_name, parse_taxon_string
 
 
 RANK_ORDER = ['d', 'p', 'c', 'o', 'f', 'g', 's']
@@ -100,7 +100,7 @@ def _entry_has_only_domain(entry: MWLEntry) -> bool:
 
 def _add_rank_value(ranks: Dict[str, set[str]], rank: str, value: str) -> None:
     key = _rank_key(rank)
-    norm = normalize_taxon_name(value)
+    norm = normalise_taxon_name(value)
     if key and norm:
         ranks.setdefault(key, set()).add(norm)
 
@@ -133,7 +133,7 @@ def _parse_entry_terms(hierarchy: str) -> tuple[Dict[str, set[str]], set[str]]:
             token = token.strip().strip(':')
             if not token or token.lower() == 'including':
                 continue
-            norm = normalize_taxon_name(token)
+            norm = normalise_taxon_name(token)
             if norm:
                 unranked.add(norm)
 
@@ -278,7 +278,7 @@ def match_taxonomy_to_mwl(
             value = parsed.get(rank)
             if not value:
                 continue
-            norm = normalize_taxon_name(value)
+            norm = normalise_taxon_name(value)
             rank_hit = norm in entry.ranks.get(rank, set()) or norm in entry.unranked_terms
             if not rank_hit or not _rank_allowed(rank, min_rank, entry):
                 continue

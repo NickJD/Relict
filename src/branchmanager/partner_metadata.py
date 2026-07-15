@@ -15,15 +15,21 @@ PARTNER_ID_COLUMNS = {
     'partnerid', 'partner_id', 'partner id', 'partner', 'partneracronym',
     'partner_acronym', 'partner acronym',
 }
-SELECTED_COLUMNS = {
+GENOME_AVAILABLE_COLUMNS = {
+    'alreadysequenced', 'already_sequenced', 'already sequenced',
+    'genomeavailable', 'genome_available', 'genome available',
+    'genomesequenced', 'genome_sequenced', 'genome sequenced',
+    'wgsavailable', 'wgs_available', 'wgs available',
+}
+SELECTION_COLUMNS = {
     'selected', 'selectedforwgs', 'selected_for_wgs', 'selected for wgs',
     'selectedforgenomesequencing', 'selected_for_genome_sequencing',
     'selected for genome sequencing', 'selectedforfullgenomesequencing',
     'selected_for_full_genome_sequencing',
     'selected for full genome sequencing', 'wgs', 'wgsselected',
     'wgs_selected', 'wgs selected', 'genomesequencing',
-    'genome_sequencing', 'genome sequencing', 'fullgenomesequencing',
-    'full_genome_sequencing', 'full genome sequencing',
+    'genomesequencingselected', 'genome_sequencing_selected',
+    'genome sequencing selected',
 }
 
 
@@ -41,7 +47,7 @@ def _open_text(path: str | Path):
     return open(path, 'rt', newline='')
 
 
-def _truthy_selected(value: object) -> bool:
+def _parse_boolean(value: object, *, field: str) -> bool:
     if value is None:
         return False
     if isinstance(value, bool):
@@ -49,17 +55,11 @@ def _truthy_selected(value: object) -> bool:
     if isinstance(value, (int, float)):
         return float(value) != 0.0
     text = str(value).strip().lower()
-    if text in ('', '0', 'false', 'f', 'no', 'n', 'none', 'na', 'n/a', 'not selected', 'not sequenced'):
+    if text in ('0', 'false', 'f', 'no', 'n'):
         return False
-    if text.startswith('not ') or text.startswith('no '):
-        return False
-    if text in (
-        '1', 'true', 't', 'yes', 'y', 'selected', 'select', 'wgs',
-        'genome', 'genome sequencing', 'full genome sequencing',
-        'sequenced', 'for sequencing',
-    ):
+    if text in ('1', 'true', 't', 'yes', 'y'):
         return True
-    return any(marker in text for marker in ('selected', 'wgs', 'sequenc'))
+    raise ValueError(f'{field} must be an explicit yes/no Boolean; received {value!r}')
 
 
 def _find_column(fieldnames: Iterable[str], candidates: set[str]) -> str | None:
@@ -93,10 +93,11 @@ def _rows_from_delimited(path: str | Path) -> list[dict]:
 
 
 def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = None) -> list[dict]:
-    """Read partner sequencing-selection metadata from CSV/TSV sidecar files.
+    """Read partner genome-availability metadata from CSV/TSV sidecar files.
 
-    Returns rows with normalized keys:
-      source_id, partner_id, selected_for_wgs, raw_selected_value
+    Returns rows with normalised keys:
+      source_id, partner_id, selected_for_sequencing, genome_available,
+      selected_for_wgs (internal compatibility alias for genome_available)
     """
     p = Path(path)
     lower = str(p).lower()
@@ -110,7 +111,8 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
 
     fieldnames = list(raw_rows[0].keys())
     id_col = _find_column(fieldnames, ID_COLUMNS)
-    selected_col = _find_column(fieldnames, SELECTED_COLUMNS)
+    genome_col = _find_column(fieldnames, GENOME_AVAILABLE_COLUMNS)
+    selection_col = _find_column(fieldnames, SELECTION_COLUMNS)
     partner_col = _find_column(fieldnames, PARTNER_ID_COLUMNS)
 
     if not id_col:
@@ -121,24 +123,50 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
         raise ValueError(
             'Partner metadata must contain a partner acronym column such as partner_id, partner, or partner_acronym.'
         )
-    if not selected_col:
+    if not genome_col:
         raise ValueError(
-            'Partner metadata must contain a WGS-selection column such as selected_for_wgs or selected_for_genome_sequencing.'
+            'Partner metadata must contain an already-sequenced/genome-available column such as already_sequenced.'
         )
 
     rows = []
-    for raw in raw_rows:
+    seen: dict[str, tuple[str, bool, bool, int]] = {}
+    for row_number, raw in enumerate(raw_rows, start=2):
         source_id = str(raw.get(id_col) or '').strip()
         if not source_id:
             continue
         partner_id = str(raw.get(partner_col) or '').strip()
         if not partner_id:
             continue
-        raw_selected = raw.get(selected_col)
+        raw_genome = raw.get(genome_col)
+        raw_selection = raw.get(selection_col) if selection_col else 'no'
+        genome_available = _parse_boolean(raw_genome, field='already_sequenced')
+        selected_for_sequencing = _parse_boolean(
+            raw_selection if raw_selection not in (None, '') else 'no',
+            field='selected_for_genome_sequencing',
+        )
+        signature = (
+            partner_id.casefold(), selected_for_sequencing, genome_available, row_number,
+        )
+        if source_id in seen:
+            previous = seen[source_id]
+            duplicate_kind = (
+                'duplicate' if previous[:3] == signature[:3] else 'conflicting'
+            )
+            raise ValueError(
+                f'Partner metadata contains a {duplicate_kind} sequence_id {source_id!r} '
+                f'on rows {previous[3]} and {row_number}; the cumulative ledger requires '
+                'exactly one row per isolate.'
+            )
+        seen[source_id] = signature
         rows.append({
             'source_id': source_id,
             'partner_id': partner_id or source_id,
-            'selected_for_wgs': _truthy_selected(raw_selected),
-            'raw_selected_value': '' if raw_selected is None else str(raw_selected),
+            'selected_for_sequencing': selected_for_sequencing,
+            'genome_available': genome_available,
+            # selected_for_wgs is retained internally until the storage schema
+            # can be renamed without ambiguity; it means genome available.
+            'selected_for_wgs': genome_available,
+            'raw_selected_value': '' if raw_genome is None else str(raw_genome),
+            'raw_commitment_value': '' if raw_selection is None else str(raw_selection),
         })
     return rows

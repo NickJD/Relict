@@ -11,12 +11,12 @@ The tree is built from THREE layers of sequences:
      They are NEVER shown in outputs - they are scaffolding only.
      Identified by the BRANCHMANAGER_REF_ prefix in their headers.
 
-  2. Preload sequences  (e.g. Hungate1000)
-     User-supplied baseline dataset loaded via `branchmanager preload`.
+  2. Filing Cabinet sequences  (e.g. Hungate1000)
+     User-supplied baseline dataset registered via `branchmanager filing-cabinet`.
      Stored in the DB with dataset label. Shown in iTOL.
 
-  3. Run sequences
-     User query sequences submitted via `branchmanager run`. Shown in iTOL.
+  3. Performance Review sequences
+     User query sequences submitted via `branchmanager performance-review`. Shown in iTOL.
 
 Tree building strategy
 ----------------------
@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import shlex
 import os as _os
 import re
 import shutil
@@ -56,7 +57,6 @@ from branchmanager.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 
 # Prefix that marks a sequence as a reference anchor.
 REF_ANCHOR_PREFIX = "BRANCHMANAGER_REF_"
@@ -66,9 +66,7 @@ _MODULE_DIR = Path(__file__).resolve().parent
 BUILTIN_ANCHOR_FILE = _MODULE_DIR.parent / "data" / "reference_anchors.fasta"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Public helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def is_ref_anchor(seq_id: str) -> bool:
     """Return True if a sequence ID belongs to a reference anchor."""
@@ -80,9 +78,7 @@ def filter_anchors_from_output(pairs: list[tuple]) -> list[tuple]:
     return [p for p in pairs if not is_ref_anchor(str(p[0]))]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Reference anchor management
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_anchor_file(custom_anchor_file: Optional[str] = None) -> Optional[Path]:
     """
@@ -132,9 +128,7 @@ def write_anchor_fasta(outdir: Path, anchor_file: Optional[Path]) -> Optional[Pa
     return out_path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Combined FASTA construction
-# ─────────────────────────────────────────────────────────────────────────────
 
 def build_combined_fasta(
     user_fasta: str,
@@ -172,7 +166,7 @@ def build_combined_fasta(
         seen_hashes.add(h_md5)
         all_records.append((h, s))
 
-    # 2. DB sequences (preload/previous runs)
+    # 2. DB sequences (Filing Cabinet and previous reviews)
     if db is not None:
         db_fasta = outdir / "db_sequences.fasta"
         try:
@@ -233,11 +227,9 @@ def build_combined_fasta(
     return combined_path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Duplicate header handling
-# ─────────────────────────────────────────────────────────────────────────────
 
-def _sanitize_name(x: str) -> str:
+def _sanitise_name(x: str) -> str:
     token = str(x).split()[0]
     if "|" in token:
         token = token.split("|")[-1]
@@ -260,7 +252,7 @@ def _make_unique_fasta(fasta_path: str, outdir: Path) -> tuple[str, dict]:
     has_duplicates = False
 
     for h, seq in records:
-        base = _sanitize_name(h)
+        base = _sanitise_name(h)
         if seen[base] == 0:
             new_h = base
         else:
@@ -285,9 +277,7 @@ def _make_unique_fasta(fasta_path: str, outdir: Path) -> tuple[str, dict]:
     return str(unique_path), mapping
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Internal node labelling
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _label_internal_nodes(newick_text: str, prefix: str = "NODE") -> str:
     """
@@ -332,18 +322,11 @@ def _repair_internal_node_label_delimiters(newick_text: Optional[str]) -> str:
     return re.sub(r"\b(NODE\d+)(::+)", r"\1:", newick_text)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Normalisation helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _norm_id(x: str) -> str:
-    if x is None:
-        return ''
-    x = str(x).split()[0]
-    if "|" in x:
-        x = x.split("|")[-1]
-    x = re.sub(r"_[0-9]+$", "", x)
-    return x
+    """Return the persistent FASTA ID without legacy shortening heuristics."""
+    return str(x).strip() if x is not None else ''
 
 
 def _new_sequences_only(
@@ -450,7 +433,7 @@ def _orient_tree_input_fasta(
 ) -> tuple[str, list[dict[str, object]]]:
     """Orient tree-input sequences against the reference/anchor database.
 
-    This is tree-only normalization: stored DB sequences are not mutated.
+    This is tree-only normalisation: stored DB sequences are not mutated.
     Sequences without confident orientation evidence are left unchanged.
     """
     ref_to_use = _ensure_uncompressed_reference(ref_fasta, outdir)
@@ -482,11 +465,11 @@ def _orient_tree_input_fasta(
     tmp_matches = outdir / f'{label}_orientation_matches.tsv'
     thread_flag = f' --threads {threads}' if threads and int(threads) > 0 else ''
     cmd = (
-        f'vsearch --usearch_global {input_fasta} '
-        f'--db {ref_to_use} '
+        f'vsearch --usearch_global {shlex.quote(str(input_fasta))} '
+        f'--db {shlex.quote(str(ref_to_use))} '
         f'--id 0.5 '
         f'--strand both '
-        f'--blast6out {tmp_matches} '
+        f'--blast6out {shlex.quote(str(tmp_matches))} '
         f'--maxaccepts 1 --maxhits 1 '
         f'--query_cov 0.5{thread_flag}'
     )
@@ -495,23 +478,9 @@ def _orient_tree_input_fasta(
         run_cmd(cmd)
         orientations = _parse_orientation_by_query(str(tmp_matches))
     except Exception as e:
-        logger.warning('[TREE] Orientation search failed for %s: %s', input_fasta, e)
-        return input_fasta, [
-            {
-                'build_mode': build_mode,
-                'source_group': label,
-                'sequence_id': h,
-                'orientation_call': 'unknown',
-                'reverse_complemented': 'False',
-                'best_hit': 'NA',
-                'best_identity': 'NA',
-                'qstart': 'NA',
-                'qend': 'NA',
-                'reference_source': Path(ref_to_use).name,
-                'status': 'search_failed',
-            }
-            for h, _ in data_records
-        ]
+        raise RuntimeError(
+            f'Tree-input orientation search failed for {input_fasta}: {e}'
+        ) from e
     finally:
         try:
             if tmp_matches.exists():
@@ -572,13 +541,11 @@ def _orient_tree_input_fasta(
     return str(oriented_path), summary_rows
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Tree building
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _run_fasttree(aln_path: Path, tree_path: Path) -> bool:
     """Run FastTree -nt -gtr on aln_path, write to tree_path. Returns success."""
-    cmd = f"FastTree -nt -gtr {aln_path} > {tree_path}"
+    cmd = f"FastTree -nt -gtr {shlex.quote(str(aln_path))} > {shlex.quote(str(tree_path))}"
     logger.info("[TREE] Running FastTree: %s", cmd)
     try:
         run_cmd(cmd)
@@ -649,8 +616,8 @@ def _run_iqtree(
     thread_flag = f"-T {threads}" if threads and int(threads) > 0 else "-T AUTO"
     fast_flag = "-fast" if fast else ""
     cmd = (
-        f"{binary} -s {aln_path} -m {model} {thread_flag} "
-        f"-pre {prefix} --redo -quiet {fast_flag}"
+        f"{shlex.quote(str(binary))} -s {shlex.quote(str(aln_path))} -m {model} {thread_flag} "
+        f"-pre {shlex.quote(str(prefix))} --redo -quiet {fast_flag}"
     ).strip()
     logger.info("[TREE] Running IQ-TREE%s: %s", " (fast)" if fast else "", cmd)
     try:
@@ -695,7 +662,10 @@ def _build_tree(
 def _run_mafft_full(input_fasta: Path, output_fasta: Path, threads: int = 4) -> bool:
     """Full de-novo MAFFT alignment (--auto mode)."""
     thread_flag = f"--thread {threads}" if threads > 0 else ""
-    cmd = f"mafft {thread_flag} --auto {input_fasta} > {output_fasta}".strip()
+    cmd = (
+        f"mafft {thread_flag} --auto {shlex.quote(str(input_fasta))} "
+        f"> {shlex.quote(str(output_fasta))}"
+    ).strip()
     logger.info("[TREE] Running MAFFT (full): %s", cmd)
     try:
         run_cmd(cmd)
@@ -713,7 +683,10 @@ def _run_mafft_add(
 ) -> bool:
     """Add near-full-length sequences to an existing alignment via --add."""
     thread_flag = f"--thread {threads}" if threads > 0 else ""
-    cmd = f"mafft {thread_flag} --add {new_fasta} {backbone_aln} > {output_fasta}".strip()
+    cmd = (
+        f"mafft {thread_flag} --add {shlex.quote(str(new_fasta))} "
+        f"{shlex.quote(str(backbone_aln))} > {shlex.quote(str(output_fasta))}"
+    ).strip()
     logger.info("[TREE] Running MAFFT (add): %s", cmd)
     try:
         run_cmd(cmd)
@@ -731,7 +704,10 @@ def _run_mafft_addfragments(
 ) -> bool:
     """Add new sequences to an existing alignment via --addfragments."""
     thread_flag = f"--thread {threads}" if threads > 0 else ""
-    cmd = f"mafft {thread_flag} --addfragments {new_fasta} {backbone_aln} > {output_fasta}".strip()
+    cmd = (
+        f"mafft {thread_flag} --addfragments {shlex.quote(str(new_fasta))} "
+        f"{shlex.quote(str(backbone_aln))} > {shlex.quote(str(output_fasta))}"
+    ).strip()
     logger.info("[TREE] Running MAFFT (addfragments): %s", cmd)
     try:
         run_cmd(cmd)
@@ -767,35 +743,35 @@ def _choose_mafft_incremental_mode(new_records: list[tuple[str, str]], backbone_
     return 'addfragments'
 
 
-def _seed_backbone_from_preload(preload_dir: Optional[str], outdir: Path) -> bool:
-    """Copy a preload backbone alignment/tree into a fresh run outdir if present."""
-    if not preload_dir:
+def _seed_backbone_from_previous_review(previous_review: Optional[str], outdir: Path) -> bool:
+    """Copy a previous-review backbone alignment/tree into a fresh run outdir if present."""
+    if not previous_review:
         return False
-    p = Path(preload_dir)
-    preload_aln = p / 'current_alignment.fasta'
-    if not preload_aln.exists():
-        preload_aln = p / 'tree' / 'current_alignment.fasta'
-    if not preload_aln.exists():
+    p = Path(previous_review)
+    previous_alignment = p / 'current_alignment.fasta'
+    if not previous_alignment.exists():
+        previous_alignment = p / 'tree' / 'current_alignment.fasta'
+    if not previous_alignment.exists():
         return False
     outdir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(preload_aln, outdir / 'current_alignment.fasta')
-    preload_tree = p / 'current_tree.nwk'
-    if not preload_tree.exists():
-        preload_tree = p / 'tree' / 'current_tree.nwk'
-    if preload_tree.exists():
+    shutil.copyfile(previous_alignment, outdir / 'current_alignment.fasta')
+    previous_tree = p / 'current_tree.nwk'
+    if not previous_tree.exists():
+        previous_tree = p / 'tree' / 'current_tree.nwk'
+    if previous_tree.exists():
         try:
-            shutil.copyfile(preload_tree, outdir / 'current_tree.nwk')
+            shutil.copyfile(previous_tree, outdir / 'current_tree.nwk')
         except Exception:
             pass
-    preload_orient = p / 'tree_orientation_summary.tsv'
-    if not preload_orient.exists():
-        preload_orient = p / 'tree' / 'tree_orientation_summary.tsv'
-    if preload_orient.exists():
+    previous_orientation = p / 'tree_orientation_summary.tsv'
+    if not previous_orientation.exists():
+        previous_orientation = p / 'tree' / 'tree_orientation_summary.tsv'
+    if previous_orientation.exists():
         try:
-            shutil.copyfile(preload_orient, outdir / 'tree_orientation_summary.tsv')
+            shutil.copyfile(previous_orientation, outdir / 'tree_orientation_summary.tsv')
         except Exception:
             pass
-    logger.info('[TREE] Seeded backbone alignment from preload directory %s', p)
+    logger.info('[TREE] Seeded backbone alignment from previous review %s', p)
     return True
 
 
@@ -824,7 +800,7 @@ def collect_tree_build_warnings(user_fasta: str, anchor_file: Optional[str] = No
     return warnings
 
 
-def summarize_alignment_quality(alignment_fasta: str):
+def summarise_alignment_quality(alignment_fasta: str):
     warnings = []
     p = Path(alignment_fasta)
     if not p.exists():
@@ -936,9 +912,7 @@ def _finalise_tree(out: Path, id_map: dict) -> None:
     logger.info("[TREE] Internal nodes labelled; tree finalised at %s", tree_path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 def initialise_or_update_tree(
     ref_fasta: str,
@@ -949,7 +923,7 @@ def initialise_or_update_tree(
     threads: int = 4,
     anchor_file: Optional[str] = None,
     force_rebuild: bool = False,
-    preload_dir: Optional[str] = None,
+    previous_review: Optional[str] = None,
     tree_method: str = "fasttree",
 ):
     """
@@ -1009,16 +983,19 @@ def initialise_or_update_tree(
     resolved_anchor_file = get_anchor_file(anchor_file)
     orientation_summary = out / 'tree_orientation_summary.tsv'
 
-    # ── Count user sequences ─────────────────────────────────────────────────
     with open(user_fasta) as handle:
         user_count = sum(1 for line in handle if line.startswith(">"))
-    logger.info("[TREE] Input: %d user sequences, preload_dir=%s, force_rebuild=%s, outdir=%s",
-                user_count, preload_dir, force_rebuild, outdir)
+    logger.info("[TREE] Input: %d user sequences, previous_review=%s, force_rebuild=%s, outdir=%s",
+                user_count, previous_review, force_rebuild, outdir)
 
     if not current_aln.exists() and not force_rebuild:
-        _seed_backbone_from_preload(preload_dir, out)
+        seeded = _seed_backbone_from_previous_review(previous_review, out)
+        if not seeded:
+            # Performance Review organises persistent tree files under out/tree at the
+            # end of a run. Reuse that backbone automatically when the same
+            # output directory is supplied again.
+            _seed_backbone_from_previous_review(str(out), out)
 
-    # ── FIRST RUN ─────────────────────────────────────────────────────────────
     if not current_aln.exists() or force_rebuild:
         logger.info("[TREE] %s — building from scratch",
                     "Force rebuild requested" if force_rebuild else "No backbone alignment found")
@@ -1055,7 +1032,6 @@ def initialise_or_update_tree(
                     len(load_anchor_sequences(resolved_anchor_file)))
         return
 
-    # ── SUBSEQUENT RUN ────────────────────────────────────────────────────────
     if user_count == 0:
         if not current_tree.exists():
             logger.info("[TREE] No user sequences; building tree from existing alignment")

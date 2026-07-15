@@ -1,6 +1,6 @@
 """BranchManager CLI — lightweight entrypoint for the branchmanager package.
 
-Implements the `preload`, `run`/`evaluate`, and `regen-itol` commands for the src/ layout.
+Implements the BranchManager office workflow and technical reporting utilities.
 """
 import argparse
 import logging
@@ -21,19 +21,22 @@ except Exception:
     pass
 
 from branchmanager.db.interface import Database
-from branchmanager.pipeline import classify, tree, itol, qc, derep, novelty
+from branchmanager.pipeline import classify, tree, itol, qc, derep, novelty, neighbourhood, quarterly_review
 from branchmanager.pipeline import cluster_report as _cluster_report
 from branchmanager.pipeline import mwl as _mwl
+from branchmanager.pipeline import selection_sets as _selection_sets
 from branchmanager.pipeline.classify import _derive_db_name as _classify_derive_db_name
 from branchmanager.pipeline.collapse import collapse_fasta_within_taxa
 from branchmanager.pipeline.workflow_helpers import (
     _assignment_source_is_fasta,
     build_orig_to_short_map as _build_orig_to_short_map_helper,
     build_placement_warning_rows,
+    build_selection_decision,
     build_sequence_assessment_rows,
     classification_ids_matching_kingdom as _classification_ids_matching_kingdom_helper,
     collect_db_taxonomy_rows,
     iter_assignment_rows,
+    iter_classification_rows,
     load_classification_results_for_dataset,
     load_taxonomy_entries_from_assignments,
     merge_combined_taxonomy_rows,
@@ -45,8 +48,9 @@ from branchmanager.pipeline.workflow_helpers import (
     write_selection_summary_tsv,
     write_sequence_assessment_tsv,
 )
-from branchmanager.taxonomy import canonicalize_sequence_id, normalize_domain_query, taxonomy_matches_kingdom
+from branchmanager.taxonomy import canonicalise_sequence_id, normalise_domain_query, taxonomy_matches_kingdom
 from branchmanager.partner_metadata import load_partner_sequencing_metadata
+from branchmanager.run_manifest import RunManifest, utc_now
 
 
 SEQUENCE_DOMAIN_CHOICES = (
@@ -142,10 +146,10 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
     metadata_path = getattr(args, 'partner_metadata', None)
     command = getattr(args, 'command', None)
     if not metadata_path:
-        if command in ('evaluate', 'eval'):
+        if command == 'performance-review':
             raise SystemExit(
-                '[RUN] evaluate requires --partner-metadata / --sequencing-metadata: '
-                'a CSV/TSV sidecar table with sequence IDs, partner IDs, and WGS-selected status.'
+                '[PERFORMANCE REVIEW] --partner-metadata / --sequencing-metadata is required: '
+                'a cumulative CSV/TSV ledger with sequence IDs, partner acronyms, optional selection commitments, and already-sequenced status.'
             )
         return {}
 
@@ -153,9 +157,15 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
     try:
         metadata_rows = load_partner_sequencing_metadata(metadata_path)
     except Exception as e:
-        raise SystemExit(f'[RUN] Failed to read partner metadata {metadata_path}: {e}')
+        raise SystemExit(f'[PERFORMANCE REVIEW] Failed to read partner metadata {metadata_path}: {e}')
 
     run_id_set = {str(x) for x in run_ids}
+    with db.connect() as conn:
+        sequence_datasets = {
+            str(sequence_id): str(dataset or '')
+            for sequence_id, dataset in conn.execute('SELECT id, dataset FROM sequences')
+        }
+    dataset_roles = db.get_dataset_roles()
     resolved_rows = []
     warnings = []
     matched_sources = set()
@@ -166,7 +176,7 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
         mapped = orig_to_short.get(source_id)
         if not mapped:
             try:
-                cid = canonicalize_sequence_id(source_id)
+                cid = canonicalise_sequence_id(source_id)
             except Exception:
                 cid = None
             if cid:
@@ -175,21 +185,30 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             mapped = source_id
         if not mapped:
             existing = db.resolve_sequence_id(source_id)
-            if existing in run_id_set:
+            if existing:
                 mapped = existing
         if not mapped:
-            warnings.append((source_id, 'metadata_id_not_found_in_current_run'))
+            warnings.append((source_id, 'metadata_id_not_found_in_project_database_or_current_run'))
+            continue
+
+        mapped_dataset = sequence_datasets.get(str(mapped), '')
+        if dataset_roles.get(mapped_dataset, {}).get('role') == 'baseline':
+            warnings.append((source_id, 'metadata_id_belongs_to_baseline_dataset'))
             continue
 
         matched_sources.add(str(mapped))
         resolved_rows.append({
             'id': mapped,
             'partner_id': row.get('partner_id') or source_id,
-            'dataset': getattr(args, 'dataset', ''),
+            # Preserve the dataset in which an earlier isolate entered the
+            # project instead of relabelling it as part of the current batch.
+            'dataset': mapped_dataset or getattr(args, 'dataset', ''),
+            'selected_for_sequencing': bool(row.get('selected_for_sequencing')),
             'selected_for_wgs': bool(row.get('selected_for_wgs')),
             'source_id': source_id,
             'source_file': str(metadata_path),
             'raw_selected_value': row.get('raw_selected_value', ''),
+            'raw_commitment_value': row.get('raw_commitment_value', ''),
         })
 
     for run_id in sorted(run_id_set - matched_sources):
@@ -197,7 +216,7 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
 
     inserted = db.upsert_sequencing_metadata(resolved_rows)
     log.info(
-        '[RUN] Loaded partner sequencing metadata from %s: %d matched rows, %d warning(s)',
+        '[PERFORMANCE REVIEW] Loaded partner sequencing metadata from %s: %d matched rows, %d warning(s)',
         metadata_path,
         inserted,
         len(warnings),
@@ -207,7 +226,7 @@ def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_shor
             Path(outdir) / 'partner_metadata_warnings.tsv',
             warnings,
         )
-        log.warning('[RUN] Partner metadata warnings written to %s', warn_path)
+        log.warning('[PERFORMANCE REVIEW] Partner metadata warnings written to %s', warn_path)
 
     return db.get_sequencing_metadata_for_ids(run_ids)
 
@@ -238,10 +257,10 @@ def _load_id_map_from_tsv(path: str | Path, db: Database | None = None):
 def _find_preferred_id_map(directory: str | Path):
     p = Path(directory)
     preferred = [
-        p / 'preload_id_map.tsv',
+        p / 'filing_cabinet_id_map.tsv',
         p / 'user_id_map.tsv',
         p / 'user_id_map.csv',
-        p / 'ids' / 'preload_id_map.tsv',
+        p / 'ids' / 'filing_cabinet_id_map.tsv',
         p / 'ids' / 'user_id_map.tsv',
         p / 'ids' / 'user_id_map.csv',
         p / 'ids' / 'baseline_id_map.tsv',
@@ -262,7 +281,7 @@ def _find_preferred_id_map(directory: str | Path):
 def _combined_taxonomy_candidates(directory: str | Path):
     p = Path(directory)
     return [
-        p / 'preload_combined_taxonomy.tsv',
+        p / 'filing_cabinet_combined_taxonomy.tsv',
         p / 'combined_taxonomy.tsv',
         p / 'taxonomy' / 'tree_taxonomy.tsv',
         p / 'baseline' / 'loaded_baseline_taxonomy.tsv',
@@ -347,30 +366,33 @@ def _write_detailed_output_guide(outdir: Path, rows):
         qc_section.append("")
     else:
         qc_section.extend([
-            "No `qc.stats` file was found in this output directory. If this was a preload-only or partially completed run, QC may not have been executed.",
+            "No `qc.stats` file was found in this output directory. If this was Filing Cabinet only or a partially completed Performance Review, QC may not have been executed.",
             "",
         ])
 
     lines = [
         "# BranchManager Output Guide",
         "",
-        "This guide explains the output files and the main metrics produced by `branchmanager run` / `branchmanager evaluate`.",
+        "This guide explains the output files and metrics produced by the BranchManager Performance Review.",
         "",
         "## Recommended Reading Order",
         "",
-        "1. `assessment/sequence_assessment.tsv` - primary per-sequence decision table.",
-        "2. `baseline/baseline_hits.tsv` - closest cultured/baseline hits such as Hungate.",
-        "3. `taxonomy/` - taxonomy assignments for each configured reference database.",
-        "4. `tree/current_tree.nwk` plus `tree/current_alignment.fasta` and `itol/*.itol` - upload to iTOL for visual inspection.",
-        "5. `assessment/novelty_metrics.tsv` - detailed novelty calculations behind the assessment table.",
+        "1. `assessment/sequencing_sets.tsv` - proposed primary, backup, and alternate isolates by GTDB species/local clade.",
+        "2. `assessment/selection_summary.tsv` - decision-facing per-isolate recommendations and evidence.",
+        "3. `assessment/neighbourhoods/` - labelled local-clade figures linked from both reports.",
+        "4. `assessment/sequence_assessment.tsv` - full per-sequence audit table.",
+        "5. `baseline/baseline_hits.tsv`, `taxonomy/`, `tree/`, and `itol/` - supporting assignments and phylogeny.",
+        "6. `assessment/novelty_metrics.tsv` - detailed component calculations.",
+        "7. `performance_review_dashboard.html` - compact linked view of the current Hiring Panel recommendations.",
         "",
         "## Directory Overview",
         "",
-        "- `assessment/`: primary reports, novelty metrics, cluster reports, warnings, and raw all-known nearest-hit table.",
+        "- `assessment/`: selection/audit reports, local-clade figures, novelty metrics, cluster reports, and warnings.",
         "- `baseline/`: nearest-hit reports and loaded baseline taxonomy/sequences.",
         "- `taxonomy/`: per-database classification outputs and combined taxonomy used for tree metadata.",
+        "- `quality/`: marker provenance and reference-UCHIME results carried into selection evidence.",
         "- `tree/`: MSA, Newick tree, and tree/alignment warning files.",
-        "- `itol/`: one iTOL metadata dataset per metadata type, usually colorstrip files.",
+        "- `itol/`: one iTOL metadata dataset per metadata type, usually colour-strip files.",
         "- `ids/`: short ID to original FASTA header maps.",
         "- `intermediate/`: QC/dereplication/collapse/debug FASTA files and scratch pools.",
         "- `logs/`: pipeline log.",
@@ -378,33 +400,49 @@ def _write_detailed_output_guide(outdir: Path, rows):
         *qc_section,
         "## Main Assessment Metrics",
         "",
+        "`assessment/selection_summary.tsv` is the decision-facing table. It separates scientific value from redundancy and marker-evidence quality:",
+        "",
+        "- `Recommendation`: primary, backup, secondary, review, target-met, or already-sequenced action; the reason is explicit in `RecommendationReason`.",
+        "- `SequencingSetID`, `SequencingSetRole`, `SequencingSetRank`: connect each isolate to its clade-level working set. `PRIMARY` rows fill the three-genome target; `BACKUP` rows protect against DNA-extraction failure and improve strain-level spread.",
+        "- `EvidenceQuality`: whether the marker classification and placement warnings are strong enough to support selection.",
+        "- `MarkerQC`, `MarkerReview`: Paper Trail/Merge Meeting evidence and any explicit manual decision. Unreviewed warning/unverified markers cannot become PRIMARY/BACKUP.",
+        "- `CulturedGap`: distance from the cultured baseline: large below 97 percent, moderate from 97 to below 98.65 percent, small at or above 98.65 percent.",
+        "- `ProjectCoverage`: number of other partner candidates at or above 97 percent identity, including the current rolling collection but excluding the query itself.",
+        "- `ReferenceContext`: divergence from the external reference using 94.5 and 98.65 percent full-length 16S heuristic boundaries.",
+        "- `CommittedGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeTarget`, `PangenomeGap`: exact GTDB-species coverage and commitments. Baselines and completed partner genomes are available; selected pending isolates reserve planned slots.",
+        "- `LocalTreeFigure`: relative path to the grouped local-clade PNG for visual inspection.",
+        "",
+        "These boundaries are decision-support heuristics, not declarations of a new species or genus. Genome analysis remains necessary for formal novelty claims.",
+        "",
         "`assessment/sequence_assessment.tsv` is the main table. Important column groups:",
         "",
-        "- `Taxonomy`, `ClassificationHit`, `ClassificationIdentity`, `ClassificationConfidence`: primary reference-database assignment, usually GTDB when `--main-ref GTDB` is used.",
+        "- `GTDBTaxonomy`, `GTDBClassificationHit`, `GTDBClassificationIdentity`, `GTDBClassificationConfidence`, `GTDBQueryCoverage`: authoritative GTDB assignment and supporting alignment extent.",
         "- `Taxonomy_<DB>`, `ClassificationHit_<DB>`, `Identity_<DB>`, `Confidence_<DB>`: assignment from additional databases such as GG2, SILVA, or NCBI.",
-        "- `NearestHit`, `NearestHitDataset`, `NearestHitTaxonomy`, `NearestIdentity`: closest sequence in the baseline/cultured pool, for example Hungate.",
-        "- `AllKnownNearestHit`, `AllKnownNearestIdentity`, `AllKnownNoveltyScore`: same idea, but against all non-current datasets in the project DB.",
-        "- `ReferenceNearestHit`, `ReferenceNearestIdentity`, `ReferenceNoveltyScore`: nearest hit and novelty score against the selected external reference FASTA, usually GTDB.",
-        "- `PartnerID`, `SelectedForGenomeSequencing`, `CladeAlreadySelectedForGenomeSequencing`, `GenomeSequencingAdjustedPriority`: rolling partner/WGS-selection context from `--partner-metadata`.",
+        "- `BaselineNearestHit`, `BaselineNearestHitDataset`, `BaselineNearestHitTaxonomy`, `BaselineNearestIdentity`: closest cultured isolate, for example Hungate.",
+        "- `ProjectNearestHit`, `ProjectNearestIdentity`, `ProjectNoveltyScore`: comparison against all partner candidates in the rolling project collection, excluding self.",
+        "- `GTDBReferenceNearestHit`, `GTDBReferenceNearestIdentity`, `GTDBReferenceNoveltyScore`: nearest hit and context against the GTDB reference FASTA.",
+        "- `PartnerID`, `SelectedForGenomeSequencing`, `GenomeAlreadySequenced`, `BaselineGenomesSameAssessmentSpecies`, `SequencedPartnerGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeGap`: rolling genome-collection context. Assessment species is GTDB for bacterial/archaeal Performance Reviews.",
+        "- `SequencingSet*`: proposed primary/backup membership based on pangenome gap, evidence quality, and phylogenetic spread.",
         "- `InTree`, `ClusterRepresentative`, `ClusterSize`, `ClusteredMembers`: whether the sequence itself entered the tree or was represented by another clustered sequence.",
         "- `PlacementFlags`: warnings such as low classification identity, low nearest identity, or novelty/classification disagreement.",
         "",
         "## Novelty Metrics",
         "",
-        "`assessment/novelty_metrics.tsv` contains cultured-baseline novelty, all-known novelty, and external reference novelty.",
+        "`assessment/novelty_metrics.tsv` contains cultured-baseline novelty, rolling project novelty, GTDB-reference context, and genome-collection coverage.",
         "",
-        "- Leading `Nearest*`, `NoveltyScore`, `Crowding`, and `SequencingPriority` columns mirror the baseline/cultured comparison when a baseline pool exists; otherwise they mirror all-known novelty.",
+        "- Leading `Nearest*`, `NoveltyScore`, `Crowding`, and `SequencingPriority` columns mirror the baseline/cultured comparison when a baseline pool exists; otherwise they mirror project novelty.",
         "- `Baseline*` columns compare only against explicit baseline datasets such as Hungate or datasets supplied with `--novelty-baseline-dataset`.",
-        "- `AllKnown*` columns compare against every DB dataset except the current run. This includes Hungate plus non-Hungate/prior partner datasets.",
+        "- `Project*` columns compare against all partner candidate datasets, including the current rolling collection and excluding each query's self-hit. Baseline datasets are not mixed into this pool.",
         "- `Reference*` columns compare against the chosen external reference FASTA supplied with `--ref`, usually GTDB. These are separate from the baseline/project novelty scores.",
-        "- `SelectedGenome*` and `GenomeSequencing*` columns use the rolling sequencing metadata table in the SQLite DB. A selected neighbour at >=97 percent identity marks the local 16S clade as already represented for genome sequencing.",
+        "- `GenomeCollection*` columns compare against every baseline genome and every partner isolate with a genome already available. Exact same-GTDB-species counts drive the three-genome target; nearest-hit identity is supporting context only.",
         "- `NearestIdentity`: vsearch global-alignment percent identity to the nearest sequence in that pool.",
+        "- `NearestQueryCoverage`, `NearestAlignmentLength`: how much marker evidence supports that identity; low-coverage identity must not be treated as a full-length equivalent.",
         "- `Novel`: `True` when nearest identity is below 97 percent.",
         "- `MatchesGE99`, `MatchesGE97`, `MatchesGE95`: number of pool sequences at or above 99, 97, and 95 percent identity. These describe how busy the local neighbourhood is.",
         "- `Crowding`: `isolated` when there is at most one hit at both 99 and 97 percent; `sparse` when <=3 hits at 97 percent; `moderate` when <=10 hits at 97 percent; otherwise `crowded`.",
         "- `NoveltyScore`: 0-100 score where higher means more novel and less crowded. It combines distance from the nearest hit with density bonuses for sparse neighbourhoods.",
         "- `SequencingPriority`: `HIGH` for <97 percent identity with few close neighbours, `MEDIUM` for moderately novel/sparse cases, otherwise `LOW`.",
-        "- `DensitySource`: names the pool used, for example `baseline:Hungate`, `all_known`, `target_fasta`, or `reference_fasta` fallback.",
+        "- `DensitySource`: names the pool used, for example `baseline:Hungate`, `project_collection`, `target_fasta`, or `reference_fasta` fallback.",
         "",
         "Interpretation: a sequence far from Hungate but close to non-Hungate isolates is likely novel relative to cultured rumen isolate collections, but not necessarily novel relative to everything already supplied to the project.",
         "",
@@ -412,6 +450,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "- `ClassificationIdentity` is the vsearch percent identity to the best reference hit used for taxonomy assignment.",
         "- `ClassificationConfidence` is derived from the assignment parser/classifier output; higher means stronger taxonomy support.",
+        "- `QueryCoverage`, `TargetCoverage`, `AlignmentLength`, `Mismatches`, and `Gaps` expose the alignment behind each best hit.",
         "- `taxonomy/all_databases.tsv` shows assignments across all configured databases in one place.",
         "- `taxonomy/input_warnings.tsv` flags mismatches between reference FASTA IDs and supplied taxonomy tables.",
         "",
@@ -428,9 +467,12 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "- `tree/current_alignment.fasta`: MSA used to build the tree.",
         "- `tree/current_tree.nwk`: tree to upload to iTOL.",
-        "- `itol/phylum.itol`, `itol/family.itol`, `itol/genus.itol`: taxonomy colorstrips.",
-        "- `itol/dataset_membership.itol`: dataset-of-origin colorstrip.",
-        "- `itol/novelty.itol`: novelty/nearest-identity colorstrip.",
+        "- `itol/phylum.itol`, `itol/family.itol`, `itol/genus.itol`: taxonomy colour strips.",
+        "- `itol/dataset_membership.itol`: dataset-of-origin colour strip.",
+        "- `itol/novelty.itol`: novelty/nearest-identity colour strip.",
+        "- `assessment/neighbourhoods/clade_*.png`: compact labelled subtrees with selection-set role/rank and MSA pident to the P1 isolate. Nearest baseline hits are forced into the displayed context.",
+        "- `assessment/neighbourhoods/clade_*_pairwise_pident.tsv`: all displayed leaf-to-leaf MSA percent identities and compared-column counts.",
+        "- `assessment/neighbourhoods/neighbourhood_manifest.tsv`: maps each assessed ID to its figure/pident table, P1 identity anchor, forced baseline hits, and displayed context.",
         "",
         "BranchManager keeps iTOL `DATASET_COLORSTRIP` files only. Older branch `TREE_COLORS` and symbol-strip variants duplicated the same metadata and are removed to keep outputs readable.",
         "",
@@ -460,49 +502,52 @@ def _write_output_explanations(outdir: str):
     # mapping of filename substrings (lowercase) to explanation text
     patterns = [
         ('tree_taxonomy.tsv', 'Combined taxonomy TSV used for tree/iTOL metadata. Columns: ID\tTaxon\tConfidence.'),
-        ('combined_taxonomy.tsv', 'Combined taxonomy TSV. Columns: ID\tTaxon\tConfidence. Used to generate iTOL color/legend files.'),
-        ('loaded_baseline_taxonomy.tsv', 'Combined taxonomy TSV for baseline/provided datasets loaded before evaluate. Columns: ID\tTaxon\tConfidence.'),
-        ('preload_combined_taxonomy.tsv', 'Combined taxonomy TSV for preload dataset. Columns: ID\tTaxon\tConfidence.'),
+        ('combined_taxonomy.tsv', 'Combined taxonomy TSV. Columns: ID\tTaxon\tConfidence. Used to generate iTOL colour/legend files.'),
+        ('loaded_baseline_taxonomy.tsv', 'Combined taxonomy TSV for baseline/provided datasets loaded before Performance Review. Columns: ID\tTaxon\tConfidence.'),
+        ('filing_cabinet_combined_taxonomy.tsv', 'Combined taxonomy TSV for the Filing Cabinet baseline. Columns: ID\tTaxon\tConfidence.'),
         ('all_databases.tsv', 'Per-sequence taxonomic assignments from every configured reference database.'),
         ('baseline_hits.tsv', 'Nearest-hit report against baseline/provided datasets such as Hungate.'),
-        ('nearest_all_known_hits_raw.tsv', 'Raw nearest-hit novelty table against all non-current DB datasets; baseline-specific hits are summarised in baseline_hits.tsv and novelty_metrics.tsv.'),
+        ('nearest_project_hits_raw.tsv', 'Raw nearest-hit table produced for the newest submission; rolling project and baseline comparisons are summarised in novelty_metrics.tsv.'),
         ('qc_rejections.tsv', 'Per-sequence QC rejection table. Columns: ID, Length, NCount, Reasons, MinLength, MaxN. Reasons explain exactly why each sequence was filtered before downstream analysis.'),
-        ('partner_metadata_warnings.tsv', 'Warnings from --partner-metadata mapping. Rows indicate metadata IDs not found in the current run, or run sequences missing from the partner metadata table.'),
+        ('partner_metadata_warnings.tsv', 'Warnings from --partner-metadata mapping. Rows indicate metadata IDs not found in the project database/current run, baseline IDs supplied as partner metadata, or current-run sequences missing from the metadata table.'),
+        ('marker_qc_provenance.tsv', 'Per-isolate bridge from Paper Trail/Merge Meeting raw reads and marker QC into Performance Review, including source checksums, manual review, and chimera call.'),
+        ('chimera_screen.tsv', 'Reference-UCHIME marker screen. CHIMERA, INDETERMINATE, SKIPPED, or NOT_RUN calls force selection evidence to review.'),
+        ('decision_changes.tsv', 'Difference between the two latest stored assessment snapshots, including recommendation, set role, pangenome gap, and tracked evidence changes.'),
+        ('run_manifest.json', 'Machine-readable workflow manifest with input/output SHA256 checksums, software/tool versions, stage status, timestamps, warnings, and failure details.'),
+        ('performance_review_dashboard.html', 'Compact linked decision dashboard for the current Performance Review/Hiring Panel.'),
         ('qc.stats', 'QC summary with total input, kept count, rejection counts, min_len, max_n, and pointer to qc_rejections.tsv when available.'),
         ('user_id_map.tsv', 'Mapping of runtime sequence IDs to original headers produced when inserting user sequences into the DB. When shortening is disabled these usually match.'),
-        ('preload_id_map.tsv', 'Mapping of preload runtime IDs back to original FASTA headers. Use this to trace tree labels back to source records.'),
+        ('filing_cabinet_id_map.tsv', 'Mapping of Filing Cabinet runtime IDs back to original FASTA headers. Use this to trace tree labels back to source records.'),
         ('*_id_map.tsv', 'ID map mapping original headers to runtime DB ids. Useful for iTOL and metadata tracing.'),
         ('collapsed_map.tsv', 'Cluster map for collapsed sequences: rep_id\ttaxonomy\tcount.'),
-        ('preload_collapsed_map.tsv', 'Cluster map for preload collapsed sequences: rep_id\ttaxonomy\tcount.'),
+        ('filing_cabinet_collapsed_map.tsv', 'Cluster map for collapsed Filing Cabinet sequences: rep_id\ttaxonomy\tcount.'),
         ('collapsed_members.tsv', 'Member->representative mapping (member\trep) for collapsed clusters.'),
-        ('preload_collapsed_members.tsv', 'Member->representative mapping for preload collapsed clusters.'),
+        ('filing_cabinet_collapsed_members.tsv', 'Member-to-representative mapping for collapsed Filing Cabinet clusters.'),
         ('derep_short.fasta', 'Dereplicated FASTA where sequence headers are the runtime IDs used by the DB. These are preserved source IDs unless --shorten-ids was requested.'),
         ('derep_short_collapsed.fasta', 'Dereplicated FASTA after collapse; representatives for clusters kept with runtime IDs.'),
-        ('preload_short_collapsed.fasta', 'Collapsed preload FASTA; representatives retained for tree building.'),
+        ('filing_cabinet_collapsed.fasta', 'Collapsed Filing Cabinet FASTA; representatives retained for tree building.'),
         ('novelty_matches.tsv', 'vsearch BLAST-like output used to compute nearest-neighbour novelty identities.'),
         ('novelty_metrics.tsv', (
             'Per-sequence novelty metrics. The leading Nearest*/NoveltyScore columns mirror the '
             'baseline/cultured comparison when available; explicit Baseline* columns compare against '
-            'datasets such as Hungate, and AllKnown* columns compare against every non-current dataset '
+            'datasets such as Hungate, and Project* columns compare against all partner candidates '
             'stored in the DB. Reference* columns compare against the external reference FASTA, usually '
-            'GTDB. PartnerID/SelectedForGenomeSequencing and SelectedGenome*/GenomeSequencing* columns '
-            'add rolling WGS-selection context. DensitySource columns name the comparison pool.'
+            'GTDB. GenomeCollection* and Pangenome* columns add rolling genome-coverage context. '
+            'DensitySource columns name the comparison pool.'
         )),
         ('sequence_assessment.tsv', (
             'Unified per-sequence assessment. '
             'COLUMN GROUPS: '
-            '(1) TAXONOMY/CLASSIFICATION — Taxonomy, ClassificationHit, ClassificationIdentity, '
-            'ClassificationConfidence: derived from the primary reference database (GTDB/SILVA). '
-            'ClassificationHit is the reference accession vsearch matched. '
+            '(1) TAXONOMY/CLASSIFICATION — GTDBTaxonomy, GTDBClassificationHit, '
+            'GTDBClassificationIdentity, GTDBClassificationConfidence: authoritative GTDB assignment. '
             'Repeated as Taxonomy_<DB>, ClassificationHit_<DB>, Identity_<DB>, Confidence_<DB> '
             'for each additional --alt-ref database. '
             '(2) NOVELTY — NearestHit, NearestIdentity, MatchesGE*, NoveltyScore, Crowding, '
             'SequencingPriority: baseline/cultured novelty when a baseline pool exists. '
-            'AllKnown* columns repeat the same metrics against all non-current DB datasets. '
+            'Project* columns repeat the same metrics against the rolling partner collection. '
             'Reference* columns repeat the same metrics against the external taxonomy reference '
-            'FASTA, usually GTDB. PartnerID/SelectedForGenomeSequencing and GenomeSequencing* '
-            'columns report whether this isolate or a nearby 16S clade has already been selected '
-            'for WGS and provide a WGS-aware adjusted priority. '
+            'FASTA, usually GTDB. GenomeCollection* and Pangenome* columns report available '
+            'baseline genomes, already-sequenced partner genomes, and remaining same-species coverage. '
             '(3) TREE/CLUSTER — InTree, ClusterRepresentative, ClusterSize, ClusteredMembers: '
             'records whether the sequence entered the phylogenetic tree directly or was '
             'represented by a cluster representative after --collapse. '
@@ -510,25 +555,42 @@ def _write_output_explanations(outdir: str):
             'GTDB-based Most Wanted List matches and MWL priority contribution.'
         )),
         ('selection_summary.tsv', (
-            'Concise scientific-advisory-board selection table. Contains one row per evaluated '
-            'sequence with partner acronym, recommendation, WGS-adjusted priority, key novelty '
-            'identities, taxonomy/MWL evidence, selected-clade status, and a short rationale. '
+            'Concise scientific-advisory-board selection table. Contains one row per assessed '
+            'sequence with a transparent decision, marker evidence quality, cultured gap, project '
+            'coverage, external-reference context, taxonomy/MWL evidence, available-genome coverage, '
+            'local-tree figure, and a short rationale. '
             'Use sequence_assessment.tsv for the full audit trail.'
         )),
+        ('sequencing_sets.tsv', (
+            'Rolling clade-level genome-sequencing plan. Every candidate is assigned PRIMARY, BACKUP, '
+            'ALTERNATE, SEQUENCED, REVIEW_EVIDENCE, or TARGET_MET within an exact GTDB-species group '
+            'or an unresolved local-tree clade. PRIMARY rows fill the pangenome target; BACKUP rows '
+            'provide extraction-failure resilience and additional strain-level diversity. One '
+            'DIVERSITY_CANDIDATE may be retained after target completion when exceptional evidence remains.'
+        )),
+        ('neighbourhood_manifest.tsv', 'Maps each assessed sequence to its grouped local-clade image and pairwise-pident table, including the P1 identity anchor, forced nearest-baseline hits, displayed leaf count, assessed peers, baseline leaves, and already-sequenced leaves.'),
+        ('visual_report_manifest.tsv', 'Page index for Paper Trail PNG reports. Records each page file, read/isolate range, dimensions, configured height ceiling, and any split-isolate continuation.'),
+        ('read_error_profiles_page_', 'Height-bounded page of per-read Phred quality, trim windows, and internally masked low-quality regions.'),
+        ('trace_chromatograms_page_', 'Height-bounded page of AB1 dye-channel traces, retained windows, and mixed-peak markers.'),
+        ('assembly_overview_page_', 'Height-bounded page aligning every read to consensus coordinates, with read contribution, assembly status, and QC decision.'),
+        ('assembly_read_placements.tsv', 'Auditable per-read consensus coordinates and contribution status used by the assembly overview figures.'),
+        ('pairwise_pident.tsv', 'Long-form pairwise MSA percent identity for every displayed leaf pair. Identity is identical A/C/G/T bases divided by jointly unambiguous A/C/G/T MSA columns; ComparableACGTColumns reports the overlap denominator. Terminal gaps and ambiguous bases are excluded.'),
+        ('clade_', 'Local phylogenetic-neighbourhood image with full sequence IDs, recommendation role/rank labels, MSA pident to P1, dataset/taxonomy context, forced nearest-baseline markers, already-sequenced markers, and primary/backup recommendation stars.'),
+        ('clusters.csv', 'Consolidated cluster-membership table containing every cluster and member isolate, representative status, backup rank, taxonomy, novelty, crowding, phylogenetic isolation, and placement fields.'),
+        ('cluster_summary.tsv', 'One row per cluster with consensus taxonomy, novelty/crowding summaries, phylogenetic isolation, investigation score, and backup availability.'),
         ('mwl_matches.tsv', 'Most Wanted List match report. Contains sequences whose GTDB taxonomy matched an MWL taxon, with matched rank, MWL score, evaluation score, and functional role.'),
         ('taxonomy_input_warnings.tsv', 'Warnings about inconsistencies between the classifier reference FASTA and supplied taxonomy table.'),
         ('tree_build_warnings.tsv', 'Warnings about weak phylogenetic signal, missing anchors, or poor alignment quality.'),
         ('tree_orientation_summary.tsv', 'Sequence-level audit of tree-input orientation checks. Reports which sequences were kept forward, reverse-complemented, or lacked orientation evidence before alignment.'),
         ('placement_warnings.tsv', 'Warnings about low-support placements, low identity matches, or potentially artefactual novelty assignments.'),
         ('taxa_assignments_classout.tsv', 'Synthetic classification-like TSV created when --taxa-assignments provided. Columns: id\tbest\tidentity\ttaxon\tconfidence.'),
-        ('dataset_membership.itol', 'iTOL DATASET_COLORSTRIP mapping sequence IDs to dataset colors (membership).'),
-        ('novelty.itol', 'iTOL colorstrip showing novelty (nearest identity) for run sequences.'),
-        ('preload_dataset.itol', 'iTOL colorstrip for the preload dataset; maps preload ids to the dataset color.'),
-        ('itol_dataset_membership.itol', 'iTOL DATASET_COLORSTRIP mapping sequence IDs to dataset colors (membership).'),
-        ('itol_novelty.itol', 'iTOL colorstrip showing novelty (nearest identity) for run sequences.'),
-        ('itol_dataset_preload.itol', 'iTOL colorstrip for the preload dataset; maps preload ids to the dataset color.'),
+        ('dataset_membership.itol', 'iTOL DATASET_COLORSTRIP mapping sequence IDs to dataset colours (membership).'),
+        ('novelty.itol', 'iTOL colour strip showing novelty (nearest identity) for run sequences.'),
+        ('filing_cabinet_dataset.itol', 'iTOL colour strip for the Filing Cabinet dataset.'),
+        ('itol_dataset_membership.itol', 'iTOL DATASET_COLORSTRIP mapping sequence IDs to dataset colours (membership).'),
+        ('itol_novelty.itol', 'iTOL colour strip showing novelty (nearest identity) for run sequences.'),
         ('.nwk', 'Newick tree file (phylogenetic tree). Commonly named current_tree.nwk.'),
-        ('.itol', 'iTOL dataset file (text format) describing colors/strips/legends for visualization in iTOL.'),
+        ('.itol', 'iTOL dataset file (text format) describing colours/strips/legends for visualisation in iTOL.'),
         ('.log', 'Log file produced by the pipeline (branchmanager.log) containing debug/info messages')
     ]
 
@@ -641,18 +703,14 @@ def _unlink_glob(outdir: Path, pattern: str):
             pass
 
 
-def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
-    """Clean and organise evaluate/run outputs into high-level report folders."""
+def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
+    """Clean and organise Performance Review outputs into report folders."""
     out = Path(outdir)
     if not out.exists():
         return
 
-    # Remove redundant iTOL representations and bulky/raw classifier caches.
+    # Remove transient classifier outputs that are represented in final reports.
     for patt in (
-        'itol_*_symbols.itol',
-        'itol_*_tree_colors.txt',
-        'tree_colors_with_clades.txt',
-        'itol_combined_colors.csv',
         'matches*.tsv',
         'novelty_matches.tsv',
         'novelty_density_matches.tsv',
@@ -665,22 +723,29 @@ def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
     for name in (
         'sequence_assessment.tsv',
         'cluster_summary.tsv',
+        'clusters.csv',
         'backup_candidates.tsv',
         'placement_warnings.tsv',
         'novelty_metrics.tsv',
         'selection_summary.tsv',
+        'sequencing_sets.tsv',
         'rumen_functions_draft.tsv',
         'qc.stats',
         'qc_rejections.tsv',
         'partner_metadata_warnings.tsv',
     ):
         _move_if_exists(out, name, 'assessment')
-    _replace_path(out / 'clusters', out / 'assessment' / 'clusters')
+    for name in (
+        'marker_qc_provenance.tsv', 'chimera_screen.tsv', 'chimera_uchime.tsv',
+        'chimera_flagged.fasta', 'chimera_passed.fasta',
+    ):
+        _move_if_exists(out, name, 'quality')
+    _replace_path(out / 'neighbourhoods', out / 'assessment' / 'neighbourhoods')
     _move_if_exists(out, 'mwl_matches.tsv', 'assessment')
 
     # Direct baseline/provided-dataset nearest-hit reports.
     _move_if_exists(out, 'baseline_hits.tsv', 'baseline')
-    _move_if_exists(out, 'novelty.tsv', 'assessment', 'nearest_all_known_hits_raw.tsv')
+    _move_if_exists(out, 'novelty.tsv', 'assessment', 'nearest_project_hits_raw.tsv')
 
     # Taxonomy assignment reports.
     primary_name = primary_db_name or 'primary'
@@ -702,7 +767,7 @@ def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
     # Tree/MSA deliverables for iTOL upload.
     for name in (
         'current_tree.nwk',
-        'current_tree_labeled.nwk',
+        'current_tree_labelled.nwk',
         'current_alignment.fasta',
         'tree_build_warnings.tsv',
         'tree_orientation_summary.tsv',
@@ -712,13 +777,13 @@ def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
 
     # One iTOL metadata dataset per metadata type.
     itol_renames = {
-        'itol_phylum_colors.itol': 'phylum.itol',
-        'itol_family_colors.itol': 'family.itol',
-        'itol_genus_colors.itol': 'genus.itol',
+        'itol_phylum_colours.itol': 'phylum.itol',
+        'itol_family_colours.itol': 'family.itol',
+        'itol_genus_colours.itol': 'genus.itol',
         'itol_dataset_membership.itol': 'dataset_membership.itol',
         'itol_novelty.itol': 'novelty.itol',
-        'itol_user_colors.itol': 'user_colors.itol',
-        'itol_dataset_preload.itol': 'preload_dataset.itol',
+        'itol_user_colours.itol': 'user_colours.itol',
+        'filing_cabinet_dataset.itol': 'filing_cabinet_dataset.itol',
     }
     for src_name, dst_name in itol_renames.items():
         _move_if_exists(out, src_name, 'itol', dst_name)
@@ -732,25 +797,25 @@ def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
     _move_glob(out, 'itol_func_*.itol', 'itol', rename=_rename_function_itol)
 
     # Stable ID maps and run-sequence processing artefacts.
-    for name in ('user_id_map.tsv', 'preload_id_map.tsv'):
+    for name in ('user_id_map.tsv', 'filing_cabinet_id_map.tsv'):
         _move_if_exists(out, name, 'ids')
 
-    # Baseline preload internals: keep useful reports, drop raw matches/ref cache.
-    baseline_preload = out / 'baseline_preload'
-    if baseline_preload.exists():
-        _replace_path(baseline_preload / 'baseline_id_map.tsv', out / 'ids' / 'baseline_id_map.tsv')
+    # Inline Filing Cabinet internals: keep useful reports, drop raw matches/ref cache.
+    baseline_filing_cabinet = out / 'filing_cabinet_baseline'
+    if baseline_filing_cabinet.exists():
+        _replace_path(baseline_filing_cabinet / 'baseline_id_map.tsv', out / 'ids' / 'baseline_id_map.tsv')
         _replace_path(
-            baseline_preload / 'baseline_combined_taxonomy.tsv',
+            baseline_filing_cabinet / 'baseline_combined_taxonomy.tsv',
             out / 'baseline' / 'loaded_baseline_taxonomy.tsv',
         )
         _replace_path(
-            baseline_preload / 'taxonomy.tsv',
+            baseline_filing_cabinet / 'taxonomy.tsv',
             out / 'baseline' / 'loaded_baseline_classification.tsv',
         )
-        for src in sorted(baseline_preload.glob('preload_*_seqs.fasta')):
+        for src in sorted(baseline_filing_cabinet.glob('filing_cabinet_*_sequences.fasta')):
             _replace_path(src, out / 'baseline' / src.name)
         try:
-            shutil.rmtree(baseline_preload)
+            shutil.rmtree(baseline_filing_cabinet)
         except Exception:
             pass
 
@@ -762,13 +827,14 @@ def _organize_run_outputs(outdir: str, *, primary_db_name: str | None = None):
         'collapsed_map.tsv',
         'collapsed_members.tsv',
         'submitted_sequences.fasta',
-        'db_preload_seqs.fasta',
+        'project_collection_reference.fasta',
         'density_query_db.fasta',
         'db_sequences.fasta',
         'combined_input.fasta',
         'new_sequences.fasta',
         'combined_aln.fasta',
         'tree_orientation_ref.fasta',
+        'rolling_candidate_sequences.fasta',
         'id_map.tsv',
     ):
         _move_if_exists(out, name, 'intermediate')
@@ -787,7 +853,7 @@ def _classification_ids_matching_kingdom(classification_tsv: str, kingdom: str):
 def _normalise_sequence_domain(value: str | None) -> str | None:
     if value is None:
         return None
-    got = normalize_domain_query(str(value))
+    got = normalise_domain_query(str(value))
     if got in ('', 'none', 'all', 'mixed'):
         return None
     return got
@@ -818,7 +884,7 @@ def _prune_dataset_by_kingdom(db: Database, dataset: str, kingdom: str | None, l
     return deleted
 
 
-def _load_evaluate_baseline(
+def _load_performance_review_baseline(
     args,
     db: Database,
     outdir: str,
@@ -839,7 +905,8 @@ def _load_evaluate_baseline(
         )
 
     log = logging.getLogger(__name__)
-    baseline_out = Path(outdir) / 'baseline_preload'
+    db.upsert_dataset_role(baseline_dataset, 'baseline', genomes_available=True)
+    baseline_out = Path(outdir) / 'filing_cabinet_baseline'
     baseline_out.mkdir(parents=True, exist_ok=True)
 
     log.info(
@@ -848,10 +915,10 @@ def _load_evaluate_baseline(
         baseline_dataset,
         run_dataset or '(current run)',
     )
-    alias_entries, mapped_fasta = db.preload_from_files(
+    alias_entries, mapped_fasta = db.register_filing_cabinet(
         baseline_fasta,
         taxa_tsv=None,
-        color_csv=getattr(args, 'baseline_colors', None),
+        colour_csv=getattr(args, 'baseline_colours', None),
         source='baseline',
         dataset=baseline_dataset,
         outdir=str(baseline_out),
@@ -888,8 +955,11 @@ def _load_evaluate_baseline(
                 source_fasta_path=baseline_fasta,
             )
         except Exception as e:
-            log.warning("[BASELINE] Failed to read baseline taxonomy assignments %s: %s", baseline_assignment_tsv, e)
-            tax_entries = []
+            raise RuntimeError(f'Failed to read baseline taxonomy assignments {baseline_assignment_tsv}: {e}') from e
+        if not tax_entries:
+            raise RuntimeError(
+                f'No baseline taxonomy rows mapped to {baseline_dataset}; check baseline FASTA/table IDs.'
+            )
         if tax_entries:
             db.insert_taxonomy(tax_entries)
             log.info("[BASELINE] Inserted/updated taxonomy for %d baseline ids", len(tax_entries))
@@ -920,7 +990,7 @@ def _load_evaluate_baseline(
                     db.insert_distances(dist_entries)
                     log.info("[BASELINE] Inserted/updated nearest-reference distances for %d baseline ids", len(dist_entries))
             except Exception as e:
-                log.warning("[BASELINE] Baseline classification failed: %s", e)
+                raise RuntimeError(f'Baseline classification failed: {e}') from e
     else:
         log.info("[BASELINE] --baseline-skip-classify set; baseline loaded without taxonomy classification")
 
@@ -929,7 +999,7 @@ def _load_evaluate_baseline(
         try:
             _prune_dataset_by_kingdom(db, baseline_dataset, baseline_domain, '[BASELINE]')
         except Exception as e:
-            log.warning("[BASELINE] Domain-based pruning failed: %s", e)
+            raise RuntimeError(f'Baseline domain filtering failed: {e}') from e
 
     try:
         combined_tax = baseline_out / 'baseline_combined_taxonomy.tsv'
@@ -1000,6 +1070,16 @@ def _store_alt_taxonomy_in_db(db: Database, all_results: dict, main_db_name: str
                 log.info("[DB] Stored %d alt-db taxonomy entries for ref_db=%s", len(alt_entries), db_name)
             except Exception as e:
                 log.warning("[DB] Failed to store alt-db taxonomy for %s: %s", db_name, e)
+        evidence = []
+        for qid, row in results.items():
+            if not isinstance(row, (tuple, list)) or len(row) < 11:
+                continue
+            evidence.append({
+                'sequence_id': qid, 'ref_db': db_name, 'best_hit': row[0], 'identity': row[1],
+                'query_coverage': row[4], 'target_coverage': row[5], 'alignment_length': row[6],
+                'query_length': row[7], 'target_length': row[8], 'mismatches': row[9], 'gaps': row[10],
+            })
+        db.upsert_classification_evidence(evidence)
 
 
 def _resolve_reference_inputs(
@@ -1060,7 +1140,24 @@ def _resolve_reference_inputs(
     return effective_ref, effective_taxa, assignments_tsv
 
 
-def cmd_preload(args):
+def _resolve_novelty_baseline_datasets(db, args) -> list[str]:
+    """Return every registered cultured baseline plus explicit current-run additions."""
+    roles = db.get_dataset_roles()
+    names = [
+        name for name, details in roles.items()
+        if details.get('role') == 'baseline'
+    ]
+    default_name = getattr(args, 'baseline_dataset', None)
+    if default_name and (
+        getattr(args, 'baseline_fasta', None)
+        or roles.get(default_name, {}).get('role') == 'baseline'
+    ):
+        names.append(default_name)
+    names.extend(getattr(args, 'novelty_baseline_datasets', None) or [])
+    return list(dict.fromkeys(str(name) for name in names if str(name).strip()))
+
+
+def _cmd_filing_cabinet_impl(args):
     db = Database(args.db)
     db.initialise()
     outdir = args.out or '.'
@@ -1068,33 +1165,38 @@ def cmd_preload(args):
     requested_kingdom = _sequence_domain_filter(args)
     os.makedirs(outdir, exist_ok=True)
     _configure_logging(outdir)
-    logging.getLogger(__name__).info("[PRELOAD] Starting preload into %s", args.db)
+    logging.getLogger(__name__).info("[FILING CABINET] Starting baseline registration in %s", args.db)
     logging.getLogger(__name__).info(
-        "[PRELOAD] Sequence-domain profile: %s",
+        "[FILING CABINET] Sequence-domain profile: %s",
         _sequence_domain_label(requested_kingdom),
     )
+    db.upsert_dataset_role(
+        getattr(args, 'dataset', 'Baseline'),
+        'baseline',
+        genomes_available=True,
+    )
 
-    alias_entries, mapped_fasta = db.preload_from_files(
+    alias_entries, mapped_fasta = db.register_filing_cabinet(
         args.fasta,
         taxa_tsv=getattr(args, 'taxa', None),
-        color_csv=getattr(args, 'colors', None),
-        source='preload',
-        dataset=getattr(args, 'dataset', 'preload'),
+        colour_csv=getattr(args, 'colours', None),
+        source='filing_cabinet',
+        dataset=getattr(args, 'dataset', 'Baseline'),
         outdir=outdir,
         shorten_ids=bool(getattr(args, 'shorten_ids', False)),
     )
     try:
         if alias_entries:
-            preload_map_path = _write_id_map_tsv(Path(outdir) / 'preload_id_map.tsv', alias_entries)
-            logging.getLogger(__name__).info('[PRELOAD] Wrote preload id mapping to %s', preload_map_path)
+            id_map_path = _write_id_map_tsv(Path(outdir) / 'filing_cabinet_id_map.tsv', alias_entries)
+            logging.getLogger(__name__).info('[FILING CABINET] Wrote baseline ID mapping to %s', id_map_path)
     except Exception as e:
-        logging.getLogger(__name__).warning('[PRELOAD] Could not write preload id mapping file: %s', e)
+        logging.getLogger(__name__).warning('[FILING CABINET] Could not write baseline ID mapping file: %s', e)
     effective_ref, effective_taxa_tsv, assignment_tsv = _resolve_reference_inputs(
         getattr(args, 'ref', None),
         getattr(args, 'taxa', None),
         getattr(args, 'taxa_assignments', None),
         source_fasta_path=args.fasta,
-        log_prefix='[PRELOAD]',
+        log_prefix='[FILING CABINET]',
     )
     classification_requested = bool(getattr(args, 'classify', False) or (getattr(args, 'taxa_assignments', None) and not assignment_tsv))
 
@@ -1103,7 +1205,7 @@ def cmd_preload(args):
     # taxonomy columns; TSV, CSV, and .gz variants are supported.
     if assignment_tsv:
         taxa_file = assignment_tsv
-        logging.getLogger(__name__).info("[PRELOAD] Using taxa assignments from %s (skipping classifier)", taxa_file)
+        logging.getLogger(__name__).info("[FILING CABINET] Using taxa assignments from %s (skipping classifier)", taxa_file)
         # build mapping orig->short from alias_entries
         orig_to_short = _build_orig_to_short(alias_entries)
         try:
@@ -1111,26 +1213,31 @@ def cmd_preload(args):
                 taxa_file,
                 orig_to_short,
                 db,
-                getattr(args, 'dataset', 'preload'),
+                getattr(args, 'dataset', 'Baseline'),
                 source_fasta_path=args.fasta,
             )
         except Exception as e:
-            logging.getLogger(__name__).warning("[PRELOAD] Failed to read taxa assignments file %s: %s", taxa_file, e)
-            tax_entries = []
+            raise RuntimeError(f'Could not read Filing Cabinet taxonomy assignments {taxa_file}: {e}') from e
 
-        if tax_entries:
-            db.insert_taxonomy(tax_entries)
-            logging.getLogger(__name__).info("[PRELOAD] Inserted/updated taxonomy for %d preloaded ids from taxa_assignments", len(tax_entries))
+        if not tax_entries:
+            raise RuntimeError(
+                f'Filing Cabinet taxonomy assignments {taxa_file} did not map to any baseline sequence IDs'
+            )
+        db.insert_taxonomy(tax_entries)
+        logging.getLogger(__name__).info("[FILING CABINET] Inserted/updated taxonomy for %d baseline IDs from taxa_assignments", len(tax_entries))
 
     # If classification requested, run classifier on the mapped fasta (short ids)
     # unless the user supplied a taxa assignments table, in which case use that
     # instead and skip running the external classifier.
     if classification_requested and not assignment_tsv:
         if not effective_ref:
-            logging.getLogger(__name__).info("[PRELOAD] Classification requested but no reference FASTA was provided via --ref or --taxa-assignments; skipping classification")
+            raise RuntimeError(
+                'Filing Cabinet classification was requested but no reference FASTA was provided '
+                'via --ref or --taxa-assignments'
+            )
         else:
             input_for_classify = str(mapped_fasta) if mapped_fasta else args.fasta
-            logging.getLogger(__name__).info("[PRELOAD] Classifying preloaded fasta %s against %s", input_for_classify, effective_ref)
+            logging.getLogger(__name__).info("[FILING CABINET] Classifying baseline FASTA %s against %s", input_for_classify, effective_ref)
 
             alt_databases = _build_alt_databases(args)
             ref_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
@@ -1139,7 +1246,7 @@ def cmd_preload(args):
 
             if alt_databases:
                 logging.getLogger(__name__).info(
-                    "[PRELOAD] Multi-database classification: primary=%s, alt=%s, main=%s",
+                    "[FILING CABINET] Multi-database classification: primary=%s, alt=%s, main=%s",
                     ref_name, [n for _, _, n in alt_databases], main_db,
                 )
                 class_out, all_results = classify.run_all_classifications(
@@ -1156,68 +1263,67 @@ def cmd_preload(args):
                 class_out = classify.run_classification(input_for_classify, outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
 
             # parse classification output and persist taxonomy/distances only for
-            # the preloaded sequence ids (short ids present in the DB)
+            # the registered baseline sequence IDs (short ids present in the DB)
             orig_to_short = _build_orig_to_short(alias_entries)
             try:
                 tax_entries, dist_entries = load_classification_results_for_dataset(
                     class_out,
                     orig_to_short,
                     db,
-                    getattr(args, 'dataset', 'preload'),
+                    getattr(args, 'dataset', 'Baseline'),
                 )
 
                 if tax_entries:
                     db.insert_taxonomy(tax_entries)
-                    logging.getLogger(__name__).info("[PRELOAD] Inserted/updated taxonomy for %d preloaded ids", len(tax_entries))
+                    logging.getLogger(__name__).info("[FILING CABINET] Inserted/updated taxonomy for %d baseline IDs", len(tax_entries))
                 if dist_entries:
                     db.insert_distances(dist_entries)
-                    logging.getLogger(__name__).info("[PRELOAD] Inserted/updated distances for %d preloaded ids", len(dist_entries))
+                    logging.getLogger(__name__).info("[FILING CABINET] Inserted/updated distances for %d baseline IDs", len(dist_entries))
             except Exception as e:
-                logging.getLogger(__name__).warning("[PRELOAD] Failed to parse classification output: %s", e)
+                raise RuntimeError(f'Could not persist Filing Cabinet classification output: {e}') from e
 
     # Apply the active sequence-domain profile before tree building so the
     # backbone tree is domain-specific.
     try:
         _prune_dataset_by_kingdom(
             db,
-            getattr(args, 'dataset', 'preload'),
+            getattr(args, 'dataset', 'Baseline'),
             requested_kingdom,
-            '[PRELOAD]',
+            '[FILING CABINET]',
         )
     except Exception as e:
-        logging.getLogger(__name__).warning("[PRELOAD] Domain-based pruning failed: %s", e)
+        raise RuntimeError(f'Filing Cabinet domain filtering failed: {e}') from e
 
-    # Optionally build a baseline tree/alignment from the preloaded sequences
+    # Optionally build a baseline tree/alignment from the registered baseline sequences
     if getattr(args, 'build_tree', False):
         try:
             # prefer mapped fasta (short ids) if present
             user_fasta = str(mapped_fasta) if mapped_fasta else args.fasta
             if requested_kingdom:
                 try:
-                    allowed_ids = _dataset_sequence_ids(db, getattr(args, 'dataset', 'preload'))
-                    domain_fasta = Path(outdir) / f'preload_{requested_kingdom}_seqs.fasta'
+                    allowed_ids = _dataset_sequence_ids(db, getattr(args, 'dataset', 'Baseline'))
+                    domain_fasta = Path(outdir) / f'filing_cabinet_{requested_kingdom}_sequences.fasta'
                     kept = _filter_fasta_to_ids(user_fasta, domain_fasta, allowed_ids)
                     if kept:
                         logging.getLogger(__name__).info(
-                            "[PRELOAD] Filtered preload tree FASTA to %d %s sequence(s): %s",
+                            "[FILING CABINET] Filtered baseline tree FASTA to %d %s sequence(s): %s",
                             kept,
                             requested_kingdom,
                             domain_fasta,
                         )
                         user_fasta = str(domain_fasta)
                     else:
-                        logging.getLogger(__name__).warning(
-                            "[PRELOAD] Domain filter %s left no FASTA records for tree building; using unfiltered FASTA",
-                            requested_kingdom,
+                        raise RuntimeError(
+                            f'Filing Cabinet domain filter {requested_kingdom} left no sequences for tree building'
                         )
                 except Exception as e:
-                    logging.getLogger(__name__).warning("[PRELOAD] Failed to filter tree FASTA by domain: %s", e)
+                    raise RuntimeError(f'Could not prepare domain-filtered Filing Cabinet tree FASTA: {e}') from e
 
-            # optionally collapse preloaded sequences before building tree
+            # optionally collapse registered baseline sequences before building tree
             if getattr(args, 'collapse', False):
                 # require classification to be run for safe taxon-based collapsing
                 if not (classification_requested or assignment_tsv):
-                    logging.getLogger(__name__).warning("[PRELOAD COLLAPSE] --collapse requires --classify to be set for safe taxon grouping; skipping collapse")
+                    raise RuntimeError('--collapse requires Filing Cabinet taxonomy assignments or --classify')
                 else:
                     try:
                         threshold = float(getattr(args, 'collapse_threshold', 99.9))
@@ -1229,7 +1335,7 @@ def cmd_preload(args):
                     try:
                         with db.connect() as conn:
                             cur = conn.cursor()
-                            cur.execute("SELECT s.id, t.taxonomy FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id WHERE s.dataset = ?", (getattr(args, 'dataset', 'preload'),))
+                            cur.execute("SELECT s.id, t.taxonomy FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id WHERE s.dataset = ?", (getattr(args, 'dataset', 'Baseline'),))
                             for rid, tax in cur.fetchall():
                                 qid_to_tax[rid] = tax
                     except Exception:
@@ -1245,22 +1351,23 @@ def cmd_preload(args):
                     except Exception:
                         taxa_groups = {None: []}
                     try:
-                        artifacts = collapse_fasta_within_taxa(
+                        artefacts = collapse_fasta_within_taxa(
                             taxa_groups,
                             outdir,
-                            'preload_short_collapsed.fasta',
-                            'preload_collapsed_map.tsv',
-                            'preload_collapsed_members.tsv',
+                            'filing_cabinet_collapsed.fasta',
+                            'filing_cabinet_collapsed_map.tsv',
+                            'filing_cabinet_collapsed_members.tsv',
                             threshold=threshold,
                             threads=threads,
-                            log_prefix='[PRELOAD COLLAPSE]',
+                            log_prefix='[FILING CABINET COLLAPSE]',
+                            strict=True,
                         )
-                        user_fasta = artifacts.collapsed_path
-                        logging.getLogger(__name__).info("[PRELOAD COLLAPSE] Wrote collapsed preload fasta %s (reps=%d)", user_fasta, len(artifacts.collapsed_records))
+                        user_fasta = artefacts.collapsed_path
+                        logging.getLogger(__name__).info("[FILING CABINET COLLAPSE] Wrote collapsed baseline FASTA %s (reps=%d)", user_fasta, len(artefacts.collapsed_records))
                     except Exception as e:
-                        logging.getLogger(__name__).warning("[PRELOAD COLLAPSE] Failed to write collapsed preload fasta: %s", e)
+                        raise RuntimeError(f'Filing Cabinet collapse failed: {e}') from e
 
-            logging.getLogger(__name__).info("[PRELOAD] Building baseline tree/alignment in %s from preloaded sequences", outdir)
+            logging.getLogger(__name__).info("[FILING CABINET] Building baseline tree/alignment in %s from registered baseline sequences", outdir)
             tree.initialise_or_update_tree(
                 ref_fasta=effective_ref,
                 user_fasta=user_fasta,
@@ -1270,44 +1377,44 @@ def cmd_preload(args):
                 anchor_file=getattr(args, 'anchors', None),
                 tree_method=getattr(args, 'tree_method', 'fasttree'),
             )
-            logging.getLogger(__name__).info("[PRELOAD] Baseline tree/alignment written to %s", outdir)
+            logging.getLogger(__name__).info("[FILING CABINET] Baseline tree/alignment written to %s", outdir)
             try:
                 warning_rows = tree.collect_tree_build_warnings(user_fasta=str(user_fasta), anchor_file=getattr(args, 'anchors', None), db=None)
-                warning_rows.extend(tree.summarize_alignment_quality(str(Path(outdir) / 'current_alignment.fasta')))
+                warning_rows.extend(tree.summarise_alignment_quality(str(Path(outdir) / 'current_alignment.fasta')))
                 if warning_rows:
                     warn_path = tree.write_tree_warning_tsv(outdir, warning_rows)
-                    logging.getLogger(__name__).warning("[PRELOAD] Tree/alignment warnings written to %s", warn_path)
+                    logging.getLogger(__name__).warning("[FILING CABINET] Tree/alignment warnings written to %s", warn_path)
             except Exception as e:
-                logging.getLogger(__name__).warning("[PRELOAD] Failed to summarise tree/alignment quality: %s", e)
+                logging.getLogger(__name__).warning("[FILING CABINET] Failed to summarise tree/alignment quality: %s", e)
         except Exception as e:
-            logging.getLogger(__name__).warning("[PRELOAD] Failed to build baseline tree: %s", e)
+            raise RuntimeError(f'Filing Cabinet tree construction failed: {e}') from e
 
-    # If kingdom filter requested for preload, remove any preloaded sequences
+    # If a sequence-domain filter is requested for the Filing Cabinet, remove any registered baseline sequences
     # whose assigned taxonomy indicates they are not the requested kingdom.
     try:
         _prune_dataset_by_kingdom(
             db,
-            getattr(args, 'dataset', 'preload'),
+            getattr(args, 'dataset', 'Baseline'),
             requested_kingdom,
-            '[PRELOAD]',
+            '[FILING CABINET]',
         )
     except Exception as e:
-        logging.getLogger(__name__).warning("[PRELOAD] Kingdom-based pruning failed: %s", e)
+        raise RuntimeError(f'Final Filing Cabinet domain validation failed: {e}') from e
 
-    # Build combined taxonomy and generate iTOL color files for the preload dataset.
+    # Build combined taxonomy and generate iTOL colour files for the Filing Cabinet dataset.
     try:
         out_p = Path(outdir)
-        combined_tax = out_p / 'preload_combined_taxonomy.tsv'
+        combined_tax = out_p / 'filing_cabinet_combined_taxonomy.tsv'
         if not combined_tax.exists():
             try:
                 with db.connect() as conn:
                     cur = conn.cursor()
-                    cur.execute("SELECT s.id, t.taxonomy, t.confidence FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id WHERE s.dataset = ?", (getattr(args, 'dataset', 'preload'),))
+                    cur.execute("SELECT s.id, t.taxonomy, t.confidence FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id WHERE s.dataset = ?", (getattr(args, 'dataset', 'Baseline'),))
                     rows = cur.fetchall()
                 write_combined_taxonomy_tsv(combined_tax, rows)
-                logging.getLogger(__name__).info("[PRELOAD] Wrote combined taxonomy for %d ids to %s", len(rows), combined_tax)
+                logging.getLogger(__name__).info("[FILING CABINET] Wrote combined taxonomy for %d ids to %s", len(rows), combined_tax)
             except Exception as e:
-                logging.getLogger(__name__).warning("[PRELOAD] Failed to build combined taxonomy: %s", e)
+                logging.getLogger(__name__).warning("[FILING CABINET] Failed to build combined taxonomy: %s", e)
 
         # Build id_map from alias_entries so the generator can emit short ids
         id_map = {}
@@ -1329,30 +1436,28 @@ def cmd_preload(args):
         try:
             tree_path = Path(outdir) / 'current_tree.nwk'
             tfile = str(tree_path) if tree_path.exists() else _find_tree_file_in_dir(outdir)
-            itol.generate_itol_colors(str(combined_tax), outdir, user_color_csv=getattr(args, 'colors', None), id_map=id_map, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
-            logging.getLogger(__name__).info("[PRELOAD] Generated iTOL color files in %s", outdir)
+            itol.generate_itol_colours(str(combined_tax), outdir, user_colour_csv=getattr(args, 'colours', None), id_map=id_map, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
+            logging.getLogger(__name__).info("[FILING CABINET] Generated iTOL colour files in %s", outdir)
         except TypeError:
             try:
-                itol.generate_itol_colors(str(combined_tax), outdir, user_color_csv=getattr(args, 'colors', None), phylum_groups=getattr(args, 'group_phyla', None))
-                logging.getLogger(__name__).info("[PRELOAD] Generated iTOL color files in %s (no id_map)", outdir)
+                itol.generate_itol_colours(str(combined_tax), outdir, user_colour_csv=getattr(args, 'colours', None), phylum_groups=getattr(args, 'group_phyla', None))
+                logging.getLogger(__name__).info("[FILING CABINET] Generated iTOL colour files in %s (no id_map)", outdir)
             except Exception as e:
-                logging.getLogger(__name__).warning("[PRELOAD] Failed to generate iTOL colors: %s", e)
+                logging.getLogger(__name__).warning("[FILING CABINET] Failed to generate iTOL colours: %s", e)
         except Exception as e:
-            logging.getLogger(__name__).warning("[PRELOAD] Failed to generate iTOL colors: %s", e)
+            logging.getLogger(__name__).warning("[FILING CABINET] Failed to generate iTOL colours: %s", e)
 
-        # ── Functional annotations (optional) ─────────────────────────────────
         try:
             func_tsv = getattr(args, 'functional', None)
             if func_tsv:
                 try:
                     written = itol.write_functional_annotations(str(func_tsv), outdir, id_map=id_map)
-                    logging.getLogger(__name__).info("[PRELOAD] Wrote functional annotation iTOL files: %s", ','.join(written) if written else '(none)')
+                    logging.getLogger(__name__).info("[FILING CABINET] Wrote functional annotation iTOL files: %s", ','.join(written) if written else '(none)')
                 except Exception as e:
-                    logging.getLogger(__name__).warning("[PRELOAD] Functional annotations generation failed: %s", e)
+                    logging.getLogger(__name__).warning("[FILING CABINET] Functional annotations generation failed: %s", e)
         except Exception:
             pass
 
-        # ── Draft rumen functional groups (optional) ──────────────────────────
         if getattr(args, 'draft_rumen_functions', False):
             try:
                 combined_tax_path = str(out_p / 'combined_taxonomy.tsv')
@@ -1361,54 +1466,147 @@ def cmd_preload(args):
                 )
                 if tsv_out:
                     logging.getLogger(__name__).info(
-                        "[PRELOAD] Draft rumen functional annotation: %s", tsv_out
+                        "[FILING CABINET] Draft rumen functional annotation: %s", tsv_out
                     )
                 if itol_out:
                     logging.getLogger(__name__).info(
-                        "[PRELOAD] Rumen functional iTOL file: %s", itol_out
+                        "[FILING CABINET] Rumen functional iTOL file: %s", itol_out
                     )
             except Exception as e:
                 logging.getLogger(__name__).warning(
-                    "[PRELOAD] Draft rumen functions generation failed: %s", e
+                    "[FILING CABINET] Draft rumen functions generation failed: %s", e
                 )
 
-        # Write a simple dataset colorstrip mapping preloaded ids to dataset color
         try:
-            ds_color = getattr(args, 'dataset_color', None) if hasattr(args, 'dataset_color') else None
-            if not ds_color:
-                # deterministic dataset-level color (use distinct palette)
-                ds_color = itol._name_to_dataset_color(getattr(args, 'dataset', 'preload'))
-            itol_path = out_p / 'itol_dataset_preload.itol'
-            dataset_label = getattr(args, 'dataset', 'preload')
+            ds_colour = itol._name_to_dataset_colour(getattr(args, 'dataset', 'Baseline'))
+            itol_path = out_p / 'filing_cabinet_dataset.itol'
+            dataset_label = getattr(args, 'dataset', 'Baseline')
             with db.connect() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT id FROM sequences WHERE dataset = ?", (getattr(args, 'dataset', 'preload'),))
-                id_to_color = {iid: ds_color for (iid,) in cur.fetchall()}
-            itol.write_dataset_colorstrip(str(itol_path), dataset_label, id_to_color, legend_title=f"{dataset_label} legend")
-            logging.getLogger(__name__).info("[PRELOAD] Wrote dataset ITOL colorstrip to %s", itol_path)
+                cur.execute("SELECT id FROM sequences WHERE dataset = ?", (getattr(args, 'dataset', 'Baseline'),))
+                id_to_colour = {iid: ds_colour for (iid,) in cur.fetchall()}
+            itol.write_dataset_colourstrip(str(itol_path), dataset_label, id_to_colour, legend_title=f"{dataset_label} legend")
+            logging.getLogger(__name__).info("[FILING CABINET] Wrote dataset iTOL colour strip to %s", itol_path)
         except Exception as e:
-            logging.getLogger(__name__).warning("[PRELOAD] Failed to write dataset iTOL colorstrip: %s", e)
+            logging.getLogger(__name__).warning("[FILING CABINET] Failed to write dataset iTOL colour strip: %s", e)
     except Exception:
         pass
 
-    # write brief explanations for files produced by preload
+    # write brief explanations for files produced by the Filing Cabinet
     try:
         _write_output_explanations(outdir)
     except Exception:
         pass
 
 
-def cmd_run(args):
+def cmd_filing_cabinet(args):
+    """Register the baseline Filing Cabinet without publishing a partial database."""
+    import fcntl
+    import sqlite3
+
+    outdir = Path(args.out or '.').expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    original = Path(args.db).expanduser().resolve()
+    original.parent.mkdir(parents=True, exist_ok=True)
+    manifest = RunManifest(outdir, 'filing_cabinet')
+    manifest.add_input(args.fasta, role='baseline_fasta')
+    for role, source in (
+        ('taxonomy', getattr(args, 'taxa', None)),
+        ('taxonomy_assignments', getattr(args, 'taxa_assignments', None)),
+        ('reference', getattr(args, 'ref', None)),
+        ('colours', getattr(args, 'colours', None)),
+        ('anchors', getattr(args, 'anchors', None)),
+        ('functional_annotations', getattr(args, 'functional', None)),
+    ):
+        if source:
+            manifest.add_input(source, role=role)
+    for source in getattr(args, 'alt_ref', None) or []:
+        manifest.add_input(source, role='alternate_reference')
+    for source in getattr(args, 'alt_taxa', None) or []:
+        manifest.add_input(source, role='alternate_reference_taxonomy')
+
+    staged_path = outdir / '.filing_cabinet_project.sqlite'
+    lock_path = original.with_name(original.name + '.lock')
+    with open(lock_path, 'a+') as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            staged_path.unlink(missing_ok=True)
+            if original.is_file():
+                manifest.add_input(original, role='project_database_before')
+                with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged_path)) as target:
+                    source.backup(target)
+            else:
+                Database(str(staged_path)).initialise()
+
+            staged_args = argparse.Namespace(**vars(args))
+            staged_args.db = str(staged_path)
+            manifest.add_stage('filing_cabinet', 'RUNNING')
+            _cmd_filing_cabinet_impl(staged_args)
+
+            staged_db = Database(str(staged_path))
+            staged_db.initialise()
+            with staged_db.connect() as conn:
+                integrity = conn.execute('PRAGMA integrity_check').fetchone()[0]
+                baseline_count = conn.execute(
+                    'SELECT COUNT(*) FROM sequences WHERE dataset = ?',
+                    (getattr(args, 'dataset', 'Baseline'),),
+                ).fetchone()[0]
+            if integrity != 'ok':
+                raise RuntimeError(f'staged Filing Cabinet database failed integrity_check: {integrity}')
+            if baseline_count < 1:
+                raise RuntimeError('Filing Cabinet registration produced no baseline sequences')
+
+            for role, path, required in (
+                ('id_map', outdir / 'filing_cabinet_id_map.tsv', False),
+                ('combined_taxonomy', outdir / 'filing_cabinet_combined_taxonomy.tsv', True),
+                ('alignment', outdir / 'current_alignment.fasta', bool(getattr(args, 'build_tree', False))),
+                ('tree', outdir / 'current_tree.nwk', bool(getattr(args, 'build_tree', False))),
+            ):
+                manifest.add_output(path, role=role, required=required)
+            missing = manifest.verify_required_outputs()
+            if missing:
+                raise RuntimeError('required Filing Cabinet outputs are missing: ' + ', '.join(missing))
+
+            manifest.add_stage('filing_cabinet', 'COMPLETE', detail=f'{baseline_count} baseline sequences')
+            manifest.finish('COMPLETE')
+            staged_db.record_project_run(
+                f'filing-cabinet:{manifest.data["started_at"]}', 'filing_cabinet', 'COMPLETE',
+                dataset=getattr(args, 'dataset', 'Baseline'), manifest_path=str(manifest.json_path),
+                started_at=manifest.data['started_at'], completed_at=manifest.data['completed_at'],
+            )
+
+            publish_tmp = original.with_name(original.name + '.publishing')
+            publish_tmp.unlink(missing_ok=True)
+            with sqlite3.connect(str(staged_path)) as source, sqlite3.connect(str(publish_tmp)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('published Filing Cabinet database failed integrity_check')
+            os.replace(publish_tmp, original)
+            staged_path.unlink(missing_ok=True)
+            manifest.add_output(original, role='project_database')
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    print(
+        f'[filing-cabinet] Registered {baseline_count} baseline sequence(s).\n'
+        f'  Project database: {original}\n'
+        f'  Backbone output : {outdir}'
+    )
+
+
+def _cmd_performance_review_impl(args):
     db = Database(args.db)
     db.initialise()
     outdir = args.out
     threads = int(getattr(args, 'threads', 4) or 4)
     os.makedirs(outdir, exist_ok=True)
     _configure_logging(outdir)
-    logging.getLogger(__name__).info("[RUN] Starting run pipeline (input=%s)", args.input)
+    logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Starting run pipeline (input=%s)", args.input)
     domain_filter = _sequence_domain_filter(args)
     logging.getLogger(__name__).info(
-        "[RUN] Sequence-domain profile: %s",
+        "[PERFORMANCE REVIEW] Sequence-domain profile: %s",
         _sequence_domain_label(domain_filter),
     )
     effective_ref, effective_taxa_tsv, assignment_tsv = _resolve_reference_inputs(
@@ -1416,17 +1614,27 @@ def cmd_run(args):
         getattr(args, 'taxa', None),
         getattr(args, 'taxa_assignments', None),
         source_fasta_path=args.input,
-        log_prefix='[RUN]',
+        log_prefix='[PERFORMANCE REVIEW]',
     )
     if not effective_ref:
-        raise SystemExit("[RUN] A reference FASTA is required via --ref, or `--taxa-assignments` must point to a GTDB/reference FASTA rather than a taxonomy assignment table.")
-    if getattr(args, 'command', None) in ('evaluate', 'eval') and not getattr(args, 'partner_metadata', None):
+        raise SystemExit("[PERFORMANCE REVIEW] A reference FASTA is required via --ref, or `--taxa-assignments` must point to a GTDB/reference FASTA rather than a taxonomy assignment table.")
+    if getattr(args, 'command', None) == 'performance-review' and not getattr(args, 'partner_metadata', None):
         raise SystemExit(
-            '[RUN] evaluate requires --partner-metadata / --sequencing-metadata: '
-            'a CSV/TSV sidecar table with sequence IDs, partner IDs, and WGS-selected status.'
+            '[PERFORMANCE REVIEW] --partner-metadata / --sequencing-metadata is required: '
+            'a cumulative CSV/TSV ledger with sequence IDs, partner acronyms, optional selection commitments, and already-sequenced status.'
         )
 
-    _load_evaluate_baseline(args, db, outdir, effective_ref, effective_taxa_tsv, threads)
+    _load_performance_review_baseline(args, db, outdir, effective_ref, effective_taxa_tsv, threads)
+    if (
+        hasattr(args, 'skip_chimera_check')
+        and getattr(args, 'command', None) == 'performance-review'
+    ):
+        baseline_datasets = db.get_dataset_names_by_role('baseline')
+        if not baseline_datasets:
+            raise SystemExit(
+                '[PERFORMANCE REVIEW] No cultured baseline is registered. Supply --baseline-fasta for this run '
+                'or establish it first with `branchmanager filing-cabinet`.'
+            )
 
     # QC
     qc_out = qc.run_qc(args.input, outdir, min_len=getattr(args, 'min_len', 800), max_n=getattr(args, 'max_n', 5))
@@ -1451,17 +1659,16 @@ def cmd_run(args):
     if kingdom:
         kingdom_text = str(kingdom)
         if not effective_ref:
-            logging.getLogger(__name__).warning("[RUN] --sequence-domain specified but no reference FASTA was available; cannot classify to filter; proceeding without domain filtering")
+            logging.getLogger(__name__).warning("[PERFORMANCE REVIEW] --sequence-domain specified but no reference FASTA was available; cannot classify to filter; proceeding without domain filtering")
             allowed_qids = None
         else:
             try:
-                logging.getLogger(__name__).info("[RUN] Running pre-insert classification on dereplicated fasta to filter by domain=%s", kingdom)
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Running pre-insert classification on dereplicated fasta to filter by domain=%s", kingdom)
                 early_class_out = classify.run_classification(str(derep_out), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
                 allowed_qids = _classification_ids_matching_kingdom(early_class_out, kingdom_text)
-                logging.getLogger(__name__).info("[RUN] Kingdom filter: %d dereplicated sequences match %s", len(allowed_qids), kingdom)
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Kingdom filter: %d dereplicated sequences match %s", len(allowed_qids), kingdom)
             except Exception as e:
-                logging.getLogger(__name__).warning("[RUN] Failed to run pre-insert classification for kingdom filtering: %s", e)
-                allowed_qids = None
+                raise SystemExit(f'[PERFORMANCE REVIEW] Domain classification/filtering failed: {e}')
 
     for h, s in read_fasta(derep_out):
         # if kingdom filtering is active, skip sequences that did not match
@@ -1477,16 +1684,20 @@ def cmd_run(args):
                 continue
 
         # If DB already contains this sequence ID (or another alias), we still
-        # want to include it in the tree for visualization, but we use the
+        # want to include it in the tree for visualisation, but we use the
         # existing DB ID so downstream taxonomy/metadata resolve consistently.
         # The "INSERT OR IGNORE" during insert_sequences will prevent DB duplicates.
         existing_id = db.resolve_sequence_id(h)
         if existing_id and existing_id in used_ids:
+            try:
+                db.assert_sequence_compatible(existing_id, s)
+            except ValueError as e:
+                raise SystemExit(f'[DB] {e}')
             skipped_existing += 1
             short = existing_id
             orig_to_short[h] = short
             try:
-                cid = canonicalize_sequence_id(h)
+                cid = canonicalise_sequence_id(h)
                 if cid:
                     orig_to_short[cid] = short
             except Exception:
@@ -1501,11 +1712,11 @@ def cmd_run(args):
                     shorten_ids=bool(getattr(args, 'shorten_ids', False)),
                 )
             except ValueError as e:
-                raise SystemExit(f"[RUN] {e}")
+                raise SystemExit(f"[PERFORMANCE REVIEW] {e}")
             mapped_records.append((short, s))
             orig_to_short[h] = short
             try:
-                cid = canonicalize_sequence_id(h)
+                cid = canonicalise_sequence_id(h)
                 if cid:
                     orig_to_short[cid] = short
             except Exception:
@@ -1515,9 +1726,13 @@ def cmd_run(args):
     write_fasta(mapped_records, str(mapped_derep))
     logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to runtime IDs and wrote %s", len(mapped_records), mapped_derep)
     if not mapped_records:
-        logging.getLogger(__name__).warning("[DB] No sequences were mapped — check if input sequences were filtered")
+        raise SystemExit(
+            '[PERFORMANCE REVIEW] No sequences passed sequence/domain QC. Project state was not accepted; '
+            'inspect qc.stats, classification, and the requested --sequence-domain.'
+        )
     # insert mapped records into DB (dataset provided by user)
     run_dataset = getattr(args, 'dataset', 'user')
+    db.upsert_dataset_role(run_dataset, 'candidate', genomes_available=False)
     db.insert_sequences(mapped_records, dataset=run_dataset)
     # write mapping file
     try:
@@ -1538,6 +1753,77 @@ def cmd_run(args):
         [short for short, _seq in mapped_records],
     )
 
+    # Carry Paper Trail/Merge Meeting quality and raw-read provenance into the persistent
+    # project record. Direct FASTA inputs are intentionally QUALITY_UNVERIFIED
+    # unless the user supplies an explicit acceptance or review decision.
+    try:
+        from branchmanager.marker_provenance import load_marker_provenance, write_marker_qc_bridge
+        marker_provenance, marker_qc_source = load_marker_provenance(
+            args.input,
+            qc_path=getattr(args, 'marker_qc', None),
+            review_path=getattr(args, 'marker_review', None),
+            id_map=orig_to_short,
+            accept_unverified=bool(getattr(args, 'accept_unverified_marker_qc', False)),
+        )
+        mapped_id_set = {short for short, _sequence in mapped_records}
+        marker_provenance = [
+            row for row in marker_provenance if row.get('sequence_id') in mapped_id_set
+        ]
+        db.upsert_sequence_provenance(marker_provenance)
+        marker_bridge_path = write_marker_qc_bridge(
+            Path(outdir) / 'marker_qc_provenance.tsv', marker_provenance,
+        )
+        existing_statuses = db.get_isolate_statuses(mapped_id_set)
+        terminal_states = {
+            'SAB_APPROVED', 'DNA_EXTRACTION_PENDING', 'DNA_EXTRACTION_FAILED',
+            'LIBRARY_PENDING', 'SEQUENCED', 'GENOME_QC_FAILED', 'GENOME_QC_PASSED', 'WITHDRAWN',
+        }
+        for row in marker_provenance:
+            sequence_id = row['sequence_id']
+            if existing_statuses.get(sequence_id, {}).get('status') in terminal_states:
+                continue
+            qc_class = str(row.get('marker_qc_class') or '').upper()
+            review = str(row.get('manual_review_status') or '').upper()
+            status = 'MARKER_QC_PASSED' if qc_class == 'PASS_HIGH_CONFIDENCE' or review == 'APPROVED' else 'TRACE_REVIEW'
+            db.update_isolate_status(
+                sequence_id, status,
+                detail=str(row.get('marker_qc_reasons') or ''),
+                source_file=marker_qc_source or str(Path(args.input).resolve()),
+            )
+        logging.getLogger(__name__).info(
+            '[PERFORMANCE REVIEW] Marker provenance for %d sequence(s) written to %s',
+            len(marker_provenance), marker_bridge_path,
+        )
+    except Exception as exc:
+        raise SystemExit(f'[PERFORMANCE REVIEW] Marker-QC provenance could not be established: {exc}')
+
+    try:
+        if not hasattr(args, 'skip_chimera_check') or getattr(args, 'skip_chimera_check', False):
+            chimera_results = {
+                sequence_id: {'call': 'SKIPPED', 'score': None}
+                for sequence_id, _sequence in mapped_records
+            }
+            logging.getLogger(__name__).warning(
+                '[PERFORMANCE REVIEW] Chimera screening explicitly skipped; affected marker evidence will require review.'
+            )
+        else:
+            from branchmanager.pipeline import chimera as _chimera
+            chimera_report, chimera_results = _chimera.run_reference_screen(
+                str(mapped_derep),
+                getattr(args, 'chimera_ref', None) or effective_ref,
+                outdir,
+                threads=threads,
+            )
+            logging.getLogger(__name__).info('[PERFORMANCE REVIEW] Chimera report written to %s', chimera_report)
+        for row in marker_provenance:
+            result = chimera_results.get(row['sequence_id'], {'call': 'INDETERMINATE', 'score': None})
+            row['chimera_call'] = result.get('call', 'INDETERMINATE')
+            row['chimera_score'] = result.get('score')
+        db.upsert_sequence_provenance(marker_provenance)
+        write_marker_qc_bridge(Path(outdir) / 'marker_qc_provenance.tsv', marker_provenance)
+    except Exception as exc:
+        raise SystemExit(f'[PERFORMANCE REVIEW] Reference-based chimera screening failed: {exc}')
+
     # classify (or use external taxa assignments if provided)
     class_out = None
     all_class_results: dict = {}
@@ -1549,7 +1835,7 @@ def cmd_run(args):
     )
     if assignment_tsv:
         taxa_file = assignment_tsv
-        logging.getLogger(__name__).info("[RUN] Using taxa assignments from %s (skipping classifier)", taxa_file)
+        logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Using taxa assignments from %s (skipping classifier)", taxa_file)
         # parse provided taxonomy assignment table and insert taxonomy for mapped runtime ids
         try:
             tax_entries_local = load_taxonomy_entries_from_assignments(
@@ -1560,8 +1846,9 @@ def cmd_run(args):
                 source_fasta_path=args.input,
             )
         except Exception as e:
-            logging.getLogger(__name__).warning("[RUN] Failed to read taxa assignments file %s: %s", taxa_file, e)
-            tax_entries_local = []
+            raise RuntimeError(f'Failed to read taxonomy assignments {taxa_file}: {e}') from e
+        if not tax_entries_local:
+            raise RuntimeError('No taxonomy assignment rows mapped to the current Performance Review IDs.')
 
         # persist taxonomy for mapped ids
         if tax_entries_local:
@@ -1569,7 +1856,7 @@ def cmd_run(args):
                 db.insert_taxonomy(tax_entries_local)
                 logging.getLogger(__name__).info("[DB] Inserted/updated taxonomy for %d ids from taxa_assignments", len(tax_entries_local))
             except Exception as e:
-                logging.getLogger(__name__).warning("[DB] Failed to insert taxonomy from taxa_assignments: %s", e)
+                raise RuntimeError(f'Failed to store provided taxonomy assignments: {e}') from e
 
         # create a synthetic classification-like file so downstream code that
         # expects `class_out` can run unchanged. Format: qid\tbest\tidentity\ttaxon\tconfidence
@@ -1583,11 +1870,11 @@ def cmd_run(args):
                         tax = row.get('tax') if row.get('tax') is not None else 'NA'
                         conf = row.get('confidence') if row.get('confidence') is not None else 'NA'
                         cf.write(f"{qid}\t\tNA\t{tax}\t{conf}\n")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    raise RuntimeError(f'Failed to normalise provided taxonomy assignments: {exc}') from exc
             class_out = str(class_out_path)
-        except Exception:
-            class_out = None
+        except Exception as exc:
+            raise RuntimeError(f'Failed to create normalised taxonomy evidence: {exc}') from exc
     else:
         # Only run classification here if we did not already run an early
         # pre-insert classification for kingdom filtering and the user did
@@ -1601,7 +1888,7 @@ def cmd_run(args):
 
             if alt_databases:
                 logging.getLogger(__name__).info(
-                    "[RUN] Multi-database classification: primary=%s, alt=%s, main=%s",
+                    "[PERFORMANCE REVIEW] Multi-database classification: primary=%s, alt=%s, main=%s",
                     ref_name, [n for _, _, n in alt_databases], run_main_db_name,
                 )
                 class_out, all_class_results = classify.run_all_classifications(
@@ -1617,30 +1904,19 @@ def cmd_run(args):
             else:
                 class_out = classify.run_classification(str(mapped_derep), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
 
-    # novelty
-    target_fasta = getattr(args, 'target', None)
-    novelty_out = novelty.run_novelty(str(mapped_derep), effective_ref, outdir, db=db, run_dataset=run_dataset, threads=threads, target_fasta=target_fasta)
-    try:
-        novelty_baseline_datasets = []
-        if getattr(args, 'baseline_dataset', None):
-            novelty_baseline_datasets.append(getattr(args, 'baseline_dataset'))
-        novelty_baseline_datasets.extend(getattr(args, 'novelty_baseline_datasets', None) or [])
-        novelty_metrics_out = novelty.build_reference_novelty_metrics(
-            str(mapped_derep),
-            effective_ref,
-            novelty_out,
-            outdir,
-            threads=threads,
-            db=db,
-            run_dataset=run_dataset,
-            target_fasta=target_fasta,
-            baseline_datasets=novelty_baseline_datasets,
+    if (
+        getattr(args, 'command', None) == 'performance-review'
+        and domain_filter in ('bacteria', 'archaea')
+        and 'gtdb' not in str(run_main_db_name).lower()
+    ):
+        raise SystemExit(
+            '[PERFORMANCE REVIEW] bacterial/archaeal assessment requires GTDB as the authoritative database. '
+            'Name the GTDB reference with --ref-name GTDB or select it with --main-ref GTDB. '
+            'Other databases remain available through --alt-ref for reporting only.'
         )
-        logging.getLogger(__name__).info("[NOVELTY] Wrote novelty metrics to %s", novelty_metrics_out)
-    except Exception as e:
-        logging.getLogger(__name__).warning("[NOVELTY] Failed to build novelty metrics: %s", e)
 
-    # persist taxonomy & distances for user sequences only
+    # Persist authoritative taxonomy before rolling novelty/genome coverage so
+    # current-run candidates can be counted by GTDB species immediately.
     try:
         tax_entries, dist_entries = load_classification_results_for_dataset(
             class_out or '',
@@ -1649,20 +1925,93 @@ def cmd_run(args):
             run_dataset,
         )
     except Exception as e:
-        logging.getLogger(__name__).warning("[RUN] Failed to parse classification output: %s", e)
-        tax_entries, dist_entries = [], []
-
+        raise SystemExit(f'[PERFORMANCE REVIEW] Authoritative classification output could not be parsed: {e}')
     if tax_entries:
         db.insert_taxonomy(tax_entries)
         logging.getLogger(__name__).info("[DB] Inserted/updated taxonomy for %d ids", len(tax_entries))
     if dist_entries:
         db.insert_distances(dist_entries)
         logging.getLogger(__name__).info("[DB] Inserted/updated distances for %d ids", len(dist_entries))
+    classification_evidence = []
+    for row in iter_classification_rows(class_out or ''):
+        query_id = str(row.get('qid') or '')
+        mapped = orig_to_short.get(query_id) or (query_id if query_id in {item[0] for item in mapped_records} else None)
+        if not mapped:
+            continue
+        classification_evidence.append({
+            'sequence_id': mapped, 'ref_db': run_main_db_name,
+            'best_hit': row.get('best'), 'identity': row.get('identity'),
+            'query_coverage': row.get('query_coverage'), 'target_coverage': row.get('target_coverage'),
+            'alignment_length': row.get('alignment_length'), 'query_length': row.get('query_length'),
+            'target_length': row.get('target_length'), 'mismatches': row.get('mismatches'),
+            'gaps': row.get('gaps'),
+        })
+    db.upsert_classification_evidence(classification_evidence)
+
+    # Register explicit cultured baselines, then migrate unlabelled historical
+    # run datasets into the rolling candidate collection.
+    novelty_baseline_datasets = _resolve_novelty_baseline_datasets(db, args)
+    for baseline_name in novelty_baseline_datasets:
+        db.upsert_dataset_role(baseline_name, 'baseline', genomes_available=True)
+    try:
+        registered_roles = db.get_dataset_roles()
+        with db.connect() as conn:
+            datasets_in_db = [row[0] for row in conn.execute(
+                "SELECT DISTINCT dataset FROM sequences WHERE dataset IS NOT NULL AND dataset != ''"
+            ).fetchall()]
+        for dataset_name in datasets_in_db:
+            if dataset_name not in registered_roles:
+                db.upsert_dataset_role(dataset_name, 'candidate', genomes_available=False)
+    except Exception as e:
+        raise RuntimeError(f'Could not establish rolling dataset roles: {e}') from e
+
+    # Recalculate metrics for the full rolling partner-candidate collection,
+    # including this batch. Pool searches explicitly remove each query's self-hit.
+    rolling_candidate_fasta = Path(outdir) / 'rolling_candidate_sequences.fasta'
+    rolling_candidate_records = []
+    try:
+        candidate_datasets = db.get_dataset_names_by_role('candidate')
+        with db.connect() as conn:
+            placeholders = ','.join('?' for _ in candidate_datasets)
+            if placeholders:
+                rows = conn.execute(
+                    f"SELECT id, sequence FROM sequences WHERE dataset IN ({placeholders}) "
+                    "AND sequence IS NOT NULL AND sequence != '' ORDER BY id",
+                    tuple(candidate_datasets),
+                ).fetchall()
+            else:
+                rows = []
+        rolling_candidate_records = [(str(sid), str(seq)) for sid, seq in rows]
+        if rolling_candidate_records:
+            write_fasta(rolling_candidate_records, str(rolling_candidate_fasta))
+    except Exception as e:
+        raise RuntimeError(f'Could not build the rolling candidate sequence pool: {e}') from e
+    metrics_query_fasta = str(rolling_candidate_fasta) if rolling_candidate_records else str(mapped_derep)
+
+    # novelty
+    target_fasta = getattr(args, 'target', None)
+    novelty_out = novelty.run_novelty(str(mapped_derep), effective_ref, outdir, db=db, run_dataset=run_dataset, threads=threads, target_fasta=target_fasta)
+    try:
+        novelty_metrics_out = novelty.build_reference_novelty_metrics(
+            metrics_query_fasta,
+            effective_ref,
+            outdir,
+            threads=threads,
+            db=db,
+            run_dataset=run_dataset,
+            target_fasta=target_fasta,
+            baseline_datasets=novelty_baseline_datasets,
+            pangenome_target=getattr(args, 'pangenome_target', 3),
+        )
+        logging.getLogger(__name__).info("[NOVELTY] Wrote novelty metrics to %s", novelty_metrics_out)
+    except Exception as e:
+        raise SystemExit(f'[PERFORMANCE REVIEW] Required novelty metrics failed: {e}')
+
     # Safety-net: remove any run sequences with explicit non-matching kingdom assignments.
     try:
-        _prune_dataset_by_kingdom(db, run_dataset, str(kingdom) if kingdom else None, '[RUN]')
+        _prune_dataset_by_kingdom(db, run_dataset, str(kingdom) if kingdom else None, '[PERFORMANCE REVIEW]')
     except Exception as e:
-        logging.getLogger(__name__).warning("[RUN] Kingdom-based pruning failed: %s", e)
+        raise RuntimeError(f'Final Performance Review domain filtering failed: {e}') from e
 
     # Initialise cluster-tracking variables used by both the tree section and
     # the assessment section below.  They will be populated if --collapse is
@@ -1674,7 +2023,7 @@ def cmd_run(args):
     # update tree/alignment
     try:
         # report DB sequence count for diagnostics so users can verify that
-        # preloaded sequences exist and will be used to seed the backbone
+        # registered baseline sequences exist and will be used to seed the backbone
         try:
             db_ids = db.get_all_ids()
             logging.getLogger(__name__).info("[TREE] DB contains %d sequences; these will be considered for backbone construction", len(db_ids))
@@ -1713,7 +2062,7 @@ def cmd_run(args):
             except Exception:
                 taxa_groups = {None: []}
             try:
-                artifacts = collapse_fasta_within_taxa(
+                artefacts = collapse_fasta_within_taxa(
                     taxa_groups,
                     outdir,
                     'derep_short_collapsed.fasta',
@@ -1722,15 +2071,16 @@ def cmd_run(args):
                     threshold=threshold,
                     threads=threads,
                     log_prefix='[COLLAPSE]',
+                    strict=True,
                 )
-                tree_fasta = artifacts.collapsed_path
-                run_member_to_rep = artifacts.member_to_rep or {}
+                tree_fasta = artefacts.collapsed_path
+                run_member_to_rep = artefacts.member_to_rep or {}
                 # Build rep -> members mapping
                 for mem, rep in run_member_to_rep.items():
                     run_rep_to_members.setdefault(rep, []).append(mem)
-                logging.getLogger(__name__).info("[COLLAPSE] Wrote collapsed fasta %s (reps=%d)", tree_fasta, len(artifacts.collapsed_records))
+                logging.getLogger(__name__).info("[COLLAPSE] Wrote collapsed fasta %s (reps=%d)", tree_fasta, len(artefacts.collapsed_records))
             except Exception as e:
-                logging.getLogger(__name__).warning("[COLLAPSE] Failed to write collapsed fasta: %s", e)
+                raise RuntimeError(f'Requested Performance Review collapse failed: {e}') from e
 
         # Optionally filter by phylum before tree building
         phylum_filter = getattr(args, 'phylum', None)
@@ -1753,7 +2103,7 @@ def cmd_run(args):
                                     for part in tax_parts:
                                         if part.startswith('p__'):
                                             phylum_name = part[3:].strip()
-                                            # Normalize for comparison (case-insensitive, strip underscores)
+                                            # Normalise for comparison (case-insensitive, strip underscores)
                                             if phylum_name.lower().replace('_', '') == phylum_filter.lower().replace('_', ''):
                                                 phylum_ids.add(qid)
                                             break
@@ -1781,14 +2131,18 @@ def cmd_run(args):
                         )
                         tree_fasta = filtered_fasta
                     else:
-                        logging.getLogger(__name__).warning("[PHYLUM] No sequences found for phylum '%s' in classification results", phylum_filter)
+                        raise RuntimeError(
+                            f"No tree sequences remained for requested phylum '{phylum_filter}'"
+                        )
                 else:
-                    logging.getLogger(__name__).warning("[PHYLUM] Could not extract phylum information from classification output")
+                    raise RuntimeError(
+                        f"Could not find requested phylum '{phylum_filter}' in classification output"
+                    )
             except Exception as e:
-                logging.getLogger(__name__).warning("[PHYLUM] Phylum filtering failed: %s", e)
+                raise RuntimeError(f'Phylum filtering failed: {e}') from e
 
         # pass the Database object so the tree builder can export existing
-        # preloaded sequences from the DB to form the backbone alignment
+        # registered baseline sequences from the DB to form the backbone alignment
         _force_rebuild = bool(getattr(args, 'force_rebuild', False))
         try:
             tree_seq_count = sum(1 for line in open(str(tree_fasta)) if line.startswith(">"))
@@ -1804,21 +2158,21 @@ def cmd_run(args):
             db=db,
             db_dataset=None,
             threads=threads,
-            preload_dir=None if _force_rebuild else getattr(args, 'preload_dir', None),
+            previous_review=None if _force_rebuild else getattr(args, 'previous_review', None),
             force_rebuild=_force_rebuild,
             anchor_file=getattr(args, 'anchors', None),
             tree_method=getattr(args, 'tree_method', 'fasttree'),
         )
         try:
             warning_rows = tree.collect_tree_build_warnings(user_fasta=str(tree_fasta), anchor_file=getattr(args, 'anchors', None), db=db, db_dataset=None)
-            warning_rows.extend(tree.summarize_alignment_quality(str(Path(outdir) / 'current_alignment.fasta')))
+            warning_rows.extend(tree.summarise_alignment_quality(str(Path(outdir) / 'current_alignment.fasta')))
             if warning_rows:
                 warn_path = tree.write_tree_warning_tsv(outdir, warning_rows)
                 logging.getLogger(__name__).warning("[TREE] Tree/alignment warnings written to %s", warn_path)
         except Exception as e:
             logging.getLogger(__name__).warning("[TREE] Failed to summarise tree/alignment quality: %s", e)
     except Exception as e:
-        logging.getLogger(__name__).warning("[TREE] Tree update failed: %s", e)
+        raise SystemExit(f'[PERFORMANCE REVIEW] Required MSA/tree update failed: {e}')
 
     # Build combined taxonomy for iTOL from DB sequences and current run results.
     combined_path = Path(outdir) / 'combined_taxonomy.tsv'
@@ -1826,20 +2180,20 @@ def cmd_run(args):
     order = []
 
     try:
-        preload_dir = getattr(args, 'preload_dir', None)
-        preload_ids = None
-        if preload_dir:
+        previous_review = getattr(args, 'previous_review', None)
+        previous_review_ids = None
+        if previous_review:
             try:
                 cand = next(
-                    (path for path in _combined_taxonomy_candidates(preload_dir) if path.exists()),
+                    (path for path in _combined_taxonomy_candidates(previous_review) if path.exists()),
                     None,
                 )
                 if cand is not None:
-                    preload_ids = read_combined_taxonomy_ids(cand)
+                    previous_review_ids = read_combined_taxonomy_ids(cand)
             except Exception:
-                preload_ids = None
+                previous_review_ids = None
 
-        base_rows = collect_db_taxonomy_rows(db, preload_ids if preload_ids else None)
+        base_rows = collect_db_taxonomy_rows(db, previous_review_ids if previous_review_ids else None)
         merged_rows = merge_combined_taxonomy_rows(base_rows, class_out or '', orig_to_short, db)
         for rid, tax, conf in merged_rows:
             merged[rid] = (tax if tax is not None else 'NA', conf if conf is not None else 'NA')
@@ -1858,13 +2212,13 @@ def cmd_run(args):
     except Exception as e:
         logging.getLogger(__name__).warning("[ITOL] Failed to write combined taxonomy: %s", e)
 
-    # Load preload id_map for iTOL when --preload-dir is provided.
+    # Load previous-review ID map for iTOL when --previous-review is provided.
     id_map_for_itol = None
-    preload_dir = getattr(args, 'preload_dir', None)
-    if preload_dir:
+    previous_review = getattr(args, 'previous_review', None)
+    if previous_review:
         try:
             id_map = {}
-            cand_map = _find_preferred_id_map(str(preload_dir))
+            cand_map = _find_preferred_id_map(str(previous_review))
             if cand_map:
                 id_map = _load_id_map_from_tsv(cand_map, db=db)
             if id_map:
@@ -1875,16 +2229,16 @@ def cmd_run(args):
         try:
             tree_path = Path(outdir) / 'current_tree.nwk'
             tfile = str(tree_path) if tree_path.exists() else _find_tree_file_in_dir(outdir)
-            itol.generate_itol_colors(str(combined_path), outdir, user_color_csv=getattr(args, 'user_colors', None), id_map=id_map_for_itol, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
-            logging.getLogger(__name__).info("[ITOL] Generated iTOL color files in %s", outdir)
+            itol.generate_itol_colours(str(combined_path), outdir, user_colour_csv=getattr(args, 'user_colours', None), id_map=id_map_for_itol, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
+            logging.getLogger(__name__).info("[ITOL] Generated iTOL colour files in %s", outdir)
         except Exception as e:
             logging.getLogger(__name__).warning("[ITOL] Failed to generate iTOL files: %s", e)
-    # Generate iTOL color files for the run output directory.
+    # Generate iTOL colour files for the Performance Review output directory.
     try:
         tree_path = Path(outdir) / 'current_tree.nwk'
         tfile = str(tree_path) if tree_path.exists() else _find_tree_file_in_dir(outdir)
-        itol.generate_itol_colors(str(combined_path), outdir, user_color_csv=getattr(args, 'user_colors', None), id_map=id_map_for_itol, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
-        logging.getLogger(__name__).info("[ITOL] Generated iTOL color files in %s", outdir)
+        itol.generate_itol_colours(str(combined_path), outdir, user_colour_csv=getattr(args, 'user_colours', None), id_map=id_map_for_itol, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
+        logging.getLogger(__name__).info("[ITOL] Generated iTOL colour files in %s", outdir)
     except Exception as e:
         logging.getLogger(__name__).warning("[ITOL] Failed to generate iTOL files: %s", e)
     # Optional: write functional annotation iTOL datasets when provided
@@ -1910,15 +2264,15 @@ def cmd_run(args):
                 logging.getLogger(__name__).info("[ITOL] Rumen functional iTOL file: %s", itol_out)
         except Exception as e:
             logging.getLogger(__name__).warning("[ITOL] Draft rumen functions generation failed: %s", e)
-    # produce dataset membership band (preload vs run)
+    # produce dataset membership band (Filing Cabinet versus review batch)
     try:
         combined_tax = combined_path
         ids_in_order = []
         if combined_tax.exists():
             with open(combined_tax) as ct:
                 next(ct, None)
-                for l in ct:
-                    iid = l.strip().split('\t')[0]
+                for line in ct:
+                    iid = line.strip().split('\t')[0]
                     if iid:
                         ids_in_order.append(iid)
         # Query DB for exact dataset membership per id to support arbitrary dataset names
@@ -1940,7 +2294,7 @@ def cmd_run(args):
     except Exception as e:
         logging.getLogger(__name__).warning("[ITOL] Failed to write dataset membership ITOL: %s", e)
 
-    # Also produce a novelty gradient colorstrip for NEW (run) sequences
+    # Add a novelty-gradient colour strip for new sequences.
     try:
         try:
             run_ids = [r[0] for r in mapped_records]
@@ -1974,9 +2328,12 @@ def cmd_run(args):
             warning_rows = build_placement_warning_rows(class_out, novelty_out, orig_to_short, db)
             if warning_rows:
                 warn_path = write_placement_warning_tsv(Path(outdir) / 'placement_warnings.tsv', warning_rows)
-                logging.getLogger(__name__).warning("[RUN] Placement warnings written to %s", warn_path)
+                logging.getLogger(__name__).warning("[PERFORMANCE REVIEW] Placement warnings written to %s", warn_path)
             try:
-                run_ids_for_assessment = [r[0] for r in mapped_records]
+                run_ids_for_assessment = (
+                    [record[0] for record in rolling_candidate_records]
+                    if rolling_candidate_records else [record[0] for record in mapped_records]
+                )
                 # Determine which sequences are actually in the tree
                 try:
                     _tree_ids = set()
@@ -1993,10 +2350,10 @@ def cmd_run(args):
                     if alt_ref_dbs:
                         alt_taxonomies = db.get_taxonomy_alt_for_ids(run_ids_for_assessment)
                         logging.getLogger(__name__).info(
-                            "[RUN] Found alt-db taxonomy for ref_dbs: %s", alt_ref_dbs
+                            "[PERFORMANCE REVIEW] Found alt-db taxonomy for ref_dbs: %s", alt_ref_dbs
                         )
                 except Exception as e:
-                    logging.getLogger(__name__).warning("[RUN] Could not load alt-db taxonomy: %s", e)
+                    logging.getLogger(__name__).warning("[PERFORMANCE REVIEW] Could not load alt-db taxonomy: %s", e)
 
                 assessment_rows = build_sequence_assessment_rows(
                     run_ids_for_assessment,
@@ -2011,6 +2368,37 @@ def cmd_run(args):
                     alt_taxonomies=alt_taxonomies,
                     alt_ref_dbs=alt_ref_dbs,
                 )
+                from branchmanager.marker_provenance import marker_qc_flag
+                project_provenance = db.get_sequence_provenance(run_ids_for_assessment)
+                for assessment_row in assessment_rows:
+                    provenance = project_provenance.get(str(assessment_row.get('id'))) or {}
+                    qc_flag = marker_qc_flag(provenance)
+                    assessment_row.update({
+                        'marker_qc_class': provenance.get('marker_qc_class', 'QUALITY_UNVERIFIED'),
+                        'marker_qc_recommendation': provenance.get('marker_qc_recommendation', 'MANUAL_REVIEW'),
+                        'marker_qc_reasons': provenance.get('marker_qc_reasons', 'no_marker_qc_provenance'),
+                        'marker_manual_review_status': provenance.get('manual_review_status', 'NOT_REVIEWED'),
+                        'marker_qc_flag': qc_flag or 'MARKER_QC_PASSED',
+                        'marker_source_manifest': provenance.get('source_manifest', ''),
+                        'chimera_call': provenance.get('chimera_call', 'NOT_RUN'),
+                        'chimera_score': provenance.get('chimera_score', 'NA'),
+                    })
+                    if qc_flag:
+                        flags = [flag for flag in str(assessment_row.get('placement_flags') or '').split(';') if flag]
+                        if qc_flag not in flags:
+                            flags.append(qc_flag)
+                        assessment_row['placement_flags'] = ';'.join(flags)
+                    chimera_call = str(provenance.get('chimera_call') or 'NOT_RUN').upper()
+                    if chimera_call != 'PASS':
+                        chimera_flag = {
+                            'CHIMERA': 'CHIMERA_DETECTED',
+                            'INDETERMINATE': 'CHIMERA_INDETERMINATE',
+                            'SKIPPED': 'CHIMERA_CHECK_SKIPPED',
+                        }.get(chimera_call, 'CHIMERA_NOT_RUN')
+                        flags = [flag for flag in str(assessment_row.get('placement_flags') or '').split(';') if flag]
+                        if chimera_flag not in flags:
+                            flags.append(chimera_flag)
+                        assessment_row['placement_flags'] = ';'.join(flags)
                 mwl_path = getattr(args, 'mwl', None)
                 mwl_entries = []
                 if mwl_path:
@@ -2036,87 +2424,287 @@ def cmd_run(args):
                             len(assessment_rows), len(mwl_entries), mwl_report,
                         )
                     except Exception as e:
-                        logging.getLogger(__name__).warning("[MWL] Failed to annotate assessment rows: %s", e)
-                assess_path = write_sequence_assessment_tsv(Path(outdir) / 'sequence_assessment.tsv', assessment_rows)
-                selection_summary_path = write_selection_summary_tsv(Path(outdir) / 'selection_summary.tsv', assessment_rows)
-                baseline_hits_path = write_baseline_hits_tsv(Path(outdir) / 'baseline_hits.tsv', assessment_rows)
-                logging.getLogger(__name__).info("[RUN] Wrote sequence assessment to %s", assess_path)
-                logging.getLogger(__name__).info("[RUN] Wrote SAB selection summary to %s", selection_summary_path)
-                logging.getLogger(__name__).info("[RUN] Wrote nearest baseline hit report to %s", baseline_hits_path)
-
-                # ── Cluster-level reports + phylogenetic isolation ───────────
+                        raise RuntimeError(f'MWL annotation failed: {e}') from e
+                _tree_nwk = str(Path(outdir) / 'current_tree.nwk')
                 try:
-                    _tree_nwk = str(Path(outdir) / 'current_tree.nwk')
-                    _cluster_summary, _cluster_csvs, _backup_tsv = _cluster_report.generate_cluster_reports(
+                    _cluster_summary, _clusters_csv, _backup_tsv = _cluster_report.generate_cluster_reports(
                         outdir=outdir,
                         assessment_rows=assessment_rows,
                         tree_path=_tree_nwk if Path(_tree_nwk).exists() else None,
                     )
-                    # Re-write sequence_assessment.tsv now that phylo_isolation /
-                    # investigation_score have been filled in by generate_cluster_reports
                     if mwl_entries:
                         try:
                             _mwl.add_evaluation_scores(assessment_rows)
                             _mwl.write_mwl_matches_tsv(Path(outdir) / 'mwl_matches.tsv', assessment_rows)
                         except Exception as _mwe:
                             logging.getLogger(__name__).warning("[MWL] Failed to refresh MWL evaluation scores: %s", _mwe)
-                    write_sequence_assessment_tsv(Path(outdir) / 'sequence_assessment.tsv', assessment_rows)
-                    write_selection_summary_tsv(Path(outdir) / 'selection_summary.tsv', assessment_rows)
-                    write_baseline_hits_tsv(Path(outdir) / 'baseline_hits.tsv', assessment_rows)
                     if _cluster_summary:
                         logging.getLogger(__name__).info(
-                            "[CLUSTER] Wrote cluster summary → %s  (%d per-cluster CSVs in %s/clusters/)",
-                            _cluster_summary, len(_cluster_csvs), outdir,
+                            "[CLUSTER] Wrote cluster summary → %s",
+                            _cluster_summary,
+                        )
+                    if _clusters_csv:
+                        logging.getLogger(__name__).info(
+                            "[CLUSTER] Wrote consolidated cluster membership → %s", _clusters_csv,
                         )
                     if _backup_tsv:
                         logging.getLogger(__name__).info(
                             "[CLUSTER] Wrote backup candidates table → %s", _backup_tsv,
                         )
                 except Exception as _ce:
-                    logging.getLogger(__name__).warning("[CLUSTER] Cluster report generation failed: %s", _ce)
-                # Emit a user-friendly summary of HIGH priority candidates
-                try:
-                    def _effective_priority(row):
-                        return row.get('genome_sequencing_adjusted_priority') or row.get('sequencing_priority')
+                    raise RuntimeError(f'Cluster report generation failed: {_ce}') from _ce
 
-                    high_priority = [r for r in assessment_rows if _effective_priority(r) == 'HIGH']
-                    medium_priority = [r for r in assessment_rows if _effective_priority(r) == 'MEDIUM']
-                    selected_clades = [
-                        r for r in assessment_rows
-                        if r.get('clade_already_selected_for_genome_sequencing') == 'True'
-                    ]
-                    collapsed_away = [r for r in assessment_rows if r.get('in_tree') == 'No']
+                # Group nearby assessed leaves into compact, labelled local-clade figures.
+                try:
+                    if Path(_tree_nwk).exists():
+                        _neighbourhood_result = neighbourhood.generate_local_neighbourhood_visuals(
+                            tree_path=_tree_nwk,
+                            assessment_rows=assessment_rows,
+                            db=db,
+                            outdir=Path(outdir) / 'neighbourhoods',
+                            alignment_path=Path(outdir) / 'current_alignment.fasta',
+                            image_format=getattr(args, 'neighbourhood_format', 'png'),
+                        )
+                        logging.getLogger(__name__).info(
+                            "[NEIGHBOURHOOD] %d figure(s), %d/%d assessed sequences resolved",
+                            len(_neighbourhood_result['figures']),
+                            _neighbourhood_result['resolved'],
+                            len(assessment_rows),
+                        )
+                        if _neighbourhood_result['resolved'] != len(assessment_rows):
+                            raise RuntimeError(
+                                f"local tree context resolved {_neighbourhood_result['resolved']}/"
+                                f"{len(assessment_rows)} assessed sequences"
+                            )
+                    else:
+                        logging.getLogger(__name__).warning(
+                            "[NEIGHBOURHOOD] No current_tree.nwk was produced; local-clade figures were skipped"
+                        )
+                except Exception as _ne:
+                    raise RuntimeError(f'Local-clade figure generation failed: {_ne}') from _ne
+
+                # Propose rolling primary + backup isolates within each GTDB
+                # species or, where species is unresolved, each local tree clade.
+                try:
+                    sequencing_sets_path = _selection_sets.build_sequencing_sets(
+                        assessment_rows,
+                        Path(outdir) / 'sequencing_sets.tsv',
+                        tree_path=_tree_nwk if Path(_tree_nwk).exists() else None,
+                        db=db,
+                        pangenome_target=getattr(args, 'pangenome_target', 3),
+                        candidate_set_size=getattr(args, 'candidate_set_size', 4),
+                    )
                     logging.getLogger(__name__).info(
-                        "[ASSESSMENT SUMMARY] %d sequences assessed: %d HIGH priority for sequencing, "
-                        "%d MEDIUM priority. %d have a >=97%% selected-genome neighbour. "
-                        "%d sequences were clustered and excluded from tree "
-                        "(their representatives are in the tree). "
-                        "See assessment/sequence_assessment.tsv for full details.",
+                        "[SELECTION SETS] Wrote rolling clade candidate sets to %s",
+                        sequencing_sets_path,
+                    )
+                    current_statuses = db.get_isolate_statuses(
+                        [row.get('id') for row in assessment_rows if row.get('id')]
+                    )
+                    protected_states = {
+                        'SAB_APPROVED', 'DNA_EXTRACTION_PENDING', 'DNA_EXTRACTION_FAILED',
+                        'LIBRARY_PENDING', 'SEQUENCED', 'GENOME_QC_FAILED',
+                        'GENOME_QC_PASSED', 'WITHDRAWN',
+                    }
+                    for row in assessment_rows:
+                        if str(row.get('sequencing_set_role') or '').upper() not in {'PRIMARY', 'BACKUP'}:
+                            continue
+                        sequence_id = str(row.get('id') or '')
+                        if current_statuses.get(sequence_id, {}).get('status') in protected_states:
+                            continue
+                        db.update_isolate_status(
+                            sequence_id, 'PROPOSED',
+                            detail=str(row.get('sequencing_set_reason') or ''),
+                            source_file=str(sequencing_sets_path),
+                        )
+                except Exception as _se:
+                    raise RuntimeError(f'Candidate-set generation failed: {_se}') from _se
+
+                # Candidate-set roles/ranks are assigned after local contexts
+                # are known. Re-render the same deterministic figure groups so
+                # PRIMARY/BACKUP/ALTERNATE labels appear in the final images.
+                try:
+                    if Path(_tree_nwk).exists():
+                        neighbourhood.generate_local_neighbourhood_visuals(
+                            tree_path=_tree_nwk,
+                            assessment_rows=assessment_rows,
+                            db=db,
+                            outdir=Path(outdir) / 'neighbourhoods',
+                            alignment_path=Path(outdir) / 'current_alignment.fasta',
+                            image_format=getattr(args, 'neighbourhood_format', 'png'),
+                        )
+                except Exception as _ne:
+                    raise RuntimeError(f'Ranked local-clade figure refresh failed: {_ne}') from _ne
+
+                # Final report write after tree-derived fields have been attached.
+                assess_path = write_sequence_assessment_tsv(
+                    Path(outdir) / 'sequence_assessment.tsv', assessment_rows,
+                    assessment_db_name=run_main_db_name,
+                )
+                selection_summary_path = write_selection_summary_tsv(
+                    Path(outdir) / 'selection_summary.tsv', assessment_rows,
+                    assessment_db_name=run_main_db_name,
+                )
+                baseline_hits_path = write_baseline_hits_tsv(Path(outdir) / 'baseline_hits.tsv', assessment_rows)
+                try:
+                    snapshot_id = f'{run_dataset}:{Path(outdir).resolve()}'
+                    snapshot_source = Path(outdir).resolve() / 'assessment' / 'sequence_assessment.tsv'
+                    saved = db.save_assessment_snapshot(
+                        snapshot_id,
+                        assessment_rows,
+                        dataset=run_dataset,
+                        source_path=str(snapshot_source),
+                    )
+                    logging.getLogger(__name__).info(
+                        '[ASSESSMENT] Saved %d rows to project snapshot %s', saved, snapshot_id,
+                    )
+                except Exception as e:
+                    raise RuntimeError(f'Could not persist project assessment snapshot: {e}') from e
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Wrote sequence assessment to %s", assess_path)
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Wrote SAB selection summary to %s", selection_summary_path)
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Wrote nearest baseline hit report to %s", baseline_hits_path)
+
+                # Emit a concise summary using the same decisions as selection_summary.tsv.
+                try:
+                    decisions = [build_selection_decision(row)['decision'] for row in assessment_rows]
+                    logging.getLogger(__name__).info(
+                        "[ASSESSMENT SUMMARY] %d assessed: %d PRIMARY, %d BACKUP, "
+                        "%d SECONDARY/STRONG, %d REVIEW, %d TARGET MET, %d ALREADY SEQUENCED. "
+                        "See assessment/selection_summary.tsv for the decision table.",
                         len(assessment_rows),
-                        len(high_priority),
-                        len(medium_priority),
-                        len(selected_clades),
-                        len(collapsed_away),
+                        sum(d == 'PRIORITISE - SET PRIMARY' for d in decisions),
+                        sum(d == 'RESERVE - SET BACKUP' for d in decisions),
+                        sum(d in ('STRONG CANDIDATE', 'SECONDARY CANDIDATE', 'SECONDARY - STRAIN DIVERSITY') for d in decisions),
+                        sum(d.startswith('REVIEW') for d in decisions),
+                        sum(d == 'LOWER PRIORITY - TARGET MET' for d in decisions),
+                        sum(d == 'ALREADY SEQUENCED' for d in decisions),
                     )
                 except Exception:
                     pass
             except Exception as e:
-                logging.getLogger(__name__).warning("[RUN] Failed to build sequence assessment: %s", e)
+                raise RuntimeError(f'Required sequence assessment failed: {e}') from e
     except Exception as e:
-        logging.getLogger(__name__).warning("[RUN] Failed to build placement warnings: %s", e)
+        raise SystemExit(f'[PERFORMANCE REVIEW] Required assessment/placement reporting failed: {e}')
 
     # At end of run, keep the externally useful deliverables and organise them
     # into high-level folders.
     try:
-        _organize_run_outputs(outdir, primary_db_name=run_main_db_name)
+        _organise_run_outputs(outdir, primary_db_name=run_main_db_name)
     except Exception as e:
-        logging.getLogger(__name__).warning("[RUN] Failed to organise output files: %s", e)
+        raise SystemExit(f'[PERFORMANCE REVIEW] Failed to organise required outputs: {e}')
 
     # Write a manifest after files have been organised.
     try:
         _write_output_explanations(outdir)
     except Exception:
         pass
+
+
+def cmd_performance_review(args):
+    """Run Performance Review transactionally and publish only after validation."""
+    import fcntl
+    import sqlite3
+    import uuid
+
+    # Internal callers predating the CLI command namespace are retained for
+    # focused unit tests; every user-facing CLI invocation takes the atomic path.
+    if not hasattr(args, 'command') or not hasattr(args, 'skip_chimera_check'):
+        return _cmd_performance_review_impl(args)
+    original_db = Path(args.db).expanduser().resolve()
+    if str(args.db) == ':memory:':
+        raise SystemExit('[PERFORMANCE REVIEW] A persistent --db path is required for the rolling workflow.')
+    outdir = Path(args.out).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    original_db.parent.mkdir(parents=True, exist_ok=True)
+    staged_db = outdir / '.performance_review_project.sqlite'
+    lock_path = original_db.with_name(original_db.name + '.lock')
+    manifest = RunManifest(outdir, 'performance_review')
+    for role, source in (
+        ('marker_fasta', args.input), ('partner_metadata', getattr(args, 'partner_metadata', None)),
+        ('primary_reference', getattr(args, 'ref', None)), ('reference_taxonomy', getattr(args, 'taxa', None)),
+        ('baseline_fasta', getattr(args, 'baseline_fasta', None)), ('mwl', getattr(args, 'mwl', None)),
+        ('marker_qc', getattr(args, 'marker_qc', None)), ('marker_review', getattr(args, 'marker_review', None)),
+        ('baseline_taxonomy', getattr(args, 'baseline_taxa_assignments', None)),
+        ('chimera_reference', getattr(args, 'chimera_ref', None)),
+        ('target_collection', getattr(args, 'target', None)),
+        ('anchors', getattr(args, 'anchors', None)),
+    ):
+        if source:
+            manifest.add_input(source, role=role, required=True)
+    for source in getattr(args, 'alt_ref', None) or []:
+        manifest.add_input(source, role='alternate_reference')
+    for source in getattr(args, 'alt_taxa', None) or []:
+        manifest.add_input(source, role='alternate_reference_taxonomy')
+    run_id = f"performance-review:{getattr(args, 'dataset', 'dataset')}:{utc_now()}:{uuid.uuid4().hex[:8]}"
+
+    with open(lock_path, 'a+') as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if staged_db.exists():
+                staged_db.unlink()
+            if original_db.is_file():
+                with sqlite3.connect(str(original_db)) as source, sqlite3.connect(str(staged_db)) as target:
+                    source.backup(target)
+                manifest.add_input(original_db, role='project_database_before')
+            staged_args = argparse.Namespace(**vars(args))
+            staged_args.db = str(staged_db)
+            manifest.add_stage('performance_review', 'RUNNING', detail='taxonomy, novelty, MSA/tree, and assessment')
+            _cmd_performance_review_impl(staged_args)
+
+            safe_main = ''.join(
+                char if char.isalnum() or char in ('_', '-') else '_'
+                for char in str(getattr(args, 'main_ref', None) or getattr(args, 'ref_name', None) or 'GTDB')
+            ).strip('_') or 'GTDB'
+            required = {
+                'full_assessment': outdir / 'assessment' / 'sequence_assessment.tsv',
+                'board_summary': outdir / 'assessment' / 'selection_summary.tsv',
+                'sequencing_sets': outdir / 'assessment' / 'sequencing_sets.tsv',
+                'novelty_metrics': outdir / 'assessment' / 'novelty_metrics.tsv',
+                'tree': outdir / 'tree' / 'current_tree.nwk',
+                'alignment': outdir / 'tree' / 'current_alignment.fasta',
+                'taxonomy': outdir / 'taxonomy' / f'{safe_main}.tsv',
+            }
+            if not required['taxonomy'].is_file():
+                taxonomy_candidates = sorted((outdir / 'taxonomy').glob('*.tsv'))
+                if taxonomy_candidates:
+                    required['taxonomy'] = taxonomy_candidates[0]
+            for role, path in required.items():
+                manifest.add_output(path, role=role)
+            missing = manifest.verify_required_outputs()
+            if missing:
+                raise RuntimeError('required Performance Review outputs are missing: ' + ', '.join(missing))
+
+            from branchmanager.reporting import write_decision_changes, write_performance_review_dashboard
+            staged = Database(str(staged_db))
+            changes = write_decision_changes(staged, outdir / 'assessment' / 'decision_changes.tsv')
+            manifest.add_output(changes, role='decision_changes')
+            dashboard = write_performance_review_dashboard(
+                outdir / 'assessment' / 'selection_summary.tsv', outdir,
+            )
+            manifest.add_output(dashboard, role='performance_review_dashboard')
+            manifest.add_stage('performance_review', 'COMPLETE')
+            manifest.add_stage('hiring_panel', 'COMPLETE', detail='candidate sets and board summary')
+            manifest.finish('COMPLETE')
+            staged.record_project_run(
+                run_id, 'performance_review', 'COMPLETE', dataset=getattr(args, 'dataset', ''),
+                manifest_path=str(manifest.json_path),
+                started_at=manifest.data['started_at'], completed_at=manifest.data['completed_at'],
+            )
+
+            publish_tmp = original_db.with_name(original_db.name + '.publishing')
+            if publish_tmp.exists():
+                publish_tmp.unlink()
+            with sqlite3.connect(str(staged_db)) as source, sqlite3.connect(str(publish_tmp)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('staged project database failed SQLite integrity_check')
+            os.replace(publish_tmp, original_db)
+            staged_db.unlink(missing_ok=True)
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _detect_taxon_rank(taxon_query: str, rank_arg: str) -> str:
@@ -2154,8 +2742,8 @@ def _taxon_name_matches(val: str, query: str) -> bool:
     return bool(val) and _n(val) == _n(query)
 
 
-def cmd_subtree(args):
-    """Build a focused subtree for a specific taxon from an existing DB.
+def cmd_org_chart(args):
+    """Build a focused phylogenetic tree for a specific taxon from an existing DB.
 
     Fast path: if a ``current_alignment.fasta`` already exists in
     ``--from-dir`` (or the output directory), the matching sequences are
@@ -2167,7 +2755,7 @@ def cmd_subtree(args):
     is performed (same as a normal run).
     """
     from branchmanager.pipeline import itol as itol_mod
-    from branchmanager.pipeline import tree as tree_mod  # noqa: F401 (used in _build_subtree)
+    from branchmanager.pipeline import tree as tree_mod  # noqa: F401 (used in _build_org_chart)
     from branchmanager.pipeline.workflow_helpers import write_combined_taxonomy_tsv
     from branchmanager.taxonomy import parse_taxon_string
     from branchmanager.utils.fasta import read_fasta, write_fasta  # noqa: F401
@@ -2188,11 +2776,10 @@ def cmd_subtree(args):
     no_tree = getattr(args, 'no_tree', False)
 
     log.info(
-        "[SUBTREE] Taxon query: '%s'  rank: '%s'  clean name: '%s'  from-dir: %s",
+        "[ORG-CHART] Taxon query: '%s'  rank: '%s'  clean name: '%s'  from-dir: %s",
         taxon_query, rank_key, taxon_clean, from_dir,
     )
 
-    # ── Query DB ──────────────────────────────────────────────────────────────
     db = Database(args.db)
     db.initialise()
 
@@ -2204,7 +2791,6 @@ def cmd_subtree(args):
         )
         all_rows = cur.fetchall()
 
-    # ── Filter to matching taxon ──────────────────────────────────────────────
     matched = []
     for sid, seq, tax, conf, dataset in all_rows:
         if not tax:
@@ -2214,12 +2800,12 @@ def cmd_subtree(args):
         if _taxon_name_matches(val, taxon_clean):
             matched.append((sid, seq or '', tax, conf or 'NA', dataset or ''))
 
-    log.info("[SUBTREE] DB has %d sequences total; %d match taxon '%s' at rank '%s'",
+    log.info("[ORG-CHART] DB has %d sequences total; %d match taxon '%s' at rank '%s'",
              len(all_rows), len(matched), taxon_clean, rank_key)
 
     if len(matched) < min_seqs:
         log.warning(
-            "[SUBTREE] Only %d sequences matched (minimum required: %d). "
+            "[ORG-CHART] Only %d sequences matched (minimum required: %d). "
             "Check taxon spelling and rank. Available phyla in DB: %s",
             len(matched), min_seqs,
             sorted({parse_taxon_string(r[2]).get('p', 'unknown')
@@ -2230,27 +2816,24 @@ def cmd_subtree(args):
     # Collect matched IDs as a set for fast lookup
     matched_ids = {sid for sid, *_ in matched}
 
-    # ── Write taxonomy TSV ────────────────────────────────────────────────────
-    combined_tax_path = Path(outdir) / 'subtree_combined_taxonomy.tsv'
+    combined_tax_path = Path(outdir) / 'org_chart_combined_taxonomy.tsv'
     write_combined_taxonomy_tsv(
         combined_tax_path,
         [(sid, tax, conf) for sid, _, tax, conf, _ in matched],
     )
-    log.info("[SUBTREE] Wrote taxonomy for %d sequences → %s", len(matched), combined_tax_path)
+    log.info("[ORG-CHART] Wrote taxonomy for %d sequences → %s", len(matched), combined_tax_path)
 
-    # ── Write summary TSV ─────────────────────────────────────────────────────
-    summary_path = Path(outdir) / 'subtree_sequence_list.tsv'
+    summary_path = Path(outdir) / 'org_chart_sequence_list.tsv'
     with open(summary_path, 'w') as sf:
         sf.write('ID\tTaxonomy\tConfidence\tDataset\n')
         for sid, _, tax, conf, dataset in matched:
             sf.write(f"{sid}\t{tax}\t{conf}\t{dataset}\n")
-    log.info("[SUBTREE] Wrote sequence list → %s", summary_path)
+    log.info("[ORG-CHART] Wrote sequence list → %s", summary_path)
 
-    # ── Tree building ─────────────────────────────────────────────────────────
-    tree_path = Path(outdir) / 'subtree_tree.nwk'
+    tree_path = Path(outdir) / 'org_chart_tree.nwk'
 
     if not no_tree:
-        _build_subtree(
+        _build_org_chart(
             matched=matched,
             matched_ids=matched_ids,
             from_dir=from_dir,
@@ -2263,20 +2846,19 @@ def cmd_subtree(args):
             log=log,
         )
     else:
-        log.info("[SUBTREE] Tree build skipped (--no-tree).")
+        log.info("[ORG-CHART] Tree build skipped (--no-tree).")
 
-    # ── iTOL files ────────────────────────────────────────────────────────────
     try:
         tfile = str(tree_path) if tree_path.exists() else None
-        itol_mod.generate_itol_colors(
+        itol_mod.generate_itol_colours(
             str(combined_tax_path),
             outdir,
             tree_file=tfile,
             phylum_groups=getattr(args, 'group_phyla', None),
         )
-        log.info("[SUBTREE] Generated iTOL colour files in %s", outdir)
+        log.info("[ORG-CHART] Generated iTOL colour files in %s", outdir)
     except Exception as e:
-        log.warning("[SUBTREE] iTOL colour generation failed: %s", e)
+        log.warning("[ORG-CHART] iTOL colour generation failed: %s", e)
 
     # Optional: write functional annotation datasets when provided
     try:
@@ -2284,9 +2866,9 @@ def cmd_subtree(args):
         if func_tsv:
             try:
                 written = itol_mod.write_functional_annotations(str(func_tsv), outdir, id_map=None)
-                log.info("[SUBTREE] Wrote functional annotation iTOL files: %s", ','.join(written) if written else '(none)')
+                log.info("[ORG-CHART] Wrote functional annotation iTOL files: %s", ','.join(written) if written else '(none)')
             except Exception as e:
-                log.warning("[SUBTREE] Functional annotations generation failed: %s", e)
+                log.warning("[ORG-CHART] Functional annotations generation failed: %s", e)
     except Exception:
         pass
     # Draft rumen functional groups
@@ -2296,15 +2878,14 @@ def cmd_subtree(args):
                 str(combined_tax_path), outdir, id_map=None
             )
             if tsv_out:
-                log.info("[SUBTREE] Draft rumen functional annotation: %s", tsv_out)
+                log.info("[ORG-CHART] Draft rumen functional annotation: %s", tsv_out)
             if itol_out:
-                log.info("[SUBTREE] Rumen functional iTOL file: %s", itol_out)
+                log.info("[ORG-CHART] Rumen functional iTOL file: %s", itol_out)
         except Exception as e:
-            log.warning("[SUBTREE] Draft rumen functions generation failed: %s", e)
+            log.warning("[ORG-CHART] Draft rumen functions generation failed: %s", e)
 
-    # ── Dataset membership strip ──────────────────────────────────────────────
     # One colour per dataset label so users can see which sequences came from
-    # which dataset (preload, run batch, etc.) in the same tree view.
+    # which dataset (Filing Cabinet, review batch, etc.) in the same tree view.
     try:
         ids_in_order = [sid for sid, *_ in matched]
         ds_map = {sid: (dataset or 'unknown') for sid, _, _tax, _conf, dataset in matched}
@@ -2313,22 +2894,21 @@ def cmd_subtree(args):
             str(membership_path), ids_in_order, ds_map,
             dataset_label='Dataset membership',
         )
-        log.info("[SUBTREE] Wrote dataset membership strip → %s", membership_path)
+        log.info("[ORG-CHART] Wrote dataset membership strip → %s", membership_path)
     except Exception as e:
-        log.warning("[SUBTREE] Dataset membership strip failed: %s", e)
+        log.warning("[ORG-CHART] Dataset membership strip failed: %s", e)
 
-    # ── Done ──────────────────────────────────────────────────────────────────
     log.info(
-        "[SUBTREE] Complete. %d sequences, taxon='%s', output=%s",
+        "[ORG-CHART] Complete. %d sequences, taxon='%s', output=%s",
         len(matched), taxon_query, outdir,
     )
     print(
-        f"[subtree] Done: {len(matched)} sequences for '{taxon_query}' "
+        f"[org-chart] Done: {len(matched)} sequences for '{taxon_query}' "
         f"→ {outdir}"
     )
 
 
-def _build_subtree(
+def _build_org_chart(
     matched, matched_ids, from_dir, outdir, tree_path,
     ref_fasta, anchor_file, threads, taxon_clean, log,
 ):
@@ -2344,17 +2924,14 @@ def _build_subtree(
     """
     from branchmanager.pipeline.tree import (
         _run_fasttree, _make_unique_fasta,
-        is_ref_anchor, get_anchor_file,
+        is_ref_anchor,
     )
     from branchmanager.utils.fasta import read_fasta, write_fasta
     from branchmanager.pipeline import tree as tree_mod
     import re
 
     out = Path(outdir)
-    resolved_anchor = get_anchor_file(anchor_file)
-
-    # ── Fast path ─────────────────────────────────────────────────────────────
-    # Look for an existing alignment in from_dir (or outdir)
+    # Reuse an existing alignment when available.
     aln_candidates = [
         Path(from_dir) / 'current_alignment.fasta',
         Path(from_dir) / 'tree' / 'current_alignment.fasta',
@@ -2364,7 +2941,7 @@ def _build_subtree(
     existing_aln = next((p for p in aln_candidates if p.exists()), None)
 
     if existing_aln:
-        log.info("[SUBTREE] Fast path: filtering existing alignment %s", existing_aln)
+        log.info("[ORG-CHART] Fast path: filtering existing alignment %s", existing_aln)
         # Build a normalised ID lookup for the matched IDs
         def _norm_id(x):
             x = str(x).split()[0]
@@ -2387,29 +2964,28 @@ def _build_subtree(
 
         n_data = len(kept) - anchors_included
         log.info(
-            "[SUBTREE] Fast path: %d data sequences + %d anchors extracted from alignment",
+            "[ORG-CHART] Fast path: %d data sequences + %d anchors extracted from alignment",
             n_data, anchors_included,
         )
 
         if n_data < 3:
             log.warning(
-                "[SUBTREE] Only %d data sequences found in existing alignment "
+                "[ORG-CHART] Only %d data sequences found in existing alignment "
                 "(IDs may not match). Falling back to slow path.", n_data,
             )
             existing_aln = None   # trigger slow path below
         else:
-            subtree_aln = out / 'subtree_alignment.fasta'
-            write_fasta(kept, str(subtree_aln))
-            fasta_for_tree, id_map = _make_unique_fasta(str(subtree_aln), out)
+            org_chart_alignment = out / 'org_chart_alignment.fasta'
+            write_fasta(kept, str(org_chart_alignment))
+            fasta_for_tree, id_map = _make_unique_fasta(str(org_chart_alignment), out)
             if _run_fasttree(Path(fasta_for_tree), tree_path):
-                _finalise_tree_subtree(out, id_map, tree_path, log)
+                _finalise_org_chart_tree(out, id_map, tree_path, log)
             else:
-                log.warning("[SUBTREE] FastTree failed on fast path")
+                log.warning("[ORG-CHART] FastTree failed on fast path")
             return
 
-    # ── Slow path ─────────────────────────────────────────────────────────────
-    log.info("[SUBTREE] Slow path: full MAFFT + FastTree build")
-    seqs_fasta = out / 'subtree_input_sequences.fasta'
+    log.info("[ORG-CHART] Slow path: full MAFFT + FastTree build")
+    seqs_fasta = out / 'org_chart_input_sequences.fasta'
     write_fasta([(sid, seq) for sid, seq, *_ in matched], str(seqs_fasta))
 
     # Empty FASTA as user_fasta; all sequences go in via the FASTA directly
@@ -2429,13 +3005,13 @@ def _build_subtree(
         if default_tree.exists():
             import shutil
             shutil.copy2(str(default_tree), str(tree_path))
-            log.info("[SUBTREE] Slow path tree written → %s", tree_path)
+            log.info("[ORG-CHART] Slow path tree written → %s", tree_path)
     except Exception as e:
-        log.warning("[SUBTREE] Slow path tree build failed: %s", e)
+        log.warning("[ORG-CHART] Slow path tree build failed: %s", e)
 
 
-def _finalise_tree_subtree(out: Path, id_map: dict, tree_path: Path, log) -> None:
-    """Remap IDs, prune anchors, and label internal nodes for subtree output."""
+def _finalise_org_chart_tree(out: Path, id_map: dict, tree_path: Path, log) -> None:
+    """Remap IDs, prune anchors, and label internal nodes for Org Chart output."""
     from branchmanager.pipeline.tree import (
         _repair_internal_node_label_delimiters, _label_internal_nodes,
         _prune_anchor_leaves, REF_ANCHOR_PREFIX,
@@ -2450,14 +3026,14 @@ def _finalise_tree_subtree(out: Path, id_map: dict, tree_path: Path, log) -> Non
     newick = _prune_anchor_leaves(newick)
     after = newick.count(REF_ANCHOR_PREFIX)
     if before:
-        log.info("[SUBTREE] Pruned %d anchor leaves from subtree newick", before - after)
+        log.info("[ORG-CHART] Pruned %d anchor leaves from focused-tree newick", before - after)
     newick = _repair_internal_node_label_delimiters(newick)
     newick = _label_internal_nodes(newick)
     tree_path.write_text(newick)
-    log.info("[SUBTREE] Subtree finalised → %s", tree_path)
+    log.info("[ORG-CHART] Focused tree finalised → %s", tree_path)
 
 
-def cmd_regen_itol(args):
+def cmd_label_maker(args):
     db = Database(args.db)
     db.initialise()
     outdir = args.out
@@ -2468,17 +3044,17 @@ def cmd_regen_itol(args):
     try:
         with db.connect() as conn:
             cur = conn.cursor()
-            # If the outdir contains a preload combined taxonomy file, prefer
-            # to use only those IDs so the regenerated iTOL matches preload
+            # If the outdir contains a Filing Cabinet combined taxonomy file, prefer
+            # to use only those IDs so the regenerated iTOL matches the previous review
             # statistics. This mirrors the behaviour used during `run` when a
-            # --preload-dir is supplied.
+            # --previous-review is supplied.
             try:
                 p = Path(outdir)
                 # Prefer an existing combined taxonomy file in the outdir, but
                 # only if it contains data (header + >=1 data row). Fall back
                 # to the DB-wide query otherwise to avoid regenerating empty
                 # iTOL outputs when a stub file exists.
-                preload_file = None
+                previous_review_file = None
                 for cand in _combined_taxonomy_candidates(p):
                     if not cand.exists():
                         continue
@@ -2487,36 +3063,36 @@ def cmd_regen_itol(args):
                         with open(cand) as pf:
                             cnt = sum(1 for _ in pf)
                         if cnt > 1:
-                            preload_file = cand
+                            previous_review_file = cand
                             break
                         else:
                             # file exists but only header or empty -> ignore
                             continue
                     except Exception:
                         continue
-                preload_ids = None
-                if preload_file is not None:
-                    preload_ids = read_combined_taxonomy_ids(preload_file)
+                previous_review_ids = None
+                if previous_review_file is not None:
+                    previous_review_ids = read_combined_taxonomy_ids(previous_review_file)
                 else:
-                    preload_ids = None
+                    previous_review_ids = None
             except Exception:
-                preload_ids = None
+                previous_review_ids = None
 
-            preload_id_list = preload_ids if isinstance(preload_ids, list) else []
+            previous_review_id_list = previous_review_ids if isinstance(previous_review_ids, list) else []
 
             # fetch id, taxonomy, confidence and dataset for all sequences (or filter)
             if getattr(args, 'include_datasets', None):
                 ds_list = [d.strip() for d in args.include_datasets.split(',') if d.strip()]
                 placeholders = ','.join('?' for _ in ds_list)
                 cur.execute(f"SELECT s.id, t.taxonomy, t.confidence, s.dataset FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id WHERE s.dataset IN ({placeholders})", tuple(ds_list))
-            elif preload_id_list:
-                placeholders = ','.join('?' for _ in preload_id_list)
-                cur.execute(f"SELECT s.id, t.taxonomy, t.confidence, s.dataset FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id WHERE s.id IN ({placeholders})", tuple(preload_id_list))
+            elif previous_review_id_list:
+                placeholders = ','.join('?' for _ in previous_review_id_list)
+                cur.execute(f"SELECT s.id, t.taxonomy, t.confidence, s.dataset FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id WHERE s.id IN ({placeholders})", tuple(previous_review_id_list))
             else:
                 cur.execute("SELECT s.id, t.taxonomy, t.confidence, s.dataset FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id")
             rows = cur.fetchall()
     except Exception as e:
-        log.warning("[REGEN-ITOL] Failed to query DB: %s", e)
+        log.warning("[LABEL-MAKER] Failed to query DB: %s", e)
         return
 
     try:
@@ -2524,26 +3100,26 @@ def cmd_regen_itol(args):
         if kingdom:
             kingdom_text = str(kingdom)
             rows = [row for row in rows if row[1] and taxonomy_matches_kingdom(str(row[1]), kingdom_text)]
-            log.info("[REGEN-ITOL] Retained %d rows after kingdom filter=%s", len(rows), kingdom)
+            log.info("[LABEL-MAKER] Retained %d rows after kingdom filter=%s", len(rows), kingdom)
     except Exception as e:
-        log.warning("[REGEN-ITOL] Kingdom filter failed: %s", e)
+        log.warning("[LABEL-MAKER] Kingdom filter failed: %s", e)
 
     combined_path = Path(outdir) / 'combined_taxonomy.tsv'
     try:
         write_combined_taxonomy_tsv(combined_path, [(rid, tax, conf) for rid, tax, conf, ds in rows])
-        log.info("[REGEN-ITOL] Wrote combined taxonomy for %d ids to %s", len(rows), combined_path)
+        log.info("[LABEL-MAKER] Wrote combined taxonomy for %d ids to %s", len(rows), combined_path)
     except Exception as e:
-        log.warning("[REGEN-ITOL] Failed to write combined taxonomy: %s", e)
+        log.warning("[LABEL-MAKER] Failed to write combined taxonomy: %s", e)
         return
 
     # call itol generator
     try:
         tree_path = Path(outdir) / 'current_tree.nwk'
         tfile = str(tree_path) if tree_path.exists() else _find_tree_file_in_dir(outdir)
-        itol.generate_itol_colors(str(combined_path), outdir, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
-        log.info("[REGEN-ITOL] Generated iTOL color files in %s", outdir)
+        itol.generate_itol_colours(str(combined_path), outdir, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
+        log.info("[LABEL-MAKER] Generated iTOL colour files in %s", outdir)
     except Exception as e:
-        log.warning("[REGEN-ITOL] Color generation failed: %s", e)
+        log.warning("[LABEL-MAKER] Colour generation failed: %s", e)
 
     # Optional: write functional annotation datasets when provided
     try:
@@ -2551,9 +3127,9 @@ def cmd_regen_itol(args):
         if func_tsv:
             try:
                 written = itol.write_functional_annotations(str(func_tsv), outdir, id_map=None)
-                log.info("[REGEN-ITOL] Wrote functional annotation iTOL files: %s", ','.join(written) if written else '(none)')
+                log.info("[LABEL-MAKER] Wrote functional annotation iTOL files: %s", ','.join(written) if written else '(none)')
             except Exception as e:
-                log.warning("[REGEN-ITOL] Functional annotations generation failed: %s", e)
+                log.warning("[LABEL-MAKER] Functional annotations generation failed: %s", e)
     except Exception:
         pass
     # Draft rumen functional groups
@@ -2561,11 +3137,11 @@ def cmd_regen_itol(args):
         try:
             tsv_out, itol_out = itol.generate_rumen_function_draft(str(combined_path), outdir, id_map=None)
             if tsv_out:
-                log.info("[REGEN-ITOL] Draft rumen functional annotation: %s", tsv_out)
+                log.info("[LABEL-MAKER] Draft rumen functional annotation: %s", tsv_out)
             if itol_out:
-                log.info("[REGEN-ITOL] Rumen functional iTOL file: %s", itol_out)
+                log.info("[LABEL-MAKER] Rumen functional iTOL file: %s", itol_out)
         except Exception as e:
-            log.warning("[REGEN-ITOL] Draft rumen functions generation failed: %s", e)
+            log.warning("[LABEL-MAKER] Draft rumen functions generation failed: %s", e)
 
     # build dataset membership strip
     try:
@@ -2573,9 +3149,9 @@ def cmd_regen_itol(args):
         ds_map = {r[0]: (r[3] or '') for r in rows}
         membership_path = Path(outdir) / 'itol_dataset_membership.itol'
         itol.write_dataset_membership_strip(str(membership_path), ids_in_order, ds_map)
-        log.info("[REGEN-ITOL] Wrote dataset membership ITOL to %s", membership_path)
+        log.info("[LABEL-MAKER] Wrote dataset membership iTOL file to %s", membership_path)
     except Exception as e:
-        log.warning("[REGEN-ITOL] Failed to build/write dataset membership ITOL: %s", e)
+        log.warning("[LABEL-MAKER] Failed to build/write dataset membership iTOL file: %s", e)
 
     # write explanations for regenerated outputs
     try:
@@ -2590,83 +3166,90 @@ def build_parser():
         description=(
             'BranchManager — marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation toolkit.\n\n'
             'Subcommands:\n'
-            '  preclassify Pre-classify reference FASTA collections (Hungate, SILVA …) once and reuse.\n'
-            '  preload     Load a baseline dataset (e.g. Hungate) and build the backbone tree.\n'
-            '  evaluate    Core partner-sequence evaluation workflow (alias: run/eval).\n'
-            '  run         Process new sequences against the baseline; score novelty and update the tree.\n'
-            '  subtree     Extract a focused tree and iTOL files for a specific taxon from an existing DB.\n'
-            '  regen-itol  Regenerate iTOL colour files from an existing DB without re-running analysis.\n\n'
+            '  background-check   Pre-classify reference collections once and reuse the evidence.\n'
+            '  filing-cabinet     Register the cultured baseline and backbone tree.\n'
+            '  onboarding         Validate a partner submission before project state changes.\n'
+            '  paper-trail        Interpret chromatograms and assemble primer reads.\n'
+            '  performance-review Assess taxonomy, novelty, phylogeny, and sequencing candidates.\n'
+            '  status-meeting     Import factual isolate lifecycle changes.\n'
+            '  records-update     Import completed-genome, QC, GTDB, and ANI evidence.\n'
+            '  quarterly-review   Nominate a later genome tranche from the complete project.\n'
+            '  annual-report      Produce the cumulative end-of-project report.\n'
+            '  it-desk            Check dependencies and project inputs before production.\n'
+            '  assistant          Run the complete raw-trace-to-Hiring-Panel workflow.\n'
+            '  org-chart          Extract a focused tree and iTOL files for a specific taxon.\n'
+            '  label-maker        Regenerate iTOL annotation files from stored taxonomy.\n\n'
             'Typical workflow:\n'
-            '  0. branchmanager preclassify --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o preclassify_out\n'
-            '  1. branchmanager preload  --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments preclassify_out/pipeline_taxonomy.tsv --build-tree -o preload_out\n'
-            '  2. branchmanager evaluate --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1  --ref gtdb.fna --baseline-fasta hungate.fasta --baseline-dataset Hungate --mwl MWL.xlsx -o eval_out\n'
-            '  3. branchmanager subtree  --db project.db --taxon archaea --from-dir preload_out -o archaea_out\n'
+            '  0. branchmanager background-check --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o background_check_out\n'
+            '  1. branchmanager filing-cabinet --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments background_check_out/pipeline_taxonomy.tsv --build-tree -o filing_cabinet_out\n'
+            '  2. branchmanager performance-review --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1 --ref gtdb.fna --mwl MWL.xlsx -o review_out\n'
+            '  3. branchmanager quarterly-review --db project.db --genome-budget 24 --tree review_out/tree/current_tree.nwk -o quarterly_review_01\n'
+            '  4. branchmanager org-chart --db project.db --taxon archaea --from-dir filing_cabinet_out -o archaea_out\n'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest='command')
 
-    # ── preload ───────────────────────────────────────────────────────────────
-    preload = sub.add_parser(
-        'preload',
-        help='Load a baseline dataset and build the reference tree.',
+    filing_cabinet_parser = sub.add_parser(
+        'filing-cabinet',
+        help='Filing Cabinet: register a cultured baseline and build the reference tree.',
         description=(
-            'Load a baseline FASTA dataset (e.g. Hungate 16S) into the DB, optionally classify\n'
+            'Filing Cabinet registers a baseline FASTA dataset (e.g. Hungate 16S) in the DB, optionally classifies\n'
             'sequences against a reference (GTDB/SILVA), collapse near-identical sequences,\n'
             'and build the backbone phylogenetic tree.\n\n'
-            'This is always the first step. All subsequent `run` calls measure novelty against\n'
+            'This is always the first step. All subsequent Performance Reviews measure novelty against\n'
             'sequences stored by this command.'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    preload.add_argument('--fasta', required=True,
+    filing_cabinet_parser.add_argument('--fasta', required=True,
         help='Input FASTA file containing the baseline sequences to load.')
-    preload.add_argument('--db', required=True,
+    filing_cabinet_parser.add_argument('--db', required=True,
         help='Path to the BranchManager SQLite database (created if it does not exist).')
-    preload.add_argument('-o', '--out', required=False, default='.',
+    filing_cabinet_parser.add_argument('-o', '--out', required=False, default='.',
         help='Output directory for tree, iTOL files, and reports (default: current directory).')
-    preload.add_argument('--dataset', required=True,
+    filing_cabinet_parser.add_argument('--dataset', required=True,
         help='Label for this dataset stored in the DB (e.g. Hungate). Used to colour iTOL strips.')
-    preload.add_argument('--shorten-ids', dest='shorten_ids',
+    filing_cabinet_parser.add_argument('--shorten-ids', dest='shorten_ids',
         action=argparse.BooleanOptionalAction, default=False,
         help='Replace input headers with compact IDs (e.g. HUN001). Default is to preserve the IDs exactly as supplied.')
-    preload.add_argument('--classify', action='store_true',
+    filing_cabinet_parser.add_argument('--classify', action='store_true',
         help='Classify sequences against --ref and store taxonomy in the DB. Requires --ref.')
-    preload.add_argument('--build-tree', action='store_true',
+    filing_cabinet_parser.add_argument('--build-tree', action='store_true',
         help='Build the backbone MAFFT + FastTree phylogenetic tree after loading.')
-    preload.add_argument('--ref', required=False,
+    filing_cabinet_parser.add_argument('--ref', required=False,
         help='Reference FASTA (GTDB/SILVA reps) for classification and tree orientation. Preferred over --taxa-assignments for externally classified inputs.')
-    preload.add_argument('--taxa', required=False,
+    filing_cabinet_parser.add_argument('--taxa', required=False,
         help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage). Optional when --ref FASTA headers already contain lineages.')
-    preload.add_argument('--ref-name', dest='ref_name', required=False, default=None,
+    filing_cabinet_parser.add_argument('--ref-name', dest='ref_name', required=False, default=None,
         help='Display name for the primary reference database (default: derived from --ref filename). Used to label taxonomy columns.')
-    preload.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
+    filing_cabinet_parser.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
         help='Additional reference FASTA to classify against (repeatable). Produces extra taxonomy columns in output files.')
-    preload.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
+    filing_cabinet_parser.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
         help='Taxonomy TSV/CSV for the corresponding --alt-ref (positionally paired; repeatable; .gz accepted).')
-    preload.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
+    filing_cabinet_parser.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
         help='Display name for the corresponding --alt-ref (positionally paired; repeatable). Default: derived from filename.')
-    preload.add_argument('--main-ref', dest='main_ref', required=False, default=None,
+    filing_cabinet_parser.add_argument('--main-ref', dest='main_ref', required=False, default=None,
         help='Name of the reference database to use as the primary taxonomy source (default: primary --ref). Must match one of the --ref-name / --alt-ref-name values.')
-    preload.add_argument('--taxa-assignments', '--taxa-aasignments',
+    filing_cabinet_parser.add_argument('--taxa-assignments',
         dest='taxa_assignments', required=False,
         help='Pre-computed taxonomy assignments for the INPUT sequences (TSV/CSV, optionally .gz: query_id + lineage, or a FASTA with embedded lineages). Use this instead of --classify when you already have taxonomy.')
-    preload.add_argument('--collapse', action='store_true',
+    filing_cabinet_parser.add_argument('--collapse', action='store_true',
         help='Collapse sequences that share ≥ --collapse-threshold identity AND the same taxonomy into a single representative for the tree. Saves time and reduces visual clutter.')
-    preload.add_argument('--collapse-threshold', type=float, default=99.8,
+    filing_cabinet_parser.add_argument('--collapse-threshold', type=float, default=99.8,
         help='Identity threshold (percent) for collapsing duplicate-like sequences (default: 99.8).')
-    preload.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
+    filing_cabinet_parser.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
         choices=SEQUENCE_DOMAIN_CHOICES, default=None,
         help=(
-            'Sequence/domain profile for this preload. Default behavior is bacteria. '
+            'Sequence/domain profile for this Filing Cabinet. Default behaviour is bacteria. '
             'Use archaea for archaeal 16S, fungi for fungal/eukaryotic runs with suitable refs/anchors, '
             'or mixed/all/none to disable domain filtering.'
         ))
-    preload.add_argument('--anchors', required=False, default=None,
+    filing_cabinet_parser.add_argument('--anchors', required=False, default=None,
         help='Custom reference anchor FASTA for tree topology scaffolding. Defaults to the 26-sequence bundled anchor set (src/branchmanager/data/reference_anchors.fasta).')
-    preload.add_argument('--threads', type=int, required=False, default=4,
+    filing_cabinet_parser.add_argument('--threads', type=int, required=False, default=4,
         help='Number of CPU threads for MAFFT and VSEARCH (default: 4).')
-    preload.add_argument('--tree-method', dest='tree_method',
+    filing_cabinet_parser.add_argument('--tree-method', dest='tree_method',
         choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree',
         help=(
             'Phylogenetic tree-building backend (default: fasttree). '
@@ -2677,9 +3260,9 @@ def build_parser():
             'Requires iqtree2 in PATH when using iqtree/iqtree-fast.'
         ),
     )
-    preload.add_argument('--colors', required=False,
-        help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, color).')
-    preload.add_argument(
+    filing_cabinet_parser.add_argument('--colours', required=False,
+        help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, colour).')
+    filing_cabinet_parser.add_argument(
         '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
         help=(
             'Collapse multiple phyla into a single colour in iTOL legends. Repeatable. '
@@ -2688,7 +3271,7 @@ def build_parser():
             '"Firmicutes:Bacillota,Bacillota_I" (named group).'
         ),
     )
-    preload.add_argument('--functional', dest='functional', required=False, default=None,
+    filing_cabinet_parser.add_argument('--functional', dest='functional', required=False, default=None,
         help=(
             'TSV file mapping sequence IDs to functional attributes (pathways, functions, '
             'traits, scores, etc.). Header row required; first column = sequence ID; '
@@ -2697,7 +3280,7 @@ def build_parser():
             'numeric → DATASET_SIMPLEBAR, categorical → DATASET_COLORSTRIP.'
         ),
     )
-    preload.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+    filing_cabinet_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
         action='store_true', default=False,
         help=(
             'Auto-generate a draft rumen functional-group annotation from the output taxonomy. '
@@ -2708,111 +3291,119 @@ def build_parser():
         ),
     )
 
-    # ── run ───────────────────────────────────────────────────────────────────
-    run = sub.add_parser(
-        'run',
-        aliases=['evaluate', 'eval'],
-        help='Process new sequences against the baseline; score novelty and update the tree.',
+    performance_review_parser = sub.add_parser(
+        'performance-review',
+        help='Performance Review: assess taxonomy, novelty, phylogeny, and sequencing candidates.',
         description=(
-            'Evaluate new partner 16S isolate sequences against the project baseline.\n\n'
+            'Assess new partner 16S isolate sequences against the project baseline.\n\n'
             'The workflow classifies against GTDB (primary), optionally cross-checks NCBI/GG2/SILVA\n'
-            'as --alt-ref databases, scores novelty and neighbourhood density against prior partner\n'
-            'and preload/baseline sequences, updates the tree, and optionally matches GTDB taxonomy against\n'
+            'as --alt-ref databases, scores novelty against separate cultured-baseline and rolling partner\n'
+            'collections, updates the tree, and optionally matches GTDB taxonomy against\n'
             'the Most Wanted List via --mwl.\n\n'
             'Provide --baseline-fasta for context datasets such as Hungate when they have not already\n'
-            'been loaded with `branchmanager preload`. Novelty is always relative to YOUR submitted data,\n'
-            'not the full external reference. Each successive run extends the baseline, so scores\n'
-            'become increasingly precise.'
+            'been registered with `branchmanager filing-cabinet`. Novelty is always relative to YOUR submitted data,\n'
+            'not the full external reference. Each successive Performance Review extends the partner collection and\n'
+            'updates same-species genome coverage and candidate sets.'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    run.add_argument('--input', required=True,
+    performance_review_parser.add_argument('--input', required=True,
         help='FASTA file of new sequences to analyse.')
-    run.add_argument('--db', required=True,
-        help='Path to the BranchManager SQLite database (must have been initialised with `branchmanager preload`).')
-    run.add_argument('-o', '--out', required=True,
+    performance_review_parser.add_argument('--db', required=True,
+        help='Path to the BranchManager SQLite database (must have been initialised with `branchmanager filing-cabinet`).')
+    performance_review_parser.add_argument('-o', '--out', required=True,
         help='Output directory for this run (sequence_assessment.tsv, novelty_metrics.tsv, tree, iTOL files, etc.).')
-    run.add_argument('--dataset', required=True,
+    performance_review_parser.add_argument('--dataset', required=True,
         help='Label for this batch of sequences stored in the DB (e.g. Batch1). Used in iTOL dataset-membership strip.')
-    run.add_argument('--ref', required=False,
-        help='Reference FASTA (GTDB/SILVA reps) used for classification and tree orientation. Same file used in preload.')
-    run.add_argument('--taxa', required=False,
+    performance_review_parser.add_argument('--ref', required=False,
+        help='Reference FASTA (GTDB/SILVA reps) used for classification and tree orientation. Use the same file as the Filing Cabinet.')
+    performance_review_parser.add_argument('--taxa', required=False,
         help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage).')
-    run.add_argument('--ref-name', dest='ref_name', required=False, default=None,
+    performance_review_parser.add_argument('--ref-name', dest='ref_name', required=False, default=None,
         help='Display name for the primary reference database (default: derived from --ref filename).')
-    run.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
+    performance_review_parser.add_argument('--alt-ref', dest='alt_ref', action='append', default=None, metavar='FASTA',
         help='Additional reference FASTA to classify against (repeatable). Adds extra taxonomy columns to sequence_assessment.tsv and taxonomy_all_dbs.tsv.')
-    run.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
+    performance_review_parser.add_argument('--alt-taxa', dest='alt_taxa', action='append', default=None, metavar='TABLE',
         help='Taxonomy TSV/CSV for the corresponding --alt-ref (positionally paired; repeatable; .gz accepted).')
-    run.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
+    performance_review_parser.add_argument('--alt-ref-name', dest='alt_ref_name', action='append', default=None, metavar='NAME',
         help='Display name for the corresponding --alt-ref (positionally paired; repeatable).')
-    run.add_argument('--main-ref', dest='main_ref', required=False, default=None,
-        help='Name of the reference database to treat as primary (drives the main Taxonomy column). Default: primary --ref.')
-    run.add_argument('--mwl', dest='mwl', required=False, default=None,
+    performance_review_parser.add_argument('--main-ref', dest='main_ref', required=False, default=None,
+        help='Name of the authoritative assessment database. Bacterial/archaeal Performance Review requires GTDB; other databases are reporting cross-checks.')
+    performance_review_parser.add_argument('--mwl', dest='mwl', required=False, default=None,
         help='Most Wanted List workbook/TSV/CSV. GTDB taxonomy is matched against this list and MWL columns are added to sequence_assessment.tsv.')
-    run.add_argument('--mwl-sheet', dest='mwl_sheet', required=False, default='MWL_V1',
+    performance_review_parser.add_argument('--mwl-sheet', dest='mwl_sheet', required=False, default='MWL_V1',
         help='Sheet name to read from an MWL .xlsx workbook (default: MWL_V1).')
-    run.add_argument('--mwl-min-rank', dest='mwl_min_rank', required=False, default='p',
+    performance_review_parser.add_argument('--mwl-min-rank', dest='mwl_min_rank', required=False, default='p',
         choices=['domain', 'd', 'phylum', 'p', 'class', 'c', 'order', 'o', 'family', 'f', 'genus', 'g', 'species', 's'],
         help='Minimum matched rank required for an MWL hit (default: phylum). Domain-only MWL entries still match at domain.')
-    run.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', required=False, default=None,
-        help='CSV/TSV sidecar table for this run with sequence IDs, partner IDs, and whether each isolate was selected for full-genome sequencing. .gz is accepted. Required when using the evaluate/eval alias.')
-    run.add_argument('--baseline-fasta', dest='baseline_fasta', required=False, default=None,
+    performance_review_parser.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', required=False, default=None,
+        help='Cumulative CSV/TSV ledger with sequence IDs, partner acronyms, optional selected_for_genome_sequencing, and required already_sequenced status. Selection is a commitment; already_sequenced means a genome is available. .gz is accepted.')
+    performance_review_parser.add_argument('--marker-qc', dest='marker_qc', default=None,
+        help='Paper Trail/Merge Meeting assembly_report.tsv sidecar. Auto-discovered beside --input when omitted.')
+    performance_review_parser.add_argument('--marker-review', dest='marker_review', default=None,
+        help='CSV/TSV manual-review decisions for PASS_WITH_WARNINGS or unverified marker sequences.')
+    performance_review_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False,
+        help='Explicitly accept FASTA inputs lacking Paper Trail provenance. Recorded in the manifest and assessment; use only for independently validated sequences.')
+    performance_review_parser.add_argument('--baseline-fasta', dest='baseline_fasta', required=False, default=None,
         help='Optional baseline/context FASTA to load before evaluating the new sequences (e.g. Hungate 16S).')
-    run.add_argument('--baseline-dataset', dest='baseline_dataset', required=False, default='Baseline',
+    performance_review_parser.add_argument('--baseline-dataset', dest='baseline_dataset', required=False, default='Baseline',
         help='Dataset label for --baseline-fasta in the DB and default cultured-baseline novelty pool (default: Baseline). Must differ from --dataset.')
-    run.add_argument('--novelty-baseline-dataset', dest='novelty_baseline_datasets', action='append', default=[],
+    performance_review_parser.add_argument('--novelty-baseline-dataset', dest='novelty_baseline_datasets', action='append', default=[],
         help='Existing DB dataset label to include in the baseline/cultured novelty pool (repeatable; useful for Hungate plus other cultured isolate sets).')
-    run.add_argument('--baseline-taxa-assignments', dest='baseline_taxa_assignments', required=False, default=None,
+    performance_review_parser.add_argument('--baseline-taxa-assignments', dest='baseline_taxa_assignments', required=False, default=None,
         help='Pre-computed taxonomy for --baseline-fasta (TSV/CSV, optionally .gz: sequence_id + lineage + optional confidence, or embedded-lineage FASTA). Skips baseline classification.')
-    run.add_argument('--baseline-skip-classify', dest='baseline_skip_classify', action='store_true', default=False,
+    performance_review_parser.add_argument('--baseline-skip-classify', dest='baseline_skip_classify', action='store_true', default=False,
         help='Load --baseline-fasta into the DB without classifying it. Novelty still uses the baseline sequences, but taxonomy/iTOL context may be sparse.')
-    run.add_argument('--baseline-colors', dest='baseline_colors', required=False, default=None,
-        help='Optional CSV with baseline sequence colors, same format as preload --colors.')
-    run.add_argument('--baseline-shorten-ids', dest='baseline_shorten_ids',
+    performance_review_parser.add_argument('--baseline-colours', dest='baseline_colours', required=False, default=None,
+        help='Optional CSV with baseline sequence colours, in the same format as filing-cabinet --colours.')
+    performance_review_parser.add_argument('--baseline-shorten-ids', dest='baseline_shorten_ids',
         action=argparse.BooleanOptionalAction, default=False,
         help='Replace baseline FASTA headers with compact IDs. Default is to preserve the IDs exactly as supplied.')
-    run.add_argument('--taxa-assignments', '--taxa-aasignments',
+    performance_review_parser.add_argument('--taxa-assignments',
         dest='taxa_assignments', required=False,
         help='Pre-computed taxonomy for the INPUT sequences (TSV/CSV, optionally .gz: query_id + lineage, or embedded-lineage FASTA).')
-    run.add_argument('--preload-dir', dest='preload_dir', required=False,
-        help='Path to the preload output directory. Used to seed the tree backbone alignment so only new sequences need aligning.')
-    run.add_argument('--shorten-ids', dest='shorten_ids',
+    performance_review_parser.add_argument('--previous-review', dest='previous_review', required=False,
+        help='Path to the previous Filing Cabinet or Performance Review output directory. Used to seed the tree alignment so only new sequences need aligning.')
+    performance_review_parser.add_argument('--shorten-ids', dest='shorten_ids',
         action=argparse.BooleanOptionalAction, default=False,
         help='Replace input headers with compact IDs. Default is to preserve the IDs exactly as supplied.')
-    run.add_argument('--min-len', dest='min_len', type=int, default=800,
+    performance_review_parser.add_argument('--min-len', dest='min_len', type=int, default=800,
         help='Minimum sequence length to retain (bp, default: 800). Shorter sequences are filtered out.')
-    run.add_argument('--max-n', dest='max_n', type=int, default=5,
+    performance_review_parser.add_argument('--max-n', dest='max_n', type=int, default=5,
         help='Maximum number of ambiguous (N) bases allowed (default: 5).')
-    run.add_argument('--collapse', action='store_true',
+    performance_review_parser.add_argument('--chimera-ref', dest='chimera_ref', default=None,
+        help='Curated chimera-free marker reference for UCHIME. Defaults to the primary classification reference.')
+    performance_review_parser.add_argument('--skip-chimera-check', dest='skip_chimera_check', action='store_true', default=False,
+        help='Explicitly skip reference-based chimera screening. The omission is recorded and marker evidence is downgraded.')
+    performance_review_parser.add_argument('--collapse', action='store_true',
         help='Collapse near-identical same-taxonomy sequences into representatives for the tree.')
-    run.add_argument('--collapse-threshold', type=float, default=99.8,
+    performance_review_parser.add_argument('--collapse-threshold', type=float, default=99.8,
         help='Identity threshold (percent) for collapsing (default: 99.8).')
-    run.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
+    performance_review_parser.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
         choices=SEQUENCE_DOMAIN_CHOICES, default=None,
         help=(
-            'Sequence/domain profile for this evaluate/run. Omitted means bacteria. '
+            'Sequence/domain profile for this Performance Review. Omitted means bacteria. '
             'Use archaea for archaeal runs, fungi for fungal/eukaryotic runs with suitable references, '
             'or mixed/all/none to disable domain filtering. Provide domain-specific --ref/--alt-ref, '
-            '--baseline-fasta, --preload-dir, and --anchors as needed.'
+            '--baseline-fasta, --previous-review, and --anchors as needed.'
         ))
-    run.add_argument('--phylum', required=False,
+    performance_review_parser.add_argument('--phylum', required=False,
         help='Filter iTOL output to sequences assigned to this phylum (e.g. Bacillota). Does not affect novelty scoring.')
-    run.add_argument('--target', required=False, default=None,
+    performance_review_parser.add_argument('--target', required=False, default=None,
         help=(
             'FASTA of sequences to measure novelty against instead of the DB. '
-            'Leave unset to use all sequences previously stored in the DB (recommended).'
+            'Leave unset to use the full rolling partner-candidate collection, including this batch with self-hits removed (recommended).'
         ),
     )
-    run.add_argument('--force-rebuild', '--rebuild-tree', dest='force_rebuild', action='store_true', default=False,
+    performance_review_parser.add_argument('--force-rebuild', '--rebuild-tree', dest='force_rebuild', action='store_true', default=False,
         help='Rebuild the entire tree from scratch even when an existing alignment is present. '
-             'When combined with --preload-dir, ignores the preload backbone and jointly estimates '
+             'When combined with --previous-review, ignores the previous alignment and jointly estimates '
              'tree topology across all datasets. (--rebuild-tree is an alias for this flag.)')
-    run.add_argument('--anchors', required=False, default=None,
+    performance_review_parser.add_argument('--anchors', required=False, default=None,
         help='Custom reference anchor FASTA for tree scaffolding. Defaults to bundled anchors.')
-    run.add_argument('--threads', dest='threads', type=int, default=4,
+    performance_review_parser.add_argument('--threads', dest='threads', type=int, default=4,
         help='CPU threads for MAFFT and VSEARCH (default: 4).')
-    run.add_argument('--tree-method', dest='tree_method',
+    performance_review_parser.add_argument('--tree-method', dest='tree_method',
         choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree',
         help=(
             'Phylogenetic tree-building backend (default: fasttree). '
@@ -2821,23 +3412,36 @@ def build_parser():
             'iqtree-fast: IQ-TREE 2 with -fast flag (good for exploratory incremental runs).'
         ),
     )
-    run.add_argument('--user-colors', dest='user_colors', required=False,
-        help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, color).')
-    run.add_argument(
+    performance_review_parser.add_argument(
+        '--neighbourhood-format', dest='neighbourhood_format',
+        choices=['png'], default='png',
+        help='Image format for local phylogenetic-neighbourhood figures (PNG only).',
+    )
+    performance_review_parser.add_argument(
+        '--pangenome-target', dest='pangenome_target', type=int, default=3,
+        help='Target number of available genomes per GTDB species (default: 3). Baseline isolates always count because their genomes are available.',
+    )
+    performance_review_parser.add_argument(
+        '--candidate-set-size', dest='candidate_set_size', type=int, default=4,
+        help='Maximum proposed primary-plus-backup isolates per GTDB species/local novel clade (default: 4).',
+    )
+    performance_review_parser.add_argument('--user-colours', dest='user_colours', required=False,
+        help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, colour).')
+    performance_review_parser.add_argument(
         '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
         help=(
             'Collapse multiple phyla into one colour in iTOL legends. Repeatable. '
             'Formats: "archaea", "bacteria", "Bacillota,Bacillota_I", "Firmicutes:Bacillota,Bacillota_I".'
         ),
     )
-    run.add_argument('--functional', dest='functional', required=False, default=None,
+    performance_review_parser.add_argument('--functional', dest='functional', required=False, default=None,
         help=(
             'TSV file mapping sequence IDs to functional attributes. '
             'Header row required; first column = sequence ID; subsequent columns = functional attributes. '
             'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
         ),
     )
-    run.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+    performance_review_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
         action='store_true', default=False,
         help=(
             'Auto-generate a draft rumen functional-group annotation from the output taxonomy. '
@@ -2846,10 +3450,49 @@ def build_parser():
         ),
     )
 
-    # ── regen-itol ────────────────────────────────────────────────────────────
-    regen = sub.add_parser(
-        'regen-itol',
-        help='Regenerate iTOL colour files from an existing DB without re-running analysis.',
+    quarterly_review_parser = sub.add_parser(
+        'quarterly-review',
+        help='Select the next project-wide genome tranche after rolling Performance Reviews.',
+        description=(
+            'Reconsider every accumulated partner isolate in one auditable selection round.\n\n'
+            'Residual three-genome coverage gaps are filled first. Remaining budget is allocated\n'
+            'across species using marginal tree/marker diversity, existing genome representation,\n'
+            'cultured-baseline novelty, GTDB-reference context, and MWL evidence. Recommendations\n'
+            'never change already_sequenced status. Use genome ANI/phylogenomics to validate\n'
+            'strain-level diversity once genome data are available.'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    quarterly_review_parser.add_argument('--db', required=True,
+        help='Rolling BranchManager SQLite database containing all partner and baseline sequences.')
+    quarterly_review_parser.add_argument('-o', '--out', required=True,
+        help='Output directory for quarterly_review_summary.tsv, next_genome_set.tsv, and quarterly_review_manifest.tsv.')
+    quarterly_review_parser.add_argument('--genome-budget', type=int, required=True,
+        help='Number of new PRIMARY genomes to nominate in this round. This is intentionally explicit.')
+    quarterly_review_parser.add_argument('--backups-per-primary', type=int, default=1,
+        help='Number of extraction-failure/diversity backups to nominate per primary (default: 1).')
+    quarterly_review_parser.add_argument('--pangenome-target', type=int, default=3,
+        help='Initial exact-GTDB-species coverage target that must be satisfied before expansion (default: 3).')
+    quarterly_review_parser.add_argument('--assessment', action='append', default=None, metavar='TSV',
+        help='Import a full sequence_assessment.tsv before selection (repeatable; later files supersede earlier rows). Future Performance Reviews store snapshots automatically.')
+    quarterly_review_parser.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', default=None,
+        help='Optional cumulative metadata TSV/CSV used to refresh confirmed already_sequenced status before this round.')
+    quarterly_review_parser.add_argument('--tree', default=None,
+        help='Latest cumulative Newick tree. Enables marginal patristic-diversity ranking.')
+    quarterly_review_parser.add_argument('--alignment', default=None,
+        help='Latest cumulative MSA. Recomputes nearest currently available genome context after metadata updates.')
+    quarterly_review_parser.add_argument('--from-dir', default=None,
+        help='Latest Performance Review output directory; used to locate tree/current_tree.nwk when --tree is omitted.')
+    quarterly_review_parser.add_argument('--round-id', default=None,
+        help='Stable round label. Default: UTC timestamp such as quarterly_review_20260713T120000Z.')
+    quarterly_review_parser.add_argument('--neighbourhood-format', choices=['png'], default='png',
+        help='Image format for Quarterly Review local-neighbourhood figures (PNG only).')
+    quarterly_review_parser.add_argument('--include-moderate-evidence', action='store_true', default=False,
+        help='Allow MODERATE marker-evidence rows into the Quarterly Review. By default they are REVIEW only.')
+
+    label_maker_parser = sub.add_parser(
+        'label-maker',
+        help='Label Maker: regenerate iTOL annotation files from stored taxonomy.',
         description=(
             'Re-generate all iTOL colour strips (phylum, family, genus, dataset membership)\n'
             'from the taxonomy already stored in the DB. Useful after changing --group-phyla\n'
@@ -2857,42 +3500,41 @@ def build_parser():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    regen.add_argument('--db', required=True,
+    label_maker_parser.add_argument('--db', required=True,
         help='Path to the BranchManager SQLite database.')
-    regen.add_argument('-o', '--out', required=True,
-        help='Output directory where iTOL files will be written (should be the preload or run output dir).')
-    regen.add_argument('--include-datasets', required=False,
+    label_maker_parser.add_argument('-o', '--out', required=True,
+        help='Output directory where iTOL files will be written (normally a Filing Cabinet or Performance Review output directory).')
+    label_maker_parser.add_argument('--include-datasets', required=False,
         help='Comma-separated list of dataset names to include (default: all datasets in the DB).')
-    regen.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
+    label_maker_parser.add_argument('--sequence-domain', '--organism-domain', dest='sequence_domain',
         choices=SEQUENCE_DOMAIN_CHOICES, default=None,
         help='Optional domain profile filter for regenerated outputs: bacteria, archaea, fungi, or mixed/all/none.')
-    regen.add_argument(
+    label_maker_parser.add_argument(
         '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
         help=(
             'Collapse multiple phyla into one colour in iTOL legends. Repeatable. '
             'Formats: "archaea", "bacteria", "Bacillota,Bacillota_I", "Firmicutes:Bacillota,Bacillota_I".'
         ),
     )
-    regen.add_argument('--functional', dest='functional', required=False, default=None,
+    label_maker_parser.add_argument('--functional', dest='functional', required=False, default=None,
         help=(
             'TSV file mapping sequence IDs to functional attributes. '
             'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
         ),
     )
-    regen.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+    label_maker_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
         action='store_true', default=False,
         help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
     )
 
-    # ── subtree ───────────────────────────────────────────────────────────────
-    subtree = sub.add_parser(
-        'subtree',
-        help='Build a focused tree and iTOL files for a specific taxon from an existing DB.',
+    org_chart_parser = sub.add_parser(
+        'org-chart',
+        help='Org Chart: build a focused tree and iTOL files for a specific taxon.',
         description=(
             'Extract all sequences matching a given taxon from the DB and build a focused\n'
             'phylogenetic tree for that group only.\n\n'
             'Fast path: if --from-dir points to a directory containing current_alignment.fasta\n'
-            '(a preload or run output), sequences are sliced from the pre-built alignment and\n'
+            '(a Filing Cabinet or Performance Review output), sequences are sliced from the pre-built alignment and\n'
             'FastTree is run directly — no MAFFT re-alignment needed (~seconds for hundreds of seqs).\n\n'
             'Slow path: if no existing alignment is found, a full MAFFT + FastTree build is run.\n\n'
             'Taxon formats accepted:\n'
@@ -2904,59 +3546,57 @@ def build_parser():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subtree.add_argument('--db', required=True,
+    org_chart_parser.add_argument('--db', required=True,
         help='Path to the BranchManager SQLite database.')
-    subtree.add_argument('-o', '--out', required=True,
-        help='Output directory for the subtree results.')
-    subtree.add_argument('--taxon', required=True,
+    org_chart_parser.add_argument('-o', '--out', required=True,
+        help='Output directory for the focused-tree results.')
+    org_chart_parser.add_argument('--taxon', required=True,
         help='Taxon to extract (see description above for accepted formats).')
-    subtree.add_argument(
+    org_chart_parser.add_argument(
         '--rank', required=False, default='auto',
         choices=['auto', 'domain', 'd', 'phylum', 'p', 'class', 'c',
                  'order', 'o', 'family', 'f', 'genus', 'g', 'species', 's'],
         help='Taxonomic rank to filter on. Default "auto" detects the rank from the taxon name or prefix.',
     )
-    subtree.add_argument('--from-dir', dest='from_dir', required=False, default=None,
+    org_chart_parser.add_argument('--from-dir', dest='from_dir', required=False, default=None,
         help=(
-            'Existing preload or run output directory containing current_alignment.fasta. '
+            'Existing Filing Cabinet or Performance Review output directory containing current_alignment.fasta. '
             'Enables the fast path (sequences extracted from the existing MSA; no re-alignment).'
         ),
     )
-    subtree.add_argument('--ref', required=False,
+    org_chart_parser.add_argument('--ref', required=False,
         help='Reference FASTA for orientation correction (slow-path full build only).')
-    subtree.add_argument('--anchors', required=False, default=None,
+    org_chart_parser.add_argument('--anchors', required=False, default=None,
         help='Custom reference anchor FASTA. Defaults to bundled anchors (26 NCBI RefSeq sequences).')
-    subtree.add_argument('--threads', type=int, default=4,
+    org_chart_parser.add_argument('--threads', type=int, default=4,
         help='CPU threads for FastTree / MAFFT (default: 4).')
-    subtree.add_argument('--min-seqs', dest='min_seqs', type=int, default=3,
+    org_chart_parser.add_argument('--min-seqs', dest='min_seqs', type=int, default=3,
         help='Minimum sequences required to proceed with tree building (default: 3).')
-    subtree.add_argument('--no-tree', dest='no_tree', action='store_true', default=False,
+    org_chart_parser.add_argument('--no-tree', dest='no_tree', action='store_true', default=False,
         help='Skip tree building; only write taxonomy TSV, sequence list, and iTOL colour files.')
-    subtree.add_argument(
+    org_chart_parser.add_argument(
         '--group-phyla', dest='group_phyla', action='append', default=None, metavar='SPEC',
         help=(
             'Collapse multiple phyla into one colour in iTOL legends. Repeatable. '
             'Formats: "archaea", "bacteria", "Bacillota,Bacillota_I", "Firmicutes:Bacillota,Bacillota_I".'
         ),
     )
-    subtree.add_argument('--functional', dest='functional', required=False, default=None,
+    org_chart_parser.add_argument('--functional', dest='functional', required=False, default=None,
         help=(
             'TSV file mapping sequence IDs to functional attributes. Header row required; first column = sequence ID; subsequent columns = functional attributes. '
             'Generates one iTOL file per column (DATASET_BINARY / DATASET_SIMPLEBAR / DATASET_COLORSTRIP).'
         ),
     )
-    subtree.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
+    org_chart_parser.add_argument('--draft-rumen-functions', dest='draft_rumen_functions',
         action='store_true', default=False,
         help='Auto-generate rumen functional-group iTOL annotation from stored taxonomy.',
     )
 
-    # ── sanger / AB1 processing ───────────────────────────────────────────────
-    sanger = sub.add_parser(
-        'sanger',
-        aliases=['ab1', 'ab1-to-fasta'],
-        help='Convert Sanger AB1/sequence reads to trimmed FASTA and assemble primer reads per isolate.',
+    paper_trail_parser = sub.add_parser(
+        'paper-trail',
+        help='Paper Trail and Merge Meeting: convert AB1 reads and assemble primer sequences.',
         description=(
-            'Process Sanger chromatogram reads before evaluate.\n\n'
+            'Process Sanger chromatogram reads before Performance Review.\n\n'
             'Inputs may be AB1/ABI files, FASTA, or FASTQ. AB1 files are base-called from '
             'PBAS/PCON tags, quality-trimmed, oriented by primer direction, and optionally '
             'assembled into one consensus 16S sequence per isolate. For example, 27F reads '
@@ -2966,13 +3606,13 @@ def build_parser():
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sanger.add_argument(
+    paper_trail_parser.add_argument(
         '--input', nargs='+', required=False, default=[],
         help='AB1/ABI/FASTA/FASTQ files or directories to process. Directories are searched recursively by default. Optional when --sample-map lists the read files.',
     )
-    sanger.add_argument('-o', '--out', required=True,
+    paper_trail_parser.add_argument('-o', '--out', required=True,
         help='Output directory for assembled.fasta, read_qc.tsv, visual reports, and assembly_report.tsv.')
-    sanger.add_argument(
+    paper_trail_parser.add_argument(
         '--sample-map', required=False, default=None,
         help=(
             'Optional CSV/TSV one row per isolate/sample. Use sequence_id/isolate_id/sample_id plus '
@@ -2981,59 +3621,198 @@ def build_parser():
             'per-isolate handling. Relative paths are resolved next to the mapping file.'
         ),
     )
-    sanger.add_argument(
+    paper_trail_parser.add_argument(
         '--read-metadata', required=False, default=None,
         help=(
             'Optional CSV/TSV mapping read files to sequence_id, primer, and direction. '
             'Columns: file/read_file, sequence_id, primer, direction. Also accepts the same sample-level format as --sample-map.'
         ),
     )
-    sanger.add_argument(
+    paper_trail_parser.add_argument(
         '--primer', dest='primers', action='append', default=None,
         help='Primer name to recognise in filenames (repeatable). Defaults include common 16S primers such as 27F, 907R, and 1492R.',
     )
-    sanger.add_argument('--min-quality', dest='min_quality', type=int, default=20,
+    paper_trail_parser.add_argument(
+        '--primer-sequence', dest='primer_sequences', action='append', default=None, metavar='NAME=SEQUENCE',
+        help='Primer oligonucleotide used for confident leading-primer removal (repeatable). Built-in common 16S primers are used by default.',
+    )
+    paper_trail_parser.add_argument('--trim-primers', dest='trim_primers',
+        action=argparse.BooleanOptionalAction, default=True,
+        help='Remove confidently matched primer sequence from the retained read (default: enabled).')
+    paper_trail_parser.add_argument('--secondary-peak-ratio', dest='secondary_peak_ratio', type=float, default=0.33,
+        help='Secondary/called chromatogram peak ratio considered mixed (default: 0.33).')
+    paper_trail_parser.add_argument('--max-mixed-peak-percent', dest='max_mixed_peak_percent', type=float, default=5.0,
+        help='Maximum percent retained high-quality positions with mixed peaks before read QC failure (default: 5).')
+    paper_trail_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=20,
+        help='Minimum Phred score for a mixed-peak position to count (default: 20).')
+    paper_trail_parser.add_argument('--screen-ref', dest='screen_ref', default=None,
+        help='Optional marker reference FASTA for independent per-primer taxonomy concordance screening.')
+    paper_trail_parser.add_argument('--screen-taxa', dest='screen_taxa', default=None,
+        help='Optional taxonomy table corresponding to --screen-ref; FASTA header taxonomy is used when omitted.')
+    paper_trail_parser.add_argument('--threads', type=int, default=4,
+        help='CPU threads for optional primer-read taxonomy screening (default: 4).')
+    paper_trail_parser.add_argument('--min-quality', dest='min_quality', type=int, default=20,
         help='Phred cutoff for Mott-style end trimming (default: 20).')
-    sanger.add_argument('--window', type=int, default=20,
+    paper_trail_parser.add_argument('--window', type=int, default=20,
         help='Window size retained in reports for trimming context; rigorous trimming uses the Phred cutoff directly.')
-    sanger.add_argument('--min-length', dest='min_length', type=int, default=800,
+    paper_trail_parser.add_argument('--min-length', dest='min_length', type=int, default=800,
         help='Minimum final sequence length to write to assembled.fasta (default: 800 bp).')
-    sanger.add_argument('--min-read-length', dest='min_read_length', type=int, default=None,
+    paper_trail_parser.add_argument('--min-read-length', dest='min_read_length', type=int, default=None,
         help='Minimum trimmed read length to retain before assembly/best-read selection. Defaults to --min-length.')
-    sanger.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=25.0,
+    paper_trail_parser.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=25.0,
         help='Minimum mean Phred score after trimming/masking for read and final QC (default: 25).')
-    sanger.add_argument('--mask-quality', dest='mask_quality', type=int, default=20,
+    paper_trail_parser.add_argument('--mask-quality', dest='mask_quality', type=int, default=20,
         help='Mask internal bases below this Phred score to N before assembly (default: 20).')
-    sanger.add_argument('--max-read-expected-errors', dest='max_read_expected_errors', type=float, default=8.0,
+    paper_trail_parser.add_argument('--max-read-expected-errors', dest='max_read_expected_errors', type=float, default=8.0,
         help='Maximum expected base-call errors allowed per retained read (default: 8).')
-    sanger.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=5.0,
+    paper_trail_parser.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=5.0,
         help='Maximum expected base-call errors allowed in the final isolate sequence (default: 5).')
-    sanger.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=1.0,
+    paper_trail_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=1.0,
         help='Maximum percent N allowed after masking for reads and final output (default: 1.0).')
-    sanger.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=20,
+    paper_trail_parser.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=20,
         help='Maximum internal low-quality/ambiguous run length before read failure (default: 20 bp).')
-    sanger.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=1.0,
+    paper_trail_parser.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=1.0,
         help='Maximum overlap conflicts per 100 final bases before final QC failure (default: 1.0).')
-    sanger.add_argument('--quality-difference', dest='quality_difference', type=int, default=10,
+    paper_trail_parser.add_argument('--quality-difference', dest='quality_difference', type=int, default=10,
         help='Minimum Phred difference required to choose one conflicting overlap base over another (default: 10).')
-    sanger.add_argument('--allow-missing-quality', dest='allow_missing_quality',
+    paper_trail_parser.add_argument('--allow-missing-quality', dest='allow_missing_quality',
         action='store_true', default=False,
         help='Allow AB1 reads missing PCON quality scores to pass with warnings. By default they fail QC.')
-    sanger.add_argument('--min-overlap', dest='min_overlap', type=int, default=40,
+    paper_trail_parser.add_argument('--min-overlap', dest='min_overlap', type=int, default=40,
         help='Minimum overlap length for assembling multiple primer reads (default: 40 bp).')
-    sanger.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=0.85,
+    paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=0.85,
         help='Minimum overlap identity for assembly, 0-1 (default: 0.85).')
-    sanger.add_argument('--assemble', dest='assemble',
+    paper_trail_parser.add_argument('--assemble', dest='assemble',
         action=argparse.BooleanOptionalAction, default=True,
         help='Assemble multiple reads per sequence_id when possible (default). Use --no-assemble to keep the best read.')
-    sanger.add_argument('--recursive', dest='recursive',
+    paper_trail_parser.add_argument('--recursive', dest='recursive',
         action=argparse.BooleanOptionalAction, default=True,
         help='Search input directories recursively (default).')
+    paper_trail_parser.add_argument('--max-report-image-height', dest='max_report_image_height',
+        type=int, default=2400,
+        help='Maximum height in pixels for each visual-report PNG; larger reports are split into numbered pages (minimum: 600, default: 2400).')
 
-    # ── preclassify ───────────────────────────────────────────────────────────
-    preclassify = sub.add_parser(
-        'preclassify',
-        help='Pre-classify reference FASTA collections (Hungate, SILVA, RDP …) so on-the-fly classification is not needed at run time.',
+    onboarding_parser = sub.add_parser(
+        'onboarding',
+        help='Onboarding: validate partner IDs, metadata, and either raw-read ownership or a supplied FASTA.',
+    )
+    onboarding_inputs = onboarding_parser.add_mutually_exclusive_group(required=True)
+    onboarding_inputs.add_argument('--sample-map',
+        help='CSV/TSV mapping isolate IDs to raw read files for an AB1/primer-read submission.')
+    onboarding_inputs.add_argument('--fasta',
+        help='Partner-supplied marker FASTA to validate without running Paper Trail/Merge Meeting.')
+    onboarding_parser.add_argument('--partner-metadata', default=None,
+        help='Cumulative project metadata CSV/TSV. Required with --fasta; defaults to --sample-map for AB1 submissions.')
+    onboarding_parser.add_argument('--partner-id', default=None,
+        help='Expected partner acronym for this submission, used to validate cumulative-ledger ownership.')
+    onboarding_parser.add_argument('--dataset', default=None,
+        help='Unique partner batch label, for example QUB_01 or UoG_02.')
+    onboarding_parser.add_argument('--read-dir', default=None,
+        help='Optional base directory for relative read paths in the sample map.')
+    onboarding_parser.add_argument('--primer', dest='primers', action='append', default=None,
+        help='Primer column/name to recognise (repeatable).')
+    onboarding_parser.add_argument('-o', '--out', required=True,
+        help='Output directory for the normalised submission and Onboarding report.')
+
+    status_meeting_parser = sub.add_parser(
+        'status-meeting',
+        help='Status Meeting: import factual isolate lifecycle changes into the project ledger.',
+    )
+    status_meeting_parser.add_argument('--db', required=True)
+    status_meeting_parser.add_argument('--input', required=True,
+        help='CSV/TSV with sequence_id, status, and optional detail.')
+    status_meeting_parser.add_argument('-o', '--out', required=True)
+
+    records_update_parser = sub.add_parser(
+        'records-update',
+        help='Records Update: import completed genome/QC/GTDB/ANI evidence.',
+    )
+    records_update_parser.add_argument('--db', required=True)
+    records_update_parser.add_argument('--input', required=True,
+        help='CSV/TSV with sequence_id, genome_id/accession, genome_status, QC, and optional GTDB/ANI fields.')
+    records_update_parser.add_argument('--min-completeness', type=float, default=90.0,
+        help='Minimum estimated genome completeness for automatic QC pass (default: 90).')
+    records_update_parser.add_argument('--max-contamination', type=float, default=5.0,
+        help='Maximum estimated contamination for automatic QC pass (default: 5).')
+    records_update_parser.add_argument('-o', '--out', required=True)
+
+    annual_report_parser = sub.add_parser(
+        'annual-report',
+        help='Annual Report: create the final dashboard, ledgers, and decision-change report.',
+    )
+    annual_report_parser.add_argument('--db', required=True)
+    annual_report_parser.add_argument('-o', '--out', required=True)
+
+    it_desk_parser = sub.add_parser(
+        'it-desk',
+        help='IT Desk: check dependencies, references, database integrity, and output location.',
+    )
+    it_desk_parser.add_argument('--db', default=None)
+    it_desk_parser.add_argument('--ref', dest='references', action='append', default=[])
+    it_desk_parser.add_argument('--tree-method', choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree')
+    it_desk_parser.add_argument('-o', '--out', default='branchmanager_it_desk')
+    it_desk_parser.add_argument('--strict', action='store_true', default=False,
+        help='Return a non-zero exit status when any required check fails.')
+
+    assistant_parser = sub.add_parser(
+        'assistant',
+        help='Assistant to the Branch Manager: run Onboarding through the Hiring Panel.',
+    )
+    assistant_input = assistant_parser.add_mutually_exclusive_group(required=True)
+    assistant_input.add_argument('--sample-map', help='AB1/primer-read sample map; runs Paper Trail and Merge Meeting.')
+    assistant_input.add_argument('--fasta', help='Partner-supplied marker FASTA; bypasses Paper Trail and Merge Meeting.')
+    assistant_parser.add_argument('--partner-metadata', required=True)
+    assistant_parser.add_argument('--partner-id', default=None,
+        help='Expected partner acronym for validation, for example QUB or UoG.')
+    assistant_parser.add_argument('--read-dir', default=None)
+    assistant_parser.add_argument('--db', required=True)
+    assistant_parser.add_argument('--dataset', required=True)
+    assistant_parser.add_argument('--ref', required=True)
+    assistant_parser.add_argument('--taxa', default=None)
+    assistant_parser.add_argument('--ref-name', default='GTDB')
+    assistant_parser.add_argument('--alt-ref', action='append', default=[])
+    assistant_parser.add_argument('--alt-taxa', action='append', default=[])
+    assistant_parser.add_argument('--alt-ref-name', action='append', default=[])
+    assistant_parser.add_argument('--baseline-fasta', default=None)
+    assistant_parser.add_argument('--baseline-dataset', default='Baseline')
+    assistant_parser.add_argument('--baseline-taxa-assignments', default=None)
+    assistant_parser.add_argument('--mwl', default=None)
+    assistant_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default='bacteria')
+    assistant_parser.add_argument('--threads', type=int, default=4)
+    assistant_parser.add_argument('--tree-method', choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree')
+    assistant_parser.add_argument('--pangenome-target', type=int, default=3)
+    assistant_parser.add_argument('--candidate-set-size', type=int, default=4)
+    assistant_parser.add_argument('--primer', dest='primers', action='append', default=None)
+    assistant_parser.add_argument('--primer-sequence', dest='primer_sequences', action='append', default=None,
+        metavar='NAME=SEQUENCE', help='Primer sequence used for IUPAC-aware trimming; repeatable.')
+    assistant_parser.add_argument('--trim-primers', dest='trim_primers',
+        action=argparse.BooleanOptionalAction, default=True)
+    assistant_parser.add_argument('--min-quality', type=int, default=20)
+    assistant_parser.add_argument('--quality-window', dest='window', type=int, default=20)
+    assistant_parser.add_argument('--min-marker-length', dest='min_length', type=int, default=800)
+    assistant_parser.add_argument('--min-mean-quality', type=float, default=25.0)
+    assistant_parser.add_argument('--max-read-expected-errors', type=float, default=8.0)
+    assistant_parser.add_argument('--max-output-expected-errors', type=float, default=5.0)
+    assistant_parser.add_argument('--max-n-percent', type=float, default=1.0)
+    assistant_parser.add_argument('--secondary-peak-ratio', type=float, default=0.33)
+    assistant_parser.add_argument('--max-mixed-peak-percent', type=float, default=5.0)
+    assistant_parser.add_argument('--max-report-image-height', type=int, default=2400,
+        help='Maximum Paper Trail visual-report PNG height before automatic pagination (minimum: 600, default: 2400).')
+    assistant_parser.add_argument('--min-overlap', type=int, default=40)
+    assistant_parser.add_argument('--min-overlap-identity', type=float, default=0.85)
+    assistant_parser.add_argument('--chimera-ref', default=None,
+        help='Curated reference FASTA for UCHIME; defaults to the primary reference.')
+    assistant_parser.add_argument('--skip-chimera-check', action='store_true', default=False,
+        help='Audited override: continue with all markers marked for review.')
+    assistant_parser.add_argument('--marker-qc', default=None,
+        help='Marker-QC sidecar for --fasta submissions, such as a reviewed assembly_report.tsv.')
+    assistant_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False,
+        help='Audited acceptance of a partner FASTA without BranchManager marker-QC provenance.')
+    assistant_parser.add_argument('-o', '--out', required=True)
+
+    background_check_parser = sub.add_parser(
+        'background-check',
+        help='Background Check: pre-classify reference collections for reuse.',
         description=(
             'Classify one or more reference FASTA collections against a reference database\n'
             'using vsearch and save the results so the main pipeline can reuse them without\n'
@@ -3053,22 +3832,22 @@ def build_parser():
             '  {name}_taxonomic_disagreement.tsv  High-quality hits with conflicting taxa\n'
             '  combined_taxonomy.tsv       All datasets merged (with Dataset column)\n'
             '  pipeline_taxonomy.tsv       All datasets merged; pass to --taxa-assignments\n'
-            '  preclassify_summary.txt     Plain-text summary with usage examples\n\n'
+            '  background_check_summary.txt  Plain-text summary with usage examples\n\n'
             'Example:\n'
-            '  branchmanager preclassify \\\n'
+            '  branchmanager background-check \\\n'
             '    --dataset hungate16s=/data/hungate.fasta \\\n'
             '    --dataset silva=/data/silva_16s.fasta \\\n'
             '    --ref /data/gtdb_ssu_reps.fna \\\n'
             '    --taxa /data/gtdb_taxonomy.tsv.gz \\\n'
-            '    --threads 8 -o preclassify_out/\n\n'
-            'Then use the output in a preload:\n'
-            '  branchmanager preload --fasta hungate.fasta \\\n'
-            '    --taxa-assignments preclassify_out/pipeline_taxonomy.tsv \\\n'
-            '    --db project.db --dataset Hungate -o preload_out/'
+            '    --threads 8 -o background_check_out/\n\n'
+            'Then use the output in the Filing Cabinet:\n'
+            '  branchmanager filing-cabinet --fasta hungate.fasta \\\n'
+            '    --taxa-assignments background_check_out/pipeline_taxonomy.tsv \\\n'
+            '    --db project.db --dataset Hungate -o filing_cabinet_out/'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--dataset', dest='datasets', nargs='+', metavar='NAME FASTA',
         required=True,
         help=(
@@ -3080,28 +3859,28 @@ def build_parser():
             'Any other name is treated as a custom dataset.'
         ),
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--ref', required=True,
         help='Reference FASTA (e.g. GTDB/SILVA reps) used by vsearch for classification.',
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--taxa', required=False, default=None,
         help='Taxonomy table matching IDs in --ref (TSV/CSV, optionally .gz: id<TAB>lineage or id,lineage). '
              'If omitted, taxonomy is parsed directly from reference FASTA headers.',
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '-o', '--out', required=True,
         help='Output directory where all classification files will be written.',
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--threads', type=int, default=4,
         help='CPU threads for vsearch (default: 4).',
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--min-identity', dest='min_identity', type=float, default=0.80,
         help='Minimum vsearch alignment identity threshold 0–1 (default: 0.80 = 80%%).',
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--max-hits', dest='max_hits', type=int, default=10,
         help=(
             'Number of candidate hits vsearch collects per query '
@@ -3110,7 +3889,7 @@ def build_parser():
             'slower (default: 10).'
         ),
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--max-rejects', dest='max_rejects', type=int, default=256,
         help=(
             'vsearch --maxrejects: maximum number of non-matching candidate '
@@ -3119,7 +3898,7 @@ def build_parser():
             '(e.g. those with many N\'s) (default: 256).'
         ),
     )
-    preclassify.add_argument(
+    background_check_parser.add_argument(
         '--low-confidence-threshold', dest='low_confidence_threshold',
         type=float, default=0.97,
         help=(
@@ -3132,9 +3911,9 @@ def build_parser():
     return parser
 
 
-def cmd_preclassify(args):
-    """Handler for the ``preclassify`` subcommand."""
-    from branchmanager.pipeline import preclassify as _preclassify_mod
+def cmd_background_check(args):
+    """Run the reusable Background Check classification workflow."""
+    from branchmanager.pipeline import background_check as _background_check_module
 
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
@@ -3169,24 +3948,24 @@ def cmd_preclassify(args):
             i += 2
         else:
             raise SystemExit(
-                f"[PRECLASSIFY] Cannot parse dataset spec at position {i}: '{token}'. "
+                f"[BACKGROUND CHECK] Cannot parse dataset spec at position {i}: '{token}'. "
                 "Expected 'NAME FASTA' pairs or 'NAME=FASTA' pairs."
             )
 
     if not datasets:
-        raise SystemExit("[PRECLASSIFY] At least one dataset is required. "
+        raise SystemExit("[BACKGROUND CHECK] At least one dataset is required. "
                          "Use: --dataset NAME /path/to/file.fasta")
 
     # Validate FASTA paths exist
     for name, fasta in datasets:
         if not os.path.exists(fasta):
             raise SystemExit(
-                f"[PRECLASSIFY] FASTA file not found for dataset '{name}': {fasta}"
+                f"[BACKGROUND CHECK] FASTA file not found for dataset '{name}': {fasta}"
             )
 
-    log.info("[PRECLASSIFY] Starting pre-classification for %d dataset(s)", len(datasets))
+    log.info("[BACKGROUND CHECK] Starting pre-classification for %d dataset(s)", len(datasets))
 
-    pipeline_tsv = _preclassify_mod.run_preclassify(
+    pipeline_tsv = _background_check_module.run_background_check(
         datasets=datasets,
         ref_fasta=args.ref,
         outdir=outdir,
@@ -3200,86 +3979,623 @@ def cmd_preclassify(args):
         max_rejects=int(getattr(args, 'max_rejects', 256) or 256),
     )
 
-    log.info("[PRECLASSIFY] Done. Pipeline-ready taxonomy → %s", pipeline_tsv)
+    log.info("[BACKGROUND CHECK] Done. Pipeline-ready taxonomy → %s", pipeline_tsv)
     print(
-        f"[preclassify] Done.\n"
+        f"[background-check] Done.\n"
         f"  Pipeline taxonomy : {pipeline_tsv}\n"
-        f"  Summary           : {os.path.join(outdir, 'preclassify_summary.txt')}\n\n"
-        f"Use in preload:\n"
-        f"  branchmanager preload --fasta <fasta> --taxa-assignments {pipeline_tsv} "
-        f"--db project.db --dataset <name> -o preload_out/"
+        f"  Summary           : {os.path.join(outdir, 'background_check_summary.txt')}\n\n"
+        f"Use in the Filing Cabinet:\n"
+        f"  branchmanager filing-cabinet --fasta <fasta> --taxa-assignments {pipeline_tsv} "
+        f"--db project.db --dataset <name> -o filing_cabinet_out/"
     )
 
 
-def cmd_sanger(args):
-    """Handler for the ``sanger`` / ``ab1`` subcommand."""
-    from branchmanager.pipeline import sanger as _sanger_mod
+def cmd_paper_trail(args):
+    """Handler for the Paper Trail + Merge Meeting chromatogram workflow."""
+    from branchmanager.pipeline import paper_trail as _paper_trail_module
 
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
     _configure_logging(outdir)
-    primers = getattr(args, 'primers', None) or _sanger_mod.DEFAULT_PRIMERS
+    primers = getattr(args, 'primers', None) or _paper_trail_module.DEFAULT_PRIMERS
     inputs = getattr(args, 'input', None) or []
     sample_map = getattr(args, 'sample_map', None)
     read_metadata = getattr(args, 'read_metadata', None)
     if not inputs and not sample_map and not read_metadata:
-        raise SystemExit('[sanger] Provide --input and/or --sample-map/--read-metadata.')
-    outputs = _sanger_mod.run_sanger(
-        inputs,
-        outdir,
-        read_metadata=read_metadata,
-        sample_map=sample_map,
-        primers=primers,
-        min_quality=int(getattr(args, 'min_quality', 20) or 20),
-        window=int(getattr(args, 'window', 20) or 20),
-        min_length=int(getattr(args, 'min_length', 800) or 800),
-        min_read_length=getattr(args, 'min_read_length', None),
-        min_mean_quality=float(getattr(args, 'min_mean_quality', 25.0) or 25.0),
-        mask_quality=int(getattr(args, 'mask_quality', 20) or 20),
-        max_read_expected_errors=float(getattr(args, 'max_read_expected_errors', 8.0) or 8.0),
-        max_output_expected_errors=float(getattr(args, 'max_output_expected_errors', 5.0) or 5.0),
-        max_n_percent=float(getattr(args, 'max_n_percent', 1.0) or 1.0),
-        max_internal_low_quality_run=int(getattr(args, 'max_internal_low_quality_run', 20) or 20),
-        max_conflict_density=float(getattr(args, 'max_conflict_density', 1.0) or 1.0),
-        quality_difference=int(getattr(args, 'quality_difference', 10) or 10),
-        allow_missing_quality=bool(getattr(args, 'allow_missing_quality', False)),
-        min_overlap=int(getattr(args, 'min_overlap', 40) or 40),
-        min_overlap_identity=float(getattr(args, 'min_overlap_identity', 0.85) or 0.85),
-        assemble=bool(getattr(args, 'assemble', True)),
-        recursive=bool(getattr(args, 'recursive', True)),
-    )
-    logging.getLogger(__name__).info("[SANGER] Final assembled FASTA: %s", outputs['assembled_fasta'])
+        raise SystemExit('[paper-trail] Provide --input and/or --sample-map/--read-metadata.')
+    primer_sequences = dict(_paper_trail_module.DEFAULT_PRIMER_SEQUENCES)
+    for specification in getattr(args, 'primer_sequences', None) or []:
+        if '=' not in str(specification):
+            raise SystemExit('[PAPER TRAIL] --primer-sequence must use NAME=SEQUENCE.')
+        name, sequence = str(specification).split('=', 1)
+        sequence = ''.join(sequence.split()).upper()
+        if not name.strip() or len(sequence) < 12:
+            raise SystemExit('[PAPER TRAIL] --primer-sequence requires a name and at least 12 bases.')
+        primer_sequences[name.strip().upper()] = sequence
+    manifest = RunManifest(outdir, 'paper_trail')
+    for source in [sample_map, read_metadata, getattr(args, 'screen_ref', None), getattr(args, 'screen_taxa', None)]:
+        if source:
+            manifest.add_input(source)
+    for source in inputs:
+        manifest.add_input(
+            source,
+            role='raw_read' if Path(source).is_file() else 'raw_read_directory',
+        )
+    manifest.add_stage('paper_trail', 'RUNNING', detail='base calls, chromatogram evidence, and trimming')
+    try:
+        outputs = _paper_trail_module.run_paper_trail(
+            inputs,
+            outdir,
+            read_metadata=read_metadata,
+            sample_map=sample_map,
+            primers=primers,
+            primer_sequences=primer_sequences,
+            trim_primers=bool(getattr(args, 'trim_primers', True)),
+            secondary_peak_ratio=float(getattr(args, 'secondary_peak_ratio', 0.33)),
+            max_mixed_peak_percent=float(getattr(args, 'max_mixed_peak_percent', 5.0)),
+            mixed_peak_min_quality=int(getattr(args, 'mixed_peak_min_quality', 20)),
+            screen_ref=getattr(args, 'screen_ref', None),
+            screen_taxa=getattr(args, 'screen_taxa', None),
+            threads=int(getattr(args, 'threads', 4) or 4),
+            min_quality=int(getattr(args, 'min_quality', 20) or 20),
+            window=int(getattr(args, 'window', 20) or 20),
+            min_length=int(getattr(args, 'min_length', 800) or 800),
+            min_read_length=getattr(args, 'min_read_length', None),
+            min_mean_quality=float(getattr(args, 'min_mean_quality', 25.0) or 25.0),
+            mask_quality=int(getattr(args, 'mask_quality', 20) or 20),
+            max_read_expected_errors=float(getattr(args, 'max_read_expected_errors', 8.0) or 8.0),
+            max_output_expected_errors=float(getattr(args, 'max_output_expected_errors', 5.0) or 5.0),
+            max_n_percent=float(getattr(args, 'max_n_percent', 1.0) or 1.0),
+            max_internal_low_quality_run=int(getattr(args, 'max_internal_low_quality_run', 20) or 20),
+            max_conflict_density=float(getattr(args, 'max_conflict_density', 1.0) or 1.0),
+            quality_difference=int(getattr(args, 'quality_difference', 10) or 10),
+            allow_missing_quality=bool(getattr(args, 'allow_missing_quality', False)),
+            min_overlap=int(getattr(args, 'min_overlap', 40) or 40),
+            min_overlap_identity=float(getattr(args, 'min_overlap_identity', 0.85) or 0.85),
+            assemble=bool(getattr(args, 'assemble', True)),
+            recursive=bool(getattr(args, 'recursive', True)),
+            max_report_image_height=int(getattr(args, 'max_report_image_height', 2400) or 2400),
+        )
+        manifest.add_stage('paper_trail', 'COMPLETE')
+        manifest.add_stage('merge_meeting', 'COMPLETE', detail='per-isolate assembly or best-read selection')
+        for key in (
+            'assembled_fasta', 'read_qc_tsv', 'assembly_tsv', 'assembly_placements_tsv',
+            'recommendations_tsv',
+            'visual_manifest_tsv',
+        ):
+            manifest.add_output(outputs[key], role=key)
+        for key in ('read_error_pngs', 'chromatogram_pngs', 'assembly_pngs'):
+            for path in outputs[key]:
+                manifest.add_output(path, role=key)
+        manifest.finish('COMPLETE')
+    except Exception as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    logging.getLogger(__name__).info("[PAPER TRAIL] Final assembled FASTA: %s", outputs['assembled_fasta'])
     print(
-        "[sanger] Done.\n"
+        "[paper-trail] Paper Trail + Merge Meeting complete.\n"
         f"  Assembled FASTA : {outputs['assembled_fasta']}\n"
         f"  Trimmed reads   : {outputs['trimmed_fasta']}\n"
         f"  Read QC         : {outputs['read_qc_tsv']}\n"
         f"  Per-base errors : {outputs['per_base_error_tsv']}\n"
-        f"  Assembly report : {outputs['assembly_tsv']}\n\n"
+        f"  Assembly report : {outputs['assembly_tsv']}\n"
+        f"  Read placements : {outputs['assembly_placements_tsv']}\n\n"
         f"  Resequence list : {outputs['recommendations_tsv']}\n"
-        f"  QC policy       : {outputs['qc_policy_tsv']}\n\n"
-        f"  Read visual     : {outputs['read_error_svg']}\n"
-        f"  Assembly visual : {outputs['assembly_svg']}\n\n"
-        "Use in evaluate:\n"
-        f"  branchmanager evaluate --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
+        f"  QC policy       : {outputs['qc_policy_tsv']}\n"
+        f"  Failed QC seqs  : {outputs['failed_qc_dir']}\n\n"
+        f"  Read visuals    : {len(outputs['read_error_pngs'])} page(s)\n"
+        f"  Chromatograms   : {len(outputs['chromatogram_pngs'])} page(s)\n"
+        f"  Assembly visuals: {len(outputs['assembly_pngs'])} page(s)\n"
+        f"  Visual manifest : {outputs['visual_manifest_tsv']}\n\n"
+        "Use in Performance Review:\n"
+        f"  branchmanager performance-review --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
     )
+
+
+def cmd_onboarding(args):
+    from branchmanager.onboarding import validate_submission, write_onboarding_outputs
+    from branchmanager.pipeline.paper_trail import DEFAULT_PRIMERS
+
+    manifest = RunManifest(args.out, 'onboarding')
+    sample_map = getattr(args, 'sample_map', None)
+    fasta = getattr(args, 'fasta', None)
+    manifest.add_input(sample_map or fasta, role='sample_map' if sample_map else 'marker_fasta')
+    if args.partner_metadata:
+        manifest.add_input(args.partner_metadata, role='partner_metadata')
+    try:
+        result = validate_submission(
+            sample_map,
+            fasta=fasta,
+            partner_metadata=args.partner_metadata,
+            read_dir=args.read_dir,
+            primers=args.primers or DEFAULT_PRIMERS,
+            expected_partner_id=getattr(args, 'partner_id', None),
+            dataset=getattr(args, 'dataset', None),
+        )
+        outputs = write_onboarding_outputs(args.out, result)
+        for role, path in outputs.items():
+            manifest.add_output(path, role=role)
+        manifest.add_stage('onboarding', result['status'], detail=f"{result['isolates']} isolates; {result['errors']} errors")
+        manifest.finish('COMPLETE' if result['status'] == 'PASS' else 'FAILED')
+    except Exception as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    print(
+        f"[onboarding] {result['status']}: {result['isolates']} isolate(s), "
+        f"input={result['input_type']}, {result['read_files']} read file(s), {result['errors']} error(s).\n"
+        f"  Normalised map : {outputs['normalised']}\n"
+        f"  Validation     : {outputs['report']}"
+        + (f"\n  Normalised FASTA: {outputs['fasta']}" if outputs.get('fasta') else '')
+    )
+    if result['status'] != 'PASS':
+        raise SystemExit(2)
+
+
+def _cmd_project_import(args, *, genomes: bool):
+    import fcntl
+    import sqlite3
+    from branchmanager.project_state import import_genome_results, import_status_updates, write_import_report
+
+    workflow = 'records_update' if genomes else 'status_meeting'
+    manifest = RunManifest(args.out, workflow)
+    manifest.add_input(args.input, role='genome_results' if genomes else 'status_updates')
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[records-update] Project database does not exist: {original}')
+    manifest.add_input(original, role='project_database_before')
+    staged_path = Path(args.out).resolve() / f'.{workflow}_project.sqlite'
+    lock_path = original.with_name(original.name + '.lock')
+    with open(lock_path, 'a+') as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            staged_path.unlink(missing_ok=True)
+            with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged_path)) as target:
+                source.backup(target)
+            db = Database(str(staged_path))
+            db.initialise()
+            rows = import_genome_results(
+                db, args.input,
+                min_completeness=float(getattr(args, 'min_completeness', 90.0)),
+                max_contamination=float(getattr(args, 'max_contamination', 5.0)),
+            ) if genomes else import_status_updates(db, args.input)
+            report_name = 'records_update_report.tsv' if genomes else 'status_meeting_report.tsv'
+            report = write_import_report(Path(args.out) / report_name, rows)
+            manifest.add_output(report, role='import_report')
+            rejected = sum(row.get('result') == 'REJECTED' for row in rows)
+            manifest.add_stage(workflow, 'COMPLETE' if rejected == 0 else 'COMPLETE_WITH_WARNINGS', detail=f'{len(rows) - rejected} imported; {rejected} rejected')
+            manifest.finish('COMPLETE' if rejected == 0 else 'COMPLETE_WITH_WARNINGS')
+            db.record_project_run(
+                f'{workflow.replace("_", "-")}:{manifest.data["started_at"]}', workflow, manifest.data['status'],
+                manifest_path=str(manifest.json_path), started_at=manifest.data['started_at'],
+                completed_at=manifest.data['completed_at'],
+            )
+            publish_tmp = original.with_name(original.name + '.publishing')
+            publish_tmp.unlink(missing_ok=True)
+            with sqlite3.connect(str(staged_path)) as source, sqlite3.connect(str(publish_tmp)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('staged Records Update database failed integrity_check')
+            os.replace(publish_tmp, original)
+            staged_path.unlink(missing_ok=True)
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    command_label = 'records-update' if genomes else 'status-meeting'
+    print(f'[{command_label}] {len(rows) - rejected} row(s) imported; {rejected} rejected.\n  Report: {report}')
+
+
+def cmd_annual_report(args):
+    from branchmanager.reporting import write_annual_report
+
+    db = Database(args.db)
+    db.initialise()
+    manifest = RunManifest(args.out, 'annual_report')
+    manifest.add_input(args.db, role='project_database')
+    try:
+        outputs = write_annual_report(db, args.out)
+        for role, path in outputs.items():
+            manifest.add_output(path, role=role)
+        manifest.add_stage('annual_report', 'COMPLETE')
+        manifest.finish('COMPLETE')
+    except Exception as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    print(f"[annual-report] Cumulative project report: {outputs['html']}")
+
+
+def cmd_it_desk(args):
+    from branchmanager.it_desk import run_it_desk_checks, write_it_desk_report
+
+    rows = run_it_desk_checks(
+        db_path=args.db, references=args.references, output_dir=args.out,
+        tree_method=args.tree_method,
+    )
+    outputs = write_it_desk_report(args.out, rows)
+    for row in rows:
+        print(f"[{row['status']}] {row['check']}: {row['detail']}")
+    print(f"[it-desk] {outputs['status']}; report: {outputs['tsv']}")
+    if args.strict and outputs['status'] != 'PASS':
+        raise SystemExit(2)
+
+
+def cmd_assistant(args):
+    """Run the Assistant workflow with explicit scientific stage boundaries."""
+    from branchmanager.it_desk import run_it_desk_checks, write_it_desk_report
+
+    root = Path(args.out).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = RunManifest(root, 'assistant')
+    for role, source in (
+        ('sample_map', args.sample_map), ('marker_fasta', args.fasta),
+        ('partner_metadata', args.partner_metadata), ('marker_qc', args.marker_qc),
+        ('primary_reference', args.ref), ('reference_taxonomy', args.taxa),
+        ('baseline_fasta', args.baseline_fasta), ('mwl', args.mwl),
+        ('baseline_taxonomy', args.baseline_taxa_assignments),
+        ('chimera_reference', args.chimera_ref),
+    ):
+        if source:
+            manifest.add_input(source, role=role)
+    for source in args.alt_ref or []:
+        manifest.add_input(source, role='alternate_reference')
+    for source in args.alt_taxa or []:
+        manifest.add_input(source, role='alternate_reference_taxonomy')
+    try:
+        it_desk_dir = root / '00_it_desk'
+        checks = run_it_desk_checks(
+            db_path=args.db,
+            references=[args.ref, *(args.alt_ref or [])],
+            output_dir=root,
+            tree_method=args.tree_method,
+        )
+        it_desk_report = write_it_desk_report(it_desk_dir, checks)
+        manifest.add_output(it_desk_report['tsv'], role='it_desk_report')
+        if it_desk_report['status'] != 'PASS':
+            raise RuntimeError(f'IT Desk checks failed; inspect {it_desk_report["tsv"]}')
+
+        onboarding_dir = root / '01_onboarding'
+        onboarding_args = argparse.Namespace(
+            sample_map=args.sample_map, fasta=args.fasta, partner_metadata=args.partner_metadata,
+            read_dir=args.read_dir, primers=args.primers, partner_id=args.partner_id,
+            dataset=args.dataset, out=str(onboarding_dir),
+        )
+        cmd_onboarding(onboarding_args)
+        manifest.add_stage('onboarding', 'COMPLETE')
+
+        paper_trail_dir = root / '02_paper_trail_merge_meeting'
+        if args.sample_map:
+            trace_args = argparse.Namespace(
+                command='paper-trail', input=[], out=str(paper_trail_dir), sample_map=None,
+                read_metadata=str(onboarding_dir / 'normalised_read_map.tsv'), primers=args.primers,
+                primer_sequences=args.primer_sequences, trim_primers=args.trim_primers,
+                min_quality=args.min_quality, window=args.window, min_length=args.min_length,
+                min_mean_quality=args.min_mean_quality,
+                max_read_expected_errors=args.max_read_expected_errors,
+                max_output_expected_errors=args.max_output_expected_errors,
+                max_n_percent=args.max_n_percent,
+                secondary_peak_ratio=args.secondary_peak_ratio,
+                max_mixed_peak_percent=args.max_mixed_peak_percent,
+                min_overlap=args.min_overlap, min_overlap_identity=args.min_overlap_identity,
+                screen_ref=args.ref, screen_taxa=args.taxa,
+                threads=args.threads,
+                max_report_image_height=args.max_report_image_height,
+            )
+            cmd_paper_trail(trace_args)
+            marker_input = paper_trail_dir / 'assembled.fasta'
+            marker_qc = paper_trail_dir / 'assembly_report.tsv'
+            manifest.add_stage('paper_trail', 'COMPLETE')
+            manifest.add_stage('merge_meeting', 'COMPLETE')
+        else:
+            if not args.marker_qc and not args.accept_unverified_marker_qc:
+                raise RuntimeError(
+                    'FASTA Assistant submissions require --marker-qc or the explicit '
+                    '--accept-unverified-marker-qc audit flag'
+                )
+            marker_input = onboarding_dir / 'normalised_input.fasta'
+            marker_qc = Path(args.marker_qc) if args.marker_qc else None
+            manifest.add_stage('paper_trail', 'SKIPPED', detail='partner supplied FASTA')
+            manifest.add_stage('merge_meeting', 'SKIPPED', detail='partner supplied FASTA')
+
+        performance_review_dir = root / '03_performance_review_hiring_panel'
+        performance_review_args = argparse.Namespace(
+            command='performance-review', input=str(marker_input),
+            partner_metadata=args.partner_metadata, db=args.db, dataset=args.dataset,
+            out=str(performance_review_dir), ref=args.ref, taxa=args.taxa, ref_name=args.ref_name,
+            alt_ref=args.alt_ref, alt_taxa=args.alt_taxa, alt_ref_name=args.alt_ref_name,
+            main_ref=args.ref_name, baseline_fasta=args.baseline_fasta,
+            baseline_dataset=args.baseline_dataset,
+            baseline_taxa_assignments=args.baseline_taxa_assignments,
+            baseline_skip_classify=False, baseline_colours=None, baseline_shorten_ids=False,
+            novelty_baseline_datasets=[], mwl=args.mwl, mwl_sheet='MWL_V1', mwl_min_rank='p',
+            taxa_assignments=None, previous_review=None, shorten_ids=False,
+            min_len=800, max_n=5, sequence_domain=args.sequence_domain,
+            phylum=None, target=None, force_rebuild=False, anchors=None,
+            threads=args.threads, tree_method=args.tree_method,
+            neighbourhood_format='png', pangenome_target=args.pangenome_target,
+            candidate_set_size=args.candidate_set_size, user_colours=None,
+            group_phyla=None, functional=None, draft_rumen_functions=False,
+            marker_qc=str(marker_qc) if marker_qc else None, marker_review=None,
+            accept_unverified_marker_qc=bool(args.accept_unverified_marker_qc),
+            chimera_ref=args.chimera_ref or args.ref,
+            skip_chimera_check=args.skip_chimera_check, collapse=False,
+        )
+        cmd_performance_review(performance_review_args)
+        manifest.add_stage('performance_review', 'COMPLETE')
+        manifest.add_stage('hiring_panel', 'COMPLETE')
+        for role, path in (
+            ('marker_fasta', marker_input),
+            ('performance_review_dashboard', performance_review_dir / 'performance_review_dashboard.html'),
+            ('selection_summary', performance_review_dir / 'assessment' / 'selection_summary.tsv'),
+            ('sequencing_sets', performance_review_dir / 'assessment' / 'sequencing_sets.tsv'),
+        ):
+            manifest.add_output(path, role=role)
+        missing = manifest.verify_required_outputs()
+        if missing:
+            raise RuntimeError('Assistant workflow outputs missing: ' + ', '.join(missing))
+        manifest.finish('COMPLETE')
+    except BaseException as exc:
+        manifest.finish('FAILED', error=exc)
+        raise
+    print(
+        '[assistant] Onboarding through Hiring Panel complete.\n'
+        f'  Decision dashboard: {performance_review_dir / "performance_review_dashboard.html"}\n'
+        f'  Sequencing sets  : {performance_review_dir / "assessment" / "sequencing_sets.tsv"}'
+    )
+
+
+def _cmd_quarterly_review_impl(args):
+    """Run a project-wide post-coverage genome-selection round."""
+    from datetime import datetime, timezone
+
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    _configure_logging(str(outdir))
+    log = logging.getLogger(__name__)
+    db = Database(args.db)
+    db.initialise()
+
+    # A final cumulative metadata file may be supplied without re-running the
+    # expensive classification/tree workflow. It updates factual genome status
+    # only; Quarterly Review recommendations never write back to that status.
+    if getattr(args, 'partner_metadata', None):
+        with db.connect() as conn:
+            sequence_rows = conn.execute('SELECT id, dataset FROM sequences').fetchall()
+        roles = db.get_dataset_roles()
+        candidate_ids = [
+            str(sequence_id) for sequence_id, dataset in sequence_rows
+            if roles.get(str(dataset or ''), {}).get('role') != 'baseline'
+        ]
+        setattr(args, 'dataset', 'QuarterlyReview')
+        _load_partner_metadata_for_run(args, db, str(outdir), {}, candidate_ids)
+
+    round_id = getattr(args, 'round_id', None) or datetime.now(timezone.utc).strftime(
+        'quarterly_review_%Y%m%dT%H%M%SZ'
+    )
+    assessment_paths = list(getattr(args, 'assessment', None) or [])
+    if assessment_paths:
+        try:
+            imported_rows = quarterly_review.read_assessment_tables(assessment_paths)
+        except Exception as exc:
+            raise SystemExit(f'[QUARTERLY REVIEW] Failed to import assessment table: {exc}')
+        if not imported_rows:
+            raise SystemExit('[QUARTERLY REVIEW] The supplied assessment table(s) contained no sequence rows.')
+        snapshot_id = f'quarterly-review-import:{round_id}'
+        db.save_assessment_snapshot(
+            snapshot_id,
+            imported_rows,
+            dataset='quarterly_review_import',
+            source_path=';'.join(str(Path(path).resolve()) for path in assessment_paths),
+        )
+        log.info('[QUARTERLY REVIEW] Imported %d latest assessment rows into %s', len(imported_rows), snapshot_id)
+
+    latest = db.get_latest_assessment_rows()
+    if not latest:
+        raise SystemExit(
+            '[QUARTERLY REVIEW] No assessment snapshots are stored. Run Performance Review once with the current '
+            'BranchManager version or provide --assessment path/to/sequence_assessment.tsv.'
+        )
+
+    tree_path = getattr(args, 'tree', None)
+    if not tree_path and getattr(args, 'from_dir', None):
+        tree_path = _find_tree_file_in_dir(args.from_dir)
+    if tree_path and not Path(tree_path).exists():
+        raise SystemExit(f'[QUARTERLY REVIEW] Tree file not found: {tree_path}')
+    if not tree_path:
+        log.warning(
+            '[QUARTERLY REVIEW] No cumulative tree supplied; ranking will use marker identities and other '
+            'assessment evidence without marginal patristic distance.'
+        )
+
+    alignment_path = getattr(args, 'alignment', None)
+    if not alignment_path and getattr(args, 'from_dir', None):
+        for candidate in (
+            Path(args.from_dir) / 'tree' / 'current_alignment.fasta',
+            Path(args.from_dir) / 'current_alignment.fasta',
+        ):
+            if candidate.exists():
+                alignment_path = str(candidate)
+                break
+    if not alignment_path and tree_path:
+        candidate = Path(tree_path).parent / 'current_alignment.fasta'
+        if candidate.exists():
+            alignment_path = str(candidate)
+    if alignment_path and not Path(alignment_path).exists():
+        raise SystemExit(f'[QUARTERLY REVIEW] Alignment file not found: {alignment_path}')
+
+    parameters = {
+        'GenomeBudget': int(args.genome_budget),
+        'BackupsPerPrimary': int(args.backups_per_primary),
+        'PangenomeTarget': int(args.pangenome_target),
+        'IncludeModerateEvidence': bool(args.include_moderate_evidence),
+        'Tree': str(Path(tree_path).resolve()) if tree_path else 'None',
+        'Alignment': str(Path(alignment_path).resolve()) if alignment_path else 'None',
+        'AssessmentRows': len(latest),
+    }
+    recommendations = quarterly_review.build_quarterly_review(
+        list(latest.values()),
+        db=db,
+        tree_path=tree_path,
+        alignment_path=alignment_path,
+        genome_budget=args.genome_budget,
+        backups_per_primary=args.backups_per_primary,
+        pangenome_target=args.pangenome_target,
+        include_moderate=args.include_moderate_evidence,
+    )
+
+    # Quarterly Review recommendations need round-specific figures. Reusing the most
+    # recent Performance Review image would display stale PRIMARY/BACKUP stars.
+    if tree_path:
+        try:
+            recommendation_by_id = {row['sequence_id']: row for row in recommendations}
+            visual_rows = [quarterly_review.normalise_assessment_row(row) for row in latest.values()]
+            for row in visual_rows:
+                recommendation = recommendation_by_id.get(row['id'], {})
+                role = str(recommendation.get('role') or '')
+                row['sequencing_set_role'] = {
+                    'PRIMARY': 'PRIMARY',
+                    'BACKUP': 'BACKUP',
+                    'ALREADY_SELECTED': 'COMMITTED',
+                    'ALREADY_SEQUENCED': 'SEQUENCED',
+                }.get(role, '')
+                row['sequencing_set_rank'] = (
+                    recommendation.get('round_rank', 'NA') if role in {'PRIMARY', 'BACKUP'} else 'NA'
+                )
+                if role == 'PRIMARY':
+                    row['sequencing_set_badge'] = f'P{recommendation.get("round_rank", "")}'
+                elif role == 'BACKUP':
+                    row['sequencing_set_badge'] = (
+                        f'B{recommendation.get("round_rank", "")}.{recommendation.get("backup_rank", "")}'
+                    )
+                row['selected_for_genome_sequencing'] = str(role == 'ALREADY_SELECTED')
+                row['already_sequenced'] = str(role == 'ALREADY_SEQUENCED')
+            visual_result = neighbourhood.generate_local_neighbourhood_visuals(
+                tree_path=tree_path,
+                assessment_rows=visual_rows,
+                db=db,
+                outdir=outdir / 'neighbourhoods',
+                alignment_path=alignment_path,
+                image_format=args.neighbourhood_format,
+            )
+            for row in visual_rows:
+                recommendation = recommendation_by_id.get(row['id'])
+                if recommendation is not None:
+                    recommendation['local_tree_figure'] = row.get('local_neighbourhood_figure', 'NA')
+            parameters['NeighbourhoodFigures'] = len(visual_result['figures'])
+            parameters['NeighbourhoodFormat'] = args.neighbourhood_format
+        except Exception as exc:
+            log.warning('[QUARTERLY REVIEW] Could not generate round-specific neighbourhood figures: %s', exc)
+    outputs = quarterly_review.write_quarterly_review_reports(outdir, round_id, recommendations, parameters)
+    db.save_selection_round(round_id, recommendations, mode='quarterly_review', parameters=parameters)
+
+    primary_count = sum(row.get('role') == 'PRIMARY' for row in recommendations)
+    backup_count = sum(row.get('role') == 'BACKUP' for row in recommendations)
+    log.info(
+        '[QUARTERLY REVIEW] Round %s nominated %d primary and %d backup isolate(s)',
+        round_id, primary_count, backup_count,
+    )
+    print(
+        '[quarterly-review] Done.\n'
+        f'  Round             : {round_id}\n'
+        f'  Primary nominees  : {primary_count}\n'
+        f'  Backup nominees   : {backup_count}\n'
+        f'  Next genome set   : {outputs["selected"]}\n'
+        f'  Full audit        : {outputs["summary"]}\n'
+        f'  Round manifest    : {outputs["manifest"]}'
+    )
+
+
+def cmd_quarterly_review(args):
+    import fcntl
+    import sqlite3
+
+    manifest = RunManifest(args.out, 'quarterly_review')
+    original = Path(args.db).expanduser().resolve()
+    if not original.is_file():
+        raise SystemExit(f'[QUARTERLY REVIEW] Project database does not exist: {original}')
+    manifest.add_input(original, role='project_database')
+    for source in getattr(args, 'assessment', None) or []:
+        manifest.add_input(source, role='assessment_import')
+    for role, source in (
+        ('partner_metadata', getattr(args, 'partner_metadata', None)),
+        ('tree', getattr(args, 'tree', None)), ('alignment', getattr(args, 'alignment', None)),
+    ):
+        if source:
+            manifest.add_input(source, role=role)
+    staged_path = Path(args.out).resolve() / '.quarterly_review_project.sqlite'
+    lock_path = original.with_name(original.name + '.lock')
+    with open(lock_path, 'a+') as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            staged_path.unlink(missing_ok=True)
+            with sqlite3.connect(str(original)) as source, sqlite3.connect(str(staged_path)) as target:
+                source.backup(target)
+            staged_args = argparse.Namespace(**vars(args))
+            staged_args.db = str(staged_path)
+            manifest.add_stage('quarterly_review', 'RUNNING')
+            _cmd_quarterly_review_impl(staged_args)
+            for role, name in (
+                ('quarterly_review_summary', 'quarterly_review_summary.tsv'),
+                ('next_genome_set', 'next_genome_set.tsv'),
+                ('quarterly_review_parameters', 'quarterly_review_manifest.tsv'),
+            ):
+                manifest.add_output(Path(args.out) / name, role=role)
+            missing = manifest.verify_required_outputs()
+            if missing:
+                raise RuntimeError('required Quarterly Review outputs are missing: ' + ', '.join(missing))
+            manifest.add_stage('quarterly_review', 'COMPLETE')
+            manifest.finish('COMPLETE')
+            db = Database(str(staged_path))
+            db.initialise()
+            db.record_project_run(
+                str(getattr(args, 'round_id', None) or f'quarterly-review:{manifest.data["started_at"]}'),
+                'quarterly_review', 'COMPLETE', manifest_path=str(manifest.json_path),
+                started_at=manifest.data['started_at'], completed_at=manifest.data['completed_at'],
+            )
+            publish_tmp = original.with_name(original.name + '.publishing')
+            publish_tmp.unlink(missing_ok=True)
+            with sqlite3.connect(str(staged_path)) as source, sqlite3.connect(str(publish_tmp)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('staged Quarterly Review database failed integrity_check')
+            os.replace(publish_tmp, original)
+            staged_path.unlink(missing_ok=True)
+        except BaseException as exc:
+            manifest.finish('FAILED', error=exc)
+            raise
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == 'preload':
-        cmd_preload(args)
-    elif args.command in ('run', 'evaluate', 'eval'):
-        cmd_run(args)
-    elif args.command == 'regen-itol':
-        cmd_regen_itol(args)
-    elif args.command == 'subtree':
-        cmd_subtree(args)
-    elif args.command == 'preclassify':
-        cmd_preclassify(args)
-    elif args.command in ('sanger', 'ab1', 'ab1-to-fasta'):
-        cmd_sanger(args)
+    if args.command == 'filing-cabinet':
+        cmd_filing_cabinet(args)
+    elif args.command == 'performance-review':
+        cmd_performance_review(args)
+    elif args.command == 'quarterly-review':
+        cmd_quarterly_review(args)
+    elif args.command == 'label-maker':
+        cmd_label_maker(args)
+    elif args.command == 'org-chart':
+        cmd_org_chart(args)
+    elif args.command == 'background-check':
+        cmd_background_check(args)
+    elif args.command == 'paper-trail':
+        cmd_paper_trail(args)
+    elif args.command == 'onboarding':
+        cmd_onboarding(args)
+    elif args.command == 'status-meeting':
+        _cmd_project_import(args, genomes=False)
+    elif args.command == 'records-update':
+        _cmd_project_import(args, genomes=True)
+    elif args.command == 'annual-report':
+        cmd_annual_report(args)
+    elif args.command == 'it-desk':
+        cmd_it_desk(args)
+    elif args.command == 'assistant':
+        cmd_assistant(args)
     else:
         parser.print_help()
 

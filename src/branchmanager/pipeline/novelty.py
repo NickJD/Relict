@@ -25,14 +25,17 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 from pathlib import Path
 from typing import Optional
 
 from branchmanager.pipeline import tree as tree_pipeline
+from branchmanager.taxonomy import parse_taxon_string
 from branchmanager.utils.fasta import read_fasta, write_fasta
 from branchmanager.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
+VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl'
 
 
 def run_novelty(
@@ -48,7 +51,7 @@ def run_novelty(
     """
     Compute novelty scores for all sequences in input_fasta.
 
-    Novelty is measured against previously submitted sequences (preload + other
+    Novelty is measured against previously submitted sequences (Filing Cabinet + other
     runs already in the DB).  This means a sequence is "novel" if it is more
     than ``1 - id_threshold`` different from everything the user has already
     submitted to BranchManager, not from a global reference.
@@ -76,7 +79,6 @@ def run_novelty(
     output = f"{outdir}/novelty.tsv"
     matches_path = f"{outdir}/novelty_matches.tsv"
 
-    # ── Build comparison database ─────────────────────────────────────────────
     # Priority: explicit target_fasta > DB-derived submitted sequences > nothing
     db_fasta = Path(outdir) / "submitted_sequences.fasta"
     submission_db_exists = False
@@ -92,7 +94,7 @@ def run_novelty(
             with db.connect() as conn:
                 cur = conn.cursor()
                 # Get sequences from ALL datasets except the current run.
-                # This intentionally includes every preload dataset so that
+                # This intentionally includes every registered baseline dataset so that
                 # novelty is measured against the full user-submitted baseline.
                 if run_dataset:
                     cur.execute(
@@ -130,22 +132,23 @@ def run_novelty(
                 submission_db_exists = True
                 logger.info(
                     "[NOVELTY] Built submission comparison DB from %d previously submitted sequences "
-                    "(preload + prior run datasets). Novelty is expressed relative to YOUR submitted "
+                    "(Filing Cabinet + prior review datasets). Novelty is expressed relative to YOUR submitted "
                     "sequences, not against the global reference.",
                     len(records),
                 )
         except Exception as e:
-            logger.warning("[NOVELTY] Failed to build submission database: %s", e)
+            raise RuntimeError(f'failed to build the submitted-sequence novelty pool: {e}') from e
 
     # Run vsearch against submission database if available
     if submission_db_exists and db_fasta.exists():
         thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
         cmd = (
-            f"vsearch --usearch_global {input_fasta} "
-            f"--db {str(db_fasta)} "
+            f"vsearch --usearch_global {shlex.quote(str(input_fasta))} "
+            f"--db {shlex.quote(str(db_fasta))} "
             f"--id 0.5 "                          # low floor — we want real distances
             f"--strand both "
-            f"--blast6out {matches_path} "
+            f"--blast6out {shlex.quote(str(matches_path))} "
+            f"--userfields {VSEARCH_USERFIELDS} "
             f"--maxaccepts 1 --maxhits 1 "
             f"--query_cov 0.7"                    # require 70% query coverage to avoid spurious hits
             f"{thread_flag}"
@@ -155,16 +158,16 @@ def run_novelty(
             run_cmd(cmd)
             logger.info("[NOVELTY] vsearch done → %s", matches_path)
         except Exception as e:
-            logger.warning("[NOVELTY] vsearch against submission DB failed: %s", e)
+            raise RuntimeError(f'vsearch against the submitted-sequence pool failed: {e}') from e
     else:
         logger.info(
             "[NOVELTY] No previously submitted sequences available and no --target FASTA provided; "
-            "all input sequences will be treated as novel. Consider running `branchmanager preload` first "
+            "all input sequences will be treated as novel. Consider running `branchmanager filing-cabinet` first "
             "to build a baseline database."
         )
 
     # Parse best hits: query_id -> (pct_identity, hit_id)
-    best_hits: dict[str, tuple[float, str]] = _parse_best_hits(matches_path)
+    best_hits = _parse_best_hits(matches_path)
 
     novel_threshold_pct = id_threshold * 100.0
 
@@ -174,7 +177,8 @@ def run_novelty(
             # Skip reference anchors — they are scaffolding, not results
             if tree_pipeline.is_ref_anchor(header):
                 continue
-            pct_id, hit_id = best_hits.get(header, (0.0, "None"))
+            hit = best_hits.get(header, (0.0, "None", None, None))
+            pct_id, hit_id = hit[0], hit[1]
             is_novel = pct_id < novel_threshold_pct
             fh.write(f"{header}\t{pct_id:.2f}\t{hit_id}\t{is_novel}\n")
 
@@ -193,13 +197,13 @@ def run_novelty(
     return output
 
 
-def _parse_best_hits(matches_path: str) -> dict[str, tuple[float, str]]:
+def _parse_best_hits(matches_path: str) -> dict[str, tuple[float, str, Optional[float], Optional[int]]]:
     """
     Parse VSEARCH blast6 output.
     Returns {query_id: (pct_identity_float, hit_id_str)}.
     Only the best (highest identity) hit per query is kept.
     """
-    best: dict[str, tuple[float, str]] = {}
+    best = {}
     try:
         with open(matches_path) as fh:
             for line in fh:
@@ -215,8 +219,17 @@ def _parse_best_hits(matches_path: str) -> dict[str, tuple[float, str]]:
                     pct_id = float(parts[2])
                 except ValueError:
                     continue
+                query_coverage = None
+                alignment_length = None
+                if len(parts) >= 12:
+                    try:
+                        alignment_length = int(float(parts[3]))
+                        query_length = int(float(parts[10]))
+                        query_coverage = 100.0 * alignment_length / query_length if query_length else None
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pass
                 if qid not in best or pct_id > best[qid][0]:
-                    best[qid] = (pct_id, hit_id)
+                    best[qid] = (pct_id, hit_id, query_coverage, alignment_length)
     except FileNotFoundError:
         logger.warning("[NOVELTY] matches file not found: %s", matches_path)
     return best
@@ -294,7 +307,7 @@ def build_novelty_itol(
     output = os.path.join(outdir, "itol_novelty.itol")
 
     # Identity bins → colour (matches the legend in your existing figures)
-    def _identity_color(pct: float) -> str:
+    def _identity_colour(pct: float) -> str:
         if pct == 0.0:
             return "#8B0000"   # dark red — no hit
         elif pct < 90:
@@ -337,7 +350,7 @@ def build_novelty_itol(
         ("100%",  "#00AA00"),
     ]
 
-    id_color_pairs = []
+    id_colour_pairs = []
     try:
         with open(novelty_tsv) as fh:
             next(fh)  # skip header
@@ -350,7 +363,7 @@ def build_novelty_itol(
                     pct = float(parts[1])
                 except ValueError:
                     pct = 0.0
-                id_color_pairs.append((qid, _identity_color(pct)))
+                id_colour_pairs.append((qid, _identity_colour(pct)))
     except FileNotFoundError:
         logger.warning("[NOVELTY] novelty.tsv not found: %s", novelty_tsv)
         return output
@@ -365,10 +378,10 @@ def build_novelty_itol(
         fh.write("LEGEND_TITLE,Novelty (nearest identity)\n")
         fh.write("LEGEND_SHAPES," + ",".join(["1"] * len(legend_bins)) + "\n")
         fh.write("LEGEND_COLORS," + ",".join(c for _, c in legend_bins) + "\n")
-        fh.write("LEGEND_LABELS," + ",".join(l for l, _ in legend_bins) + "\n")
+        fh.write("LEGEND_LABELS," + ",".join(label for label, _ in legend_bins) + "\n")
         fh.write("DATA\n")
-        for qid, color in id_color_pairs:
-            fh.write(f"{qid},{color}\n")
+        for qid, colour in id_colour_pairs:
+            fh.write(f"{qid},{colour}\n")
 
     logger.info("[NOVELTY] iTOL novelty strip → %s", output)
     return output
@@ -378,9 +391,9 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
     """Compute nearest-neighbour identities of run sequences against all non-run DB sequences.
 
     The comparison pool includes ALL datasets stored in the DB except *run_dataset*,
-    which means every preload dataset (no matter how many) is automatically included.
+    which means every registered baseline dataset (no matter how many) is automatically included.
     """
-    db_preset_fasta = Path(outdir) / 'db_preload_seqs.fasta'
+    db_preset_fasta = Path(outdir) / 'project_collection_reference.fasta'
     try:
         with db.connect() as conn:
             cur = conn.cursor()
@@ -412,8 +425,13 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
             from branchmanager.utils.subprocess import run_cmd
             novelty_matches = Path(outdir) / 'novelty_matches.tsv'
             thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
-            cmd = f"vsearch --usearch_global {mapped_derep} --db {db_preset_fasta} --id 0.5 --strand both --blast6out {novelty_matches} --maxaccepts 1 --maxhits 1{thread_flag}"
-            logger.info("[NOVELTY] Running vsearch against preload DB to compute novelty")
+            cmd = (
+                f"vsearch --usearch_global {shlex.quote(str(mapped_derep))} "
+                f"--db {shlex.quote(str(db_preset_fasta))} --id 0.5 --strand both "
+                f"--blast6out {shlex.quote(str(novelty_matches))} "
+                f"--maxaccepts 1 --maxhits 1{thread_flag}"
+            )
+            logger.info("[NOVELTY] Running vsearch against registered project collection to compute novelty")
             run_cmd(cmd)
             if novelty_matches.exists():
                 with open(novelty_matches) as nm:
@@ -447,12 +465,12 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
     ]
     try:
         percents = list(range(90, 101))
-        colors = [itol._novelty_color_for_pct('<90')]
-        colors += [itol._identity_to_color(p / 100.0, vmin=0.90, vmax=1.0) for p in percents]
+        colours = [itol._novelty_colour_for_pct('<90')]
+        colours += [itol._identity_to_colour(p / 100.0, vmin=0.90, vmax=1.0) for p in percents]
         labels = ['<90'] + [f"{p}%" for p in percents]
         nov_lines.append('LEGEND_TITLE,Novelty (identity)')
         nov_lines.append('LEGEND_SHAPES,' + ','.join(['1'] * len(labels)))
-        nov_lines.append('LEGEND_COLORS,' + ','.join(colors))
+        nov_lines.append('LEGEND_COLORS,' + ','.join(colours))
         nov_lines.append('LEGEND_LABELS,' + ','.join(labels))
     except Exception:
         pass
@@ -498,14 +516,14 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
                     break
         if short_id is None:
             short_id = iid
-        color = '#cccccc'
+        colour = '#cccccc'
         if novel_results and short_id in novel_results:
             v = novel_results.get(short_id)
             if v is not None:
                 try:
-                    color = itol._identity_to_color(float(v), vmin=0.90, vmax=1.0)
+                    colour = itol._identity_to_colour(float(v), vmin=0.90, vmax=1.0)
                 except Exception:
-                    color = '#cccccc'
+                    colour = '#cccccc'
             else:
                 try:
                     with db.connect() as conn:
@@ -513,35 +531,15 @@ def build_run_novelty_itol(outdir: str, run_ids, mapped_derep: str, db, run_data
                         cur.execute('SELECT identity FROM distances WHERE id = ? LIMIT 1', (iid,))
                         r = cur.fetchone()
                         if r:
-                            color = itol._identity_to_color(r[0], vmin=0.90, vmax=1.0)
+                            colour = itol._identity_to_colour(r[0], vmin=0.90, vmax=1.0)
                 except Exception:
-                    color = '#cccccc'
-        nov_lines.append(f'{iid},{color}')
+                    colour = '#cccccc'
+        nov_lines.append(f'{iid},{colour}')
 
     nov_path = Path(outdir) / 'itol_novelty.itol'
     nov_path.write_text('\n'.join(nov_lines) + '\n')
-    logger.info('[ITOL] Wrote novelty ITOL colorstrip to %s', nov_path)
+    logger.info('[ITOL] Wrote novelty iTOL colour strip to %s', nov_path)
     return str(nov_path)
-
-
-def _load_novelty_summary(novelty_tsv: str):
-    summary = {}
-    with open(novelty_tsv) as fh:
-        next(fh, None)
-        for line in fh:
-            parts = line.rstrip('\n').split('\t')
-            if len(parts) < 4:
-                continue
-            try:
-                nearest_identity = float(parts[1]) if parts[1] not in ('', 'NA') else 0.0
-            except Exception:
-                nearest_identity = 0.0
-            summary[parts[0]] = {
-                'nearest_identity': nearest_identity,
-                'nearest_hit': parts[2] if len(parts) > 2 else 'None',
-                'novel': parts[3] if len(parts) > 3 else 'True',
-            }
-    return summary
 
 
 def _novelty_priority_from_metrics(nearest_identity: float, matches_ge_99: int, matches_ge_97: int):
@@ -584,8 +582,15 @@ def _normalise_dataset_names(dataset_names) -> list[str]:
     return names
 
 
-def _query_db_pool(db, *, run_dataset: Optional[str] = None, include_datasets=None):
+def _query_db_pool(
+    db,
+    *,
+    run_dataset: Optional[str] = None,
+    include_datasets=None,
+    exclude_datasets=None,
+):
     include = _normalise_dataset_names(include_datasets)
+    exclude = _normalise_dataset_names(exclude_datasets)
     clauses = ["sequence IS NOT NULL", "sequence != ''"]
     params: list[object] = []
     if run_dataset:
@@ -595,6 +600,10 @@ def _query_db_pool(db, *, run_dataset: Optional[str] = None, include_datasets=No
         placeholders = ','.join('?' for _ in include)
         clauses.append(f"dataset IN ({placeholders})")
         params.extend(include)
+    if exclude:
+        placeholders = ','.join('?' for _ in exclude)
+        clauses.append(f"(dataset NOT IN ({placeholders}) OR dataset IS NULL)")
+        params.extend(exclude)
     where = ' AND '.join(clauses)
     with db.connect() as conn:
         cur = conn.cursor()
@@ -620,6 +629,7 @@ def _build_db_pool_fasta(
     name: str,
     run_dataset: Optional[str] = None,
     include_datasets=None,
+    exclude_datasets=None,
 ) -> tuple[Optional[str], str, list[str], int]:
     if db is None:
         return None, 'none', [], 0
@@ -628,39 +638,79 @@ def _build_db_pool_fasta(
             db,
             run_dataset=run_dataset,
             include_datasets=include_datasets,
+            exclude_datasets=exclude_datasets,
         )
     except Exception as e:
-        logger.warning('[NOVELTY] Failed to query %s comparison pool from DB: %s', name, e)
-        return None, 'none', [], 0
+        raise RuntimeError(f'failed to query the {name} novelty pool from the project database: {e}') from e
     path = _write_pool_fasta(records, Path(outdir) / f'novelty_{name}_pool.fasta')
     if not path:
         return None, 'none', datasets, 0
     return path, name, datasets, len(records)
 
 
-def _run_nearest_search(input_fasta: str, db_fasta: str, matches_path: Path, threads: Optional[int] = None):
+def _run_nearest_search(
+    input_fasta: str,
+    db_fasta: str,
+    matches_path: Path,
+    threads: Optional[int] = None,
+    *,
+    exclude_self: bool = False,
+):
     thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
     cmd = (
-        f"vsearch --usearch_global {input_fasta} "
-        f"--db {db_fasta} "
+        f"vsearch --usearch_global {shlex.quote(str(input_fasta))} "
+        f"--db {shlex.quote(str(db_fasta))} "
         f"--id 0.5 "
         f"--strand both "
-        f"--blast6out {matches_path} "
-        f"--maxaccepts 1 --maxhits 1 "
+        f"--blast6out {shlex.quote(str(matches_path))} "
+        f"--userfields {VSEARCH_USERFIELDS} "
+        f"--maxaccepts {2 if exclude_self else 1} --maxhits {2 if exclude_self else 1} "
         f"--query_cov 0.7{thread_flag}"
     )
     run_cmd(cmd)
-    return _parse_best_hits(str(matches_path))
+    if not exclude_self:
+        return _parse_best_hits(str(matches_path))
+    best = {}
+    if matches_path.exists():
+        with open(matches_path) as handle:
+            for line in handle:
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 3 or parts[0] == parts[1]:
+                    continue
+                try:
+                    pct = float(parts[2])
+                except Exception:
+                    continue
+                if parts[0] not in best or pct > best[parts[0]][0]:
+                    query_coverage = None
+                    alignment_length = None
+                    if len(parts) >= 12:
+                        try:
+                            alignment_length = int(float(parts[3]))
+                            query_length = int(float(parts[10]))
+                            query_coverage = 100.0 * alignment_length / query_length if query_length else None
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            pass
+                    best[parts[0]] = (pct, parts[1], query_coverage, alignment_length)
+    return best
 
 
-def _run_density_search(input_fasta: str, db_fasta: str, matches_path: Path, threads: Optional[int] = None):
+def _run_density_search(
+    input_fasta: str,
+    db_fasta: str,
+    matches_path: Path,
+    threads: Optional[int] = None,
+    *,
+    exclude_self: bool = False,
+):
     thread_flag = f" --threads {int(threads)}" if threads and int(threads) > 0 else ""
     cmd = (
-        f"vsearch --usearch_global {input_fasta} "
-        f"--db {db_fasta} "
+        f"vsearch --usearch_global {shlex.quote(str(input_fasta))} "
+        f"--db {shlex.quote(str(db_fasta))} "
         f"--id 0.95 "
         f"--strand both "
-        f"--blast6out {matches_path} "
+        f"--blast6out {shlex.quote(str(matches_path))} "
+        f"--userfields {VSEARCH_USERFIELDS} "
         f"--maxaccepts 0 --maxhits 0 "
         f"--query_cov 0.7{thread_flag}"
     )
@@ -674,6 +724,8 @@ def _run_density_search(input_fasta: str, db_fasta: str, matches_path: Path, thr
                 if len(parts) < 3:
                     continue
                 qid = parts[0]
+                if exclude_self and parts[1] == qid:
+                    continue
                 try:
                     pct = float(parts[2])
                 except Exception:
@@ -702,7 +754,8 @@ def _metrics_from_nearest_and_density(qids, nearest_hits, density_counts, *, sou
     novel_threshold_pct = id_threshold * 100.0
     rows = {}
     for qid in qids:
-        pct_id, hit_id = nearest_hits.get(qid, (0.0, 'None'))
+        hit = nearest_hits.get(qid, (0.0, 'None', None, None))
+        pct_id, hit_id = hit[0], hit[1]
         counts = density_counts.get(qid, {'ge_99': 0, 'ge_97': 0, 'ge_95': 0})
         crowding = _crowding_from_counts(counts)
         score = _novelty_score_from_metrics(pct_id, counts['ge_99'], counts['ge_97'], counts['ge_95'])
@@ -710,6 +763,8 @@ def _metrics_from_nearest_and_density(qids, nearest_hits, density_counts, *, sou
         rows[qid] = {
             'nearest_identity': pct_id,
             'nearest_hit': hit_id,
+            'nearest_query_coverage': hit[2] if len(hit) > 2 else None,
+            'nearest_alignment_length': hit[3] if len(hit) > 3 else None,
             'novel': str(pct_id < novel_threshold_pct),
             'matches_ge_99': counts['ge_99'],
             'matches_ge_97': counts['ge_97'],
@@ -727,65 +782,125 @@ def _empty_pool_metrics(qids, *, source: str = 'none'):
         qid: {
             'nearest_identity': 0.0,
             'nearest_hit': 'None',
-            'novel': 'True',
+            'nearest_query_coverage': None,
+            'nearest_alignment_length': None,
+            'novel': 'NA',
             'matches_ge_99': 0,
             'matches_ge_97': 0,
             'matches_ge_95': 0,
             'novelty_score': 0.0,
-            'crowding': 'sparse',
-            'sequencing_priority': 'HIGH',
+            'crowding': 'unknown',
+            'sequencing_priority': 'NA',
             'density_source': source,
         }
         for qid in qids
     }
 
 
-def _empty_sequencing_context(qids):
+def _empty_sequencing_context(qids, pangenome_target: int = 3):
+    target_count = max(1, int(pangenome_target or 3))
     return {
         qid: {
             'partner_id': 'NA',
+            'selected_for_sequencing': 'NA',
+            'already_sequenced': 'NA',
             'selected_for_wgs': 'NA',
-            'nearest_selected_hit': 'None',
-            'nearest_selected_identity': 0.0,
-            'selected_ge_99': 0,
-            'selected_ge_97': 0,
-            'selected_ge_95': 0,
-            'clade_already_selected': 'False',
+            'nearest_genome_hit': 'None',
+            'nearest_genome_identity': 0.0,
+            'genome_ge_99': 0,
+            'genome_ge_97': 0,
+            'genome_ge_95': 0,
+            'related_genome_clade': 'False',
             'adjusted_novelty_score': 'NA',
             'adjusted_priority': 'NA',
             'source': 'none',
+            'genome_same_species_committed': 0,
+            'genome_same_species_available': 0,
+            'genome_same_species_selected': 0,
+            'genome_same_species_pending': 0,
+            'pangenome_target': target_count,
+            'pangenome_gap': target_count,
         }
         for qid in qids
     }
 
 
-def _compute_sequencing_context(input_fasta: str, outdir: str, db, qids, primary_metrics, threads: Optional[int] = None):
+def _compute_sequencing_context(
+    input_fasta: str,
+    outdir: str,
+    db,
+    qids,
+    primary_metrics,
+    threads: Optional[int] = None,
+    pangenome_target: int = 3,
+):
     if db is None:
-        return _empty_sequencing_context(qids)
+        return _empty_sequencing_context(qids, pangenome_target)
 
     try:
         metadata = db.get_sequencing_metadata_for_ids(qids)
     except Exception:
         metadata = {}
 
-    selected_records = []
+    genome_records = []
+    genome_metadata = {}
+    collection_metadata = {}
+    query_taxonomy = {}
     try:
+        dataset_roles = db.get_dataset_roles()
+        baseline_genome_datasets = {
+            dataset for dataset, values in dataset_roles.items()
+            if values.get('role') == 'baseline' and values.get('genomes_available')
+        }
         with db.connect() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT s.id, s.sequence FROM sequences s "
-                "JOIN sequencing_metadata m ON s.id = m.id "
-                "WHERE m.selected_for_wgs = 1 AND s.sequence IS NOT NULL AND s.sequence != ''"
+                "SELECT s.id, s.sequence, s.dataset, t.taxonomy, "
+                "COALESCE(m.selected_for_wgs, 0), COALESCE(m.selected_for_sequencing, 0) "
+                "FROM sequences s "
+                "LEFT JOIN taxonomy t ON s.id = t.id AND (t.dataset = s.dataset OR t.dataset IS NULL) "
+                "LEFT JOIN sequencing_metadata m ON s.id = m.id "
+                "WHERE s.sequence IS NOT NULL AND s.sequence != ''"
             )
-            selected_records = [(str(r[0]), str(r[1])) for r in cur.fetchall() if r[0] and r[1]]
+            rows = cur.fetchall()
+        by_id = {}
+        for sid, sequence, dataset, taxonomy, available, selected in rows:
+            sid = str(sid)
+            entry = by_id.setdefault(sid, {
+                'sequence': str(sequence),
+                'dataset': str(dataset or ''),
+                'taxonomy': '',
+                'available': bool(available),
+                'selected': bool(selected),
+            })
+            if taxonomy and not entry['taxonomy']:
+                entry['taxonomy'] = str(taxonomy)
+        for sid, entry in by_id.items():
+            if sid in qids:
+                query_taxonomy[sid] = entry.get('taxonomy', '')
+            is_baseline_genome = entry.get('dataset') in baseline_genome_datasets
+            is_partner_genome = bool(entry.get('available')) and not is_baseline_genome
+            is_pending_selection = bool(entry.get('selected')) and not is_partner_genome and not is_baseline_genome
+            collection_metadata[sid] = {
+                'taxonomy': entry.get('taxonomy', ''),
+                'dataset': entry.get('dataset', ''),
+                'baseline_available': is_baseline_genome,
+                'partner_available': is_partner_genome,
+                'selected_pending': is_pending_selection,
+            }
+            if is_baseline_genome or is_partner_genome:
+                genome_records.append((sid, entry['sequence']))
+                genome_metadata[sid] = collection_metadata[sid]
     except Exception as e:
-        logger.warning('[NOVELTY] Failed to load selected-for-WGS pool from DB: %s', e)
-        selected_records = []
+        logger.warning('[NOVELTY] Failed to load genome collection from DB: %s', e)
+        genome_records = []
+        genome_metadata = {}
+        collection_metadata = {}
 
     selected_hits = {qid: [] for qid in qids}
-    if selected_records:
+    if genome_records:
         selected_pool = Path(outdir) / 'novelty_selected_for_wgs_pool.fasta'
-        write_fasta(selected_records, str(selected_pool))
+        write_fasta(genome_records, str(selected_pool))
         matches_path = Path(outdir) / 'novelty_selected_for_wgs_matches.tsv'
         try:
             _run_density_search(input_fasta, str(selected_pool), matches_path, threads=threads)
@@ -806,6 +921,15 @@ def _compute_sequencing_context(input_fasta: str, outdir: str, db, qids, primary
         except Exception as e:
             logger.warning('[NOVELTY] Failed to compute selected-for-WGS neighbourhood: %s', e)
 
+    def species_key(taxonomy):
+        parsed = parse_taxon_string(str(taxonomy or ''))
+        species = str(parsed.get('s') or '').strip()
+        if not species or species.lower() in ('na', 'none', 'unclassified'):
+            return None
+        if species.startswith('s__') and not species[3:].strip():
+            return None
+        return species.lower()
+
     context = {}
     for qid in qids:
         hits = selected_hits.get(qid, [])
@@ -816,7 +940,25 @@ def _compute_sequencing_context(input_fasta: str, outdir: str, db, qids, primary
         if hits:
             nearest_pct, nearest_hit = max(hits, key=lambda item: item[0])
         meta = metadata.get(qid, {})
-        current_selected = meta.get('selected_for_wgs')
+        current_available = meta.get('selected_for_wgs')
+        current_selected = meta.get('selected_for_sequencing')
+        query_species = species_key(query_taxonomy.get(qid))
+        same_species_ids = [
+            sid for sid, values in collection_metadata.items()
+            if query_species and species_key(values.get('taxonomy')) == query_species
+        ]
+        same_species_baseline = sum(
+            1 for sid in same_species_ids if collection_metadata[sid].get('baseline_available')
+        )
+        same_species_partner_available = sum(
+            1 for sid in same_species_ids if collection_metadata[sid].get('partner_available')
+        )
+        same_species_pending = sum(
+            1 for sid in same_species_ids if collection_metadata[sid].get('selected_pending')
+        )
+        same_species_committed = same_species_baseline + same_species_partner_available + same_species_pending
+        target_count = max(1, int(pangenome_target or 3))
+        pangenome_gap = max(0, target_count - same_species_committed)
         base = primary_metrics.get(qid, {})
         try:
             base_score = float(base.get('novelty_score', 0.0))
@@ -824,12 +966,21 @@ def _compute_sequencing_context(input_fasta: str, outdir: str, db, qids, primary
             base_score = 0.0
         base_priority = str(base.get('sequencing_priority', 'NA'))
         clade_already_selected = ge_97 > 0
-        if current_selected:
-            adjusted_priority = 'SELECTED'
+        if current_available:
+            adjusted_priority = 'SEQUENCED'
             adjusted_score = base_score
-        elif clade_already_selected:
-            adjusted_priority = 'LOW_ALREADY_SELECTED_CLADE'
+        elif current_selected:
+            adjusted_priority = 'SELECTED_PENDING'
+            adjusted_score = base_score
+        elif query_species and pangenome_gap > 0:
+            adjusted_priority = base_priority
+            adjusted_score = base_score
+        elif query_species and pangenome_gap == 0 and nearest_pct >= 98.65:
+            adjusted_priority = 'LOW_PANGENOME_TARGET_MET'
             adjusted_score = max(0.0, base_score - 25.0)
+        elif clade_already_selected:
+            adjusted_priority = 'MEDIUM_RELATED_GENOME_CLADE'
+            adjusted_score = max(0.0, base_score - 10.0)
         elif ge_95 > 0 and base_priority == 'HIGH':
             adjusted_priority = 'MEDIUM_SELECTED_NEARBY'
             adjusted_score = max(0.0, base_score - 10.0)
@@ -838,39 +989,51 @@ def _compute_sequencing_context(input_fasta: str, outdir: str, db, qids, primary
             adjusted_score = base_score
         context[qid] = {
             'partner_id': meta.get('partner_id', 'NA'),
-            'selected_for_wgs': 'True' if current_selected is True else ('False' if current_selected is False else 'NA'),
-            'nearest_selected_hit': nearest_hit,
-            'nearest_selected_identity': nearest_pct,
-            'selected_ge_99': ge_99,
-            'selected_ge_97': ge_97,
-            'selected_ge_95': ge_95,
-            'clade_already_selected': str(clade_already_selected),
+            'selected_for_sequencing': 'True' if current_selected is True else ('False' if current_selected is False else 'NA'),
+            'already_sequenced': 'True' if current_available is True else ('False' if current_available is False else 'NA'),
+            'selected_for_wgs': 'True' if current_available is True else ('False' if current_available is False else 'NA'),
+            'nearest_genome_hit': nearest_hit,
+            'nearest_genome_identity': nearest_pct,
+            'genome_ge_99': ge_99,
+            'genome_ge_97': ge_97,
+            'genome_ge_95': ge_95,
+            'related_genome_clade': str(clade_already_selected),
             'adjusted_novelty_score': adjusted_score,
             'adjusted_priority': adjusted_priority,
-            'source': 'sequencing_metadata' if metadata or selected_records else 'none',
+            'source': 'baseline_genomes_and_project_ledger' if metadata or genome_records else 'none',
+            'genome_same_species_committed': same_species_committed,
+            'genome_same_species_available': same_species_baseline,
+            'genome_same_species_selected': same_species_partner_available,
+            'genome_same_species_pending': same_species_pending,
+            'pangenome_target': target_count,
+            'pangenome_gap': pangenome_gap,
         }
     return context
 
 
-def _write_novelty_metrics_table(output: Path, qids, primary_metrics, baseline_metrics, all_known_metrics, reference_metrics, sequencing_context=None):
+def _write_novelty_metrics_table(output: Path, qids, primary_metrics, baseline_metrics, project_metrics, reference_metrics, sequencing_context=None):
     headers = [
         'ID',
         'NearestIdentity', 'NearestHit', 'Novel', 'MatchesGE99', 'MatchesGE97', 'MatchesGE95',
-        'NoveltyScore', 'Crowding', 'SequencingPriority', 'DensitySource',
+        'NoveltyScore', 'Crowding', 'SequencingPriority', 'NearestQueryCoverage', 'NearestAlignmentLength', 'DensitySource',
         'BaselineNearestIdentity', 'BaselineNearestHit', 'BaselineNovel',
         'BaselineMatchesGE99', 'BaselineMatchesGE97', 'BaselineMatchesGE95',
-        'BaselineNoveltyScore', 'BaselineCrowding', 'BaselineSequencingPriority', 'BaselineDensitySource',
-        'AllKnownNearestIdentity', 'AllKnownNearestHit', 'AllKnownNovel',
-        'AllKnownMatchesGE99', 'AllKnownMatchesGE97', 'AllKnownMatchesGE95',
-        'AllKnownNoveltyScore', 'AllKnownCrowding', 'AllKnownSequencingPriority', 'AllKnownDensitySource',
+        'BaselineNoveltyScore', 'BaselineCrowding', 'BaselineSequencingPriority', 'BaselineNearestQueryCoverage', 'BaselineNearestAlignmentLength', 'BaselineDensitySource',
+        'ProjectNearestIdentity', 'ProjectNearestHit', 'ProjectNovel',
+        'ProjectMatchesGE99', 'ProjectMatchesGE97', 'ProjectMatchesGE95',
+        'ProjectNoveltyScore', 'ProjectCrowding', 'ProjectSequencingPriority', 'ProjectNearestQueryCoverage', 'ProjectNearestAlignmentLength', 'ProjectDensitySource',
         'ReferenceNearestIdentity', 'ReferenceNearestHit', 'ReferenceNovel',
         'ReferenceMatchesGE99', 'ReferenceMatchesGE97', 'ReferenceMatchesGE95',
-        'ReferenceNoveltyScore', 'ReferenceCrowding', 'ReferenceSequencingPriority', 'ReferenceDensitySource',
-        'PartnerID', 'SelectedForGenomeSequencing',
-        'NearestSelectedGenomeHit', 'NearestSelectedGenomeIdentity',
-        'SelectedGenomeMatchesGE99', 'SelectedGenomeMatchesGE97', 'SelectedGenomeMatchesGE95',
-        'CladeAlreadySelectedForGenomeSequencing',
-        'GenomeSequencingAdjustedNoveltyScore', 'GenomeSequencingAdjustedPriority',
+        'ReferenceNoveltyScore', 'ReferenceCrowding', 'ReferenceSequencingPriority', 'ReferenceNearestQueryCoverage', 'ReferenceNearestAlignmentLength', 'ReferenceDensitySource',
+        'PartnerID', 'SelectedForGenomeSequencing', 'GenomeAlreadySequenced',
+        'NearestGenomeHit', 'NearestGenomeIdentity',
+        'GenomeCollectionMatchesGE99', 'GenomeCollectionMatchesGE97', 'GenomeCollectionMatchesGE95',
+        'RelatedGenomeCladeGE97',
+        'CommittedGenomeCountSameAssessmentSpecies',
+        'BaselineGenomeCountSameAssessmentSpecies',
+        'SequencedPartnerGenomeCountSameAssessmentSpecies',
+        'SelectedPendingGenomeCountSameAssessmentSpecies',
+        'PangenomeTarget', 'PangenomeGap',
         'GenomeSequencingMetadataSource',
     ]
 
@@ -886,6 +1049,8 @@ def _write_novelty_metrics_table(output: Path, qids, primary_metrics, baseline_m
             f"{float(row['novelty_score']):.2f}",
             row['crowding'],
             row['sequencing_priority'],
+            'NA' if row.get('nearest_query_coverage') is None else f"{float(row['nearest_query_coverage']):.2f}",
+            'NA' if row.get('nearest_alignment_length') is None else str(int(row['nearest_alignment_length'])),
             row['density_source'],
         ]
 
@@ -895,44 +1060,47 @@ def _write_novelty_metrics_table(output: Path, qids, primary_metrics, baseline_m
         for qid in qids:
             primary = vals(primary_metrics, qid)
             baseline = vals(baseline_metrics, qid)
-            all_known = vals(all_known_metrics, qid)
+            project = vals(project_metrics, qid)
             reference = vals(reference_metrics, qid)
             seq_ctx = sequencing_context.get(qid) or _empty_sequencing_context([qid])[qid]
             sequencing = [
                 seq_ctx['partner_id'],
-                seq_ctx['selected_for_wgs'],
-                seq_ctx['nearest_selected_hit'],
-                f"{float(seq_ctx['nearest_selected_identity']):.2f}",
-                str(seq_ctx['selected_ge_99']),
-                str(seq_ctx['selected_ge_97']),
-                str(seq_ctx['selected_ge_95']),
-                seq_ctx['clade_already_selected'],
-                f"{float(seq_ctx['adjusted_novelty_score']):.2f}" if seq_ctx['adjusted_novelty_score'] != 'NA' else 'NA',
-                seq_ctx['adjusted_priority'],
+                seq_ctx['selected_for_sequencing'],
+                seq_ctx['already_sequenced'],
+                seq_ctx['nearest_genome_hit'],
+                f"{float(seq_ctx['nearest_genome_identity']):.2f}",
+                str(seq_ctx['genome_ge_99']),
+                str(seq_ctx['genome_ge_97']),
+                str(seq_ctx['genome_ge_95']),
+                seq_ctx['related_genome_clade'],
+                str(seq_ctx['genome_same_species_committed']),
+                str(seq_ctx['genome_same_species_available']),
+                str(seq_ctx['genome_same_species_selected']),
+                str(seq_ctx['genome_same_species_pending']),
+                str(seq_ctx['pangenome_target']),
+                str(seq_ctx['pangenome_gap']),
                 seq_ctx['source'],
             ]
-            fh.write('\t'.join([qid] + primary + baseline + all_known + reference + sequencing) + '\n')
+            fh.write('\t'.join([qid] + primary + baseline + project + reference + sequencing) + '\n')
     return str(output)
 
 
 def build_reference_novelty_metrics(
     input_fasta: str,
     ref_fasta: str,
-    novelty_tsv: str,
     outdir: str,
     threads: Optional[int] = None,
     db=None,
     run_dataset: Optional[str] = None,
     target_fasta: Optional[str] = None,
     baseline_datasets=None,
+    pangenome_target: int = 3,
 ):
     """Write per-sequence novelty metrics comparing against user-submitted sequences.
 
-    Density (neighbourhood crowding) is computed against previously submitted
-    sequences (preload + all other run datasets stored in the DB), NOT against
-    the external reference database.  This ensures that novelty is always
-    expressed relative to the sequences *the user* has already characterised,
-    which is the core BranchManager design goal.
+    Project density is computed against the rolling partner-candidate
+    collection, including the current batch but excluding each query's self-hit.
+    Cultured baselines and the external GTDB reference remain separate pools.
 
     If ``target_fasta`` is provided it overrides both the DB lookup and the
     ``ref_fasta`` fallback — only those sequences are used as the density
@@ -945,7 +1113,6 @@ def build_reference_novelty_metrics(
     ----------
     input_fasta  : Query sequences (dereplicated, QC-passed).
     ref_fasta    : External reference FASTA — used as a last resort fallback only.
-    novelty_tsv  : Path to novelty.tsv produced by run_novelty.
     outdir       : Output directory.
     threads      : VSEARCH thread count.
     db           : Database instance (used to pull previously submitted seqs).
@@ -959,14 +1126,15 @@ def build_reference_novelty_metrics(
     whether each query or any close 16S neighbour (>=97% identity) has already
     been selected for WGS/full-genome sequencing.
     """
-    summary = _load_novelty_summary(novelty_tsv)
     output = Path(outdir) / 'novelty_metrics.tsv'
-    qids = list(summary.keys())
-    if not qids:
-        qids = [
-            h for h, _ in read_fasta(input_fasta)
-            if not tree_pipeline.is_ref_anchor(h)
-        ]
+    # The metrics query FASTA may contain the entire rolling candidate
+    # collection, not only the newest submission represented in novelty.tsv.
+    qids = [
+        h for h, _ in read_fasta(input_fasta)
+        if not tree_pipeline.is_ref_anchor(h)
+    ]
+
+    baseline_names = _normalise_dataset_names(baseline_datasets)
 
     all_pool_path: Optional[str] = None
     all_source = 'none'
@@ -975,17 +1143,23 @@ def build_reference_novelty_metrics(
     if target_fasta and Path(target_fasta).exists():
         all_pool_path = target_fasta
         all_source = 'target_fasta'
-        logger.info('[NOVELTY] Using target FASTA for all-known novelty metrics: %s', target_fasta)
+        logger.info('[NOVELTY] Using target FASTA for project novelty metrics: %s', target_fasta)
     elif db is not None:
+        try:
+            candidate_datasets = db.get_dataset_names_by_role('candidate')
+        except Exception:
+            candidate_datasets = []
         all_pool_path, all_source, all_datasets, all_count = _build_db_pool_fasta(
             db=db,
             outdir=outdir,
-            name='all_known',
-            run_dataset=run_dataset,
+            name='project_collection',
+            include_datasets=candidate_datasets or None,
+            exclude_datasets=None if candidate_datasets else baseline_names,
         )
+        all_source = 'project_collection' if all_pool_path else all_source
         if all_pool_path:
             logger.info(
-                '[NOVELTY] All-known pool: %d sequences from %d dataset(s): %s',
+                '[NOVELTY] Project pool: %d sequences from %d dataset(s): %s',
                 all_count, len(all_datasets), all_datasets,
             )
 
@@ -993,21 +1167,25 @@ def build_reference_novelty_metrics(
         all_pool_path = _ensure_uncompressed(ref_fasta, outdir)
         all_source = 'reference_fasta'
         logger.info(
-            '[NOVELTY] WARNING: No user-submitted all-known pool available. '
+            '[NOVELTY] WARNING: No partner-candidate project pool available. '
             'Falling back to external reference (%s).',
             ref_fasta,
         )
 
     if all_pool_path:
-        all_nearest = {
-            qid: (meta['nearest_identity'], meta['nearest_hit'])
-            for qid, meta in summary.items()
-        }
+        all_nearest = _run_nearest_search(
+            input_fasta,
+            all_pool_path,
+            Path(outdir) / 'novelty_project_nearest_matches.tsv',
+            threads=threads,
+            exclude_self=True,
+        )
         all_density = _run_density_search(
             input_fasta,
             all_pool_path,
-            Path(outdir) / 'novelty_all_known_density_matches.tsv',
+            Path(outdir) / 'novelty_project_density_matches.tsv',
             threads=threads,
+            exclude_self=True,
         )
         all_metrics = _metrics_from_nearest_and_density(
             qids,
@@ -1017,7 +1195,7 @@ def build_reference_novelty_metrics(
             id_threshold=0.97,
         )
     else:
-        logger.warning('[NOVELTY] No all-known comparison pool available; all-known metrics will be empty')
+        logger.warning('[NOVELTY] No project comparison pool available; project metrics will be empty')
         all_metrics = _empty_pool_metrics(qids, source='none')
 
     reference_pool_path: Optional[str] = None
@@ -1027,8 +1205,7 @@ def build_reference_novelty_metrics(
             reference_pool_path = _ensure_uncompressed(ref_fasta, outdir)
             reference_source = 'reference_fasta'
         except Exception as e:
-            logger.warning('[NOVELTY] Could not prepare reference novelty pool %s: %s', ref_fasta, e)
-            reference_pool_path = None
+            raise RuntimeError(f'could not prepare external-reference novelty pool {ref_fasta}: {e}') from e
 
     if reference_pool_path:
         reference_nearest = _run_nearest_search(
@@ -1053,7 +1230,6 @@ def build_reference_novelty_metrics(
     else:
         reference_metrics = _empty_pool_metrics(qids, source='none')
 
-    baseline_names = _normalise_dataset_names(baseline_datasets)
     baseline_pool_path: Optional[str] = None
     baseline_source = 'none'
     baseline_datasets_found: list[str] = []
@@ -1073,7 +1249,9 @@ def build_reference_novelty_metrics(
                 baseline_count, baseline_datasets_found or baseline_names,
             )
         else:
-            logger.info('[NOVELTY] No baseline sequences found for dataset(s): %s', baseline_names)
+            raise RuntimeError(
+                f'no cultured-baseline sequences were found for registered dataset(s): {baseline_names}'
+            )
 
     if baseline_pool_path:
         baseline_nearest = _run_nearest_search(
@@ -1106,6 +1284,7 @@ def build_reference_novelty_metrics(
         qids,
         primary_metrics,
         threads=threads,
+        pangenome_target=pangenome_target,
     )
     _write_novelty_metrics_table(
         output,
@@ -1117,7 +1296,7 @@ def build_reference_novelty_metrics(
         sequencing_context,
     )
     logger.info(
-        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; baseline=%s; all-known=%s; reference=%s)',
+        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; baseline=%s; project=%s; reference=%s)',
         output,
         'baseline' if baseline_pool_path else all_source,
         baseline_source,

@@ -38,7 +38,7 @@ def _clean_taxon_value(value: str) -> str:
     return value
 
 
-def normalize_taxon_name(value: str) -> str:
+def normalise_taxon_name(value: str) -> str:
     value = _clean_taxon_value(value)
     if not value:
         return ''
@@ -47,8 +47,8 @@ def normalize_taxon_name(value: str) -> str:
     return value
 
 
-def normalize_domain_query(value: str) -> str:
-    norm = normalize_taxon_name(value)
+def normalise_domain_query(value: str) -> str:
+    norm = normalise_taxon_name(value)
     return DOMAIN_QUERY_ALIASES.get(norm, norm)
 
 
@@ -95,27 +95,27 @@ def taxonomy_matches_kingdom(taxon: Optional[str], kingdom: str) -> bool:
     """
     if not kingdom:
         return True
-    wanted = normalize_domain_query(kingdom)
+    wanted = normalise_domain_query(kingdom)
     if not wanted:
         return True
     parsed = parse_taxon_string(taxon)
-    domain = normalize_domain_query(parsed.get('d', ''))
-    kingdom_value = normalize_domain_query(parsed.get('k', ''))
+    domain = normalise_domain_query(parsed.get('d', ''))
+    kingdom_value = normalise_domain_query(parsed.get('k', ''))
     candidates = [value for value in (domain, kingdom_value) if value]
     if candidates:
         return wanted in candidates
     # fallback for malformed lineage strings with no explicit rank prefixes
-    raw = normalize_domain_query(taxon)
+    raw = normalise_domain_query(taxon)
     if not raw:
         return False
     return raw == wanted
 
 
-def canonicalize_sequence_id(header: str) -> Optional[str]:
+def canonicalise_sequence_id(header: str) -> Optional[str]:
     """Conservative sequence-id canonicalisation.
 
     Keeps biologically meaningful suffixes such as `_1` / `_2` (ASV/OTU labels),
-    while stripping transport/coordinate artifacts from FASTA headers.
+    while stripping transport/coordinate artefacts from FASTA headers.
     """
     if header is None:
         return None
@@ -141,14 +141,14 @@ def reference_lookup_keys(header: Optional[str]) -> list[str]:
         return []
     keys = []
     first = raw.split()[0]
-    for candidate in (raw, first, canonicalize_sequence_id(raw), canonicalize_sequence_id(first)):
+    for candidate in (raw, first, canonicalise_sequence_id(raw), canonicalise_sequence_id(first)):
         if candidate and candidate not in keys:
             keys.append(candidate)
     if '|' in first:
         last = first.split('|')[-1]
         if last and last not in keys:
             keys.append(last)
-        canon_last = canonicalize_sequence_id(last)
+        canon_last = canonicalise_sequence_id(last)
         if canon_last and canon_last not in keys:
             keys.append(canon_last)
     return keys

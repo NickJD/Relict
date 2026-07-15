@@ -1,4 +1,5 @@
 import gzip
+import csv
 import os
 import re
 import struct
@@ -14,32 +15,37 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from branchmanager.cli import _find_preferred_id_map, _load_evaluate_baseline, _load_partner_metadata_for_run, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_preload, cmd_run
+from branchmanager.cli import _find_preferred_id_map, _load_partner_metadata_for_run, _load_performance_review_baseline, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_filing_cabinet, cmd_performance_review
 from branchmanager.db.interface import Database
 from branchmanager.pipeline import classify as classify_pipeline
 from branchmanager.pipeline import novelty as novelty_pipeline
-from branchmanager.pipeline import preclassify as preclassify_pipeline
+from branchmanager.pipeline import neighbourhood as neighbourhood_pipeline
+from branchmanager.pipeline import cluster_report as cluster_report_pipeline
+from branchmanager.pipeline import background_check as background_check_pipeline
 from branchmanager.pipeline import mwl as mwl_pipeline
+from branchmanager.pipeline import selection_sets as selection_sets_pipeline
+from branchmanager.pipeline import quarterly_review as quarterly_review_pipeline
 from branchmanager.pipeline import qc as qc_pipeline
-from branchmanager.pipeline import sanger as sanger_pipeline
+from branchmanager.pipeline import paper_trail as paper_trail_pipeline
 from branchmanager.pipeline.classify import _load_taxa_map_from_reference_fasta, validate_reference_taxonomy_consistency
 from branchmanager.pipeline.collapse import collapse_fasta_within_taxa
-from branchmanager.pipeline.itol import generate_itol_colors, write_dataset_membership_strip
+from branchmanager.pipeline.itol import generate_itol_colours, write_dataset_membership_strip
 from branchmanager.pipeline.novelty import build_reference_novelty_metrics
 from branchmanager.pipeline.tree import (
+    _new_sequences_only,
     _orient_tree_input_fasta,
     _label_internal_nodes,
     _repair_internal_node_label_delimiters,
     build_combined_fasta,
     collect_tree_build_warnings,
     initialise_or_update_tree,
-    summarize_alignment_quality,
-    _prune_anchor_leaves,
+    summarise_alignment_quality,
 )
 from branchmanager.utils.fasta import read_fasta, reverse_complement
 from branchmanager.pipeline.workflow_helpers import (
     _assignment_source_is_fasta,
     build_placement_warning_rows,
+    build_selection_decision,
     build_sequence_assessment_rows,
     classification_ids_matching_kingdom,
     iter_assignment_rows,
@@ -48,7 +54,7 @@ from branchmanager.pipeline.workflow_helpers import (
     write_selection_summary_tsv,
 )
 from branchmanager.taxonomy import (
-    canonicalize_sequence_id,
+    canonicalise_sequence_id,
     parse_taxon_string,
     taxonomy_matches_kingdom,
 )
@@ -108,13 +114,13 @@ class TaxonomyUtilsTests(unittest.TestCase):
         self.assertTrue(taxonomy_matches_kingdom('d__Eukaryota; k__Fungi; p__Ascomycota', 'fungi'))
         self.assertTrue(taxonomy_matches_kingdom('k__Fungi; p__Basidiomycota', 'fungal'))
 
-    def test_canonicalize_sequence_id_preserves_asv_suffixes(self):
-        self.assertEqual(canonicalize_sequence_id('ASV_1 some description'), 'ASV_1')
-        self.assertEqual(canonicalize_sequence_id('read42:100-250(+)' ), 'read42')
-        self.assertEqual(canonicalize_sequence_id('abc|ASV_2#fragment extra'), 'ASV_2')
+    def test_canonicalise_sequence_id_preserves_asv_suffixes(self):
+        self.assertEqual(canonicalise_sequence_id('ASV_1 some description'), 'ASV_1')
+        self.assertEqual(canonicalise_sequence_id('read42:100-250(+)' ), 'read42')
+        self.assertEqual(canonicalise_sequence_id('abc|ASV_2#fragment extra'), 'ASV_2')
 
 
-class DatabaseBehaviorTests(unittest.TestCase):
+class DatabaseBehaviourTests(unittest.TestCase):
     def test_database_initialise_creates_parent_directory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / 'missing' / 'nested' / 'project.sqlite'
@@ -351,21 +357,10 @@ class DatabaseBehaviorTests(unittest.TestCase):
             self.assertIsNone(taxa)
             self.assertEqual(assignments, str(query))
 
-    def test_build_parser_accepts_taxa_aasignments_alias(self):
-        parser = build_parser()
-        args = parser.parse_args([
-            'preload',
-            '--fasta', 'input.fasta',
-            '--db', 'db.sqlite',
-            '--dataset', 'Hungate',
-            '--taxa-aasignments', 'gtdb.fna',
-        ])
-        self.assertEqual(args.taxa_assignments, 'gtdb.fna')
-
     def test_build_parser_accepts_no_shorten_ids(self):
         parser = build_parser()
         args = parser.parse_args([
-            'run',
+            'performance-review',
             '--input', 'input.fasta',
             '--db', 'db.sqlite',
             '--out', 'outdir',
@@ -375,21 +370,21 @@ class DatabaseBehaviorTests(unittest.TestCase):
         ])
         self.assertFalse(args.shorten_ids)
 
-    def test_build_parser_accepts_sanger_subcommand(self):
+    def test_build_parser_accepts_paper_trail_subcommand(self):
         parser = build_parser()
         args = parser.parse_args([
-            'sanger',
+            'paper-trail',
             '--input', 'reads',
-            '-o', 'sanger_out',
+            '-o', 'paper_trail_out',
             '--min-quality', '25',
             '--min-overlap', '30',
             '--primer', '27F',
             '--primer', '907R',
             '--sample-map', 'reads.tsv',
         ])
-        self.assertEqual(args.command, 'sanger')
+        self.assertEqual(args.command, 'paper-trail')
         self.assertEqual(args.input, ['reads'])
-        self.assertEqual(args.out, 'sanger_out')
+        self.assertEqual(args.out, 'paper_trail_out')
         self.assertEqual(args.min_quality, 25)
         self.assertEqual(args.min_overlap, 30)
         self.assertEqual(args.min_length, 800)
@@ -397,10 +392,10 @@ class DatabaseBehaviorTests(unittest.TestCase):
         self.assertEqual(args.primers, ['27F', '907R'])
         self.assertEqual(args.sample_map, 'reads.tsv')
 
-    def test_build_parser_accepts_evaluate_alias_and_mwl_flags(self):
+    def test_build_parser_accepts_performance_review_mwl_flags(self):
         parser = build_parser()
         args = parser.parse_args([
-            'evaluate',
+            'performance-review',
             '--input', 'input.fasta',
             '--db', 'project.sqlite',
             '--out', 'outdir',
@@ -418,7 +413,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
             '--no-baseline-shorten-ids',
             '--sequence-domain', 'archaea',
         ])
-        self.assertEqual(args.command, 'evaluate')
+        self.assertEqual(args.command, 'performance-review')
         self.assertEqual(args.mwl, 'MWL.xlsx')
         self.assertEqual(args.mwl_sheet, 'MWL_V1')
         self.assertEqual(args.mwl_min_rank, 'order')
@@ -430,21 +425,45 @@ class DatabaseBehaviorTests(unittest.TestCase):
         self.assertTrue(args.baseline_skip_classify)
         self.assertFalse(args.baseline_shorten_ids)
         self.assertEqual(args.sequence_domain, 'archaea')
+        self.assertEqual(args.neighbourhood_format, 'png')
+        self.assertEqual(args.pangenome_target, 3)
+        self.assertEqual(args.candidate_set_size, 4)
 
-    def test_find_preferred_id_map_prefers_preload_specific_mapping(self):
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                'performance-review', '--input', 'input.fasta', '--db', 'project.sqlite',
+                '--out', 'outdir', '--dataset', 'PartnerA',
+                '--neighbourhood-format', 'pdf',
+            ])
+
+    def test_build_parser_accepts_quarterly_review(self):
+        args = build_parser().parse_args([
+            'quarterly-review', '--db', 'project.sqlite', '--out', 'quarterly_review_out',
+            '--genome-budget', '24', '--backups-per-primary', '2',
+            '--tree', 'current_tree.nwk', '--alignment', 'current_alignment.fasta',
+            '--assessment', 'sequence_assessment.tsv',
+        ])
+        self.assertEqual(args.command, 'quarterly-review')
+        self.assertEqual(args.genome_budget, 24)
+        self.assertEqual(args.backups_per_primary, 2)
+        self.assertEqual(args.pangenome_target, 3)
+        self.assertEqual(args.alignment, 'current_alignment.fasta')
+        self.assertEqual(args.assessment, ['sequence_assessment.tsv'])
+
+    def test_find_preferred_id_map_prefers_filing_cabinet_mapping(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             (tmp / 'user_id_map.tsv').write_text('short_id\toriginal_header\nUSR01\torig_user\n')
-            (tmp / 'preload_id_map.tsv').write_text('short_id\toriginal_header\nQUE06\torig_preload\n')
-            self.assertEqual(_find_preferred_id_map(tmp), tmp / 'preload_id_map.tsv')
+            (tmp / 'filing_cabinet_id_map.tsv').write_text('short_id\toriginal_header\nQUE06\torig_baseline\n')
+            self.assertEqual(_find_preferred_id_map(tmp), tmp / 'filing_cabinet_id_map.tsv')
 
-    def test_cmd_preload_writes_preload_id_map(self):
+    def test_filing_cabinet_writes_office_named_id_map(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            fasta = tmp / 'preload.fasta'
+            fasta = tmp / 'baseline.fasta'
             fasta.write_text('>query_alpha full original header\nACGT\n>query_beta another header\nTGCA\n')
             db_path = tmp / 'test.sqlite'
-            outdir = tmp / 'preload_out'
+            outdir = tmp / 'filing_cabinet_out'
             args = Namespace(
                 fasta=str(fasta),
                 db=str(db_path),
@@ -454,7 +473,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 collapse_threshold=99.9,
                 taxa=None,
                 taxa_assignments=None,
-                colors=None,
+                colours=None,
                 classify=False,
                 kingdom=None,
                 build_tree=False,
@@ -463,24 +482,24 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 anchor_file=None,
             )
 
-            cmd_preload(args)
+            cmd_filing_cabinet(args)
 
-            map_path = outdir / 'preload_id_map.tsv'
+            map_path = outdir / 'filing_cabinet_id_map.tsv'
             self.assertTrue(map_path.exists())
             text = map_path.read_text()
             self.assertIn('short_id\toriginal_header', text)
             self.assertIn('query_alpha full original header', text)
             self.assertIn('query_beta another header', text)
 
-    def test_preload_preserves_supplied_ids_when_shortening_disabled(self):
+    def test_filing_cabinet_preserves_supplied_ids_when_shortening_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            fasta = tmp / 'preload.fasta'
+            fasta = tmp / 'baseline.fasta'
             fasta.write_text('>Alpha description one\nACGT\n>Beta description two\nTGCA\n')
             db = Database(os.path.join(tmpdir, 'test.sqlite'))
             db.initialise()
 
-            alias_entries, mapped_fasta = db.preload_from_files(
+            alias_entries, mapped_fasta = db.register_filing_cabinet(
                 str(fasta),
                 dataset='Hungate',
                 outdir=str(tmp),
@@ -491,18 +510,18 @@ class DatabaseBehaviorTests(unittest.TestCase):
             headers = [h for h, _ in read_fasta(mapped_fasta)]
             self.assertEqual(headers, ['Alpha description one', 'Beta description two'])
 
-    def test_preload_no_shorten_ids_raises_on_exact_id_collision(self):
+    def test_filing_cabinet_no_shorten_ids_raises_on_exact_id_collision(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            fasta = tmp / 'preload.fasta'
+            fasta = tmp / 'baseline.fasta'
             fasta.write_text('>Alpha description one\nACGT\n>Alpha description one\nTGCA\n')
             db = Database(os.path.join(tmpdir, 'test.sqlite'))
             db.initialise()
 
             with self.assertRaises(ValueError):
-                db.preload_from_files(str(fasta), dataset='Hungate', outdir=str(tmp), shorten_ids=False)
+                db.register_filing_cabinet(str(fasta), dataset='Hungate', outdir=str(tmp), shorten_ids=False)
 
-    def test_cmd_run_uses_external_fasta_taxa_assignments_as_reference(self):
+    def test_performance_review_uses_external_fasta_taxa_assignments_as_reference(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             input_fasta = tmp / 'input.fasta'
@@ -521,7 +540,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(class_path)
 
-            def fake_run_novelty(input_path, ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
+            def fake_run_novelty(input_path, _ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 novelty_path = Path(out_path) / 'novelty.tsv'
                 novelty_path.write_text(
@@ -530,7 +549,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(novelty_path)
 
-            def fake_build_reference_novelty_metrics(input_path, ref_path, novelty_out, out_path, threads=None, **kwargs):
+            def fake_build_reference_novelty_metrics(input_path, _ref_path, out_path, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 metrics_path = Path(out_path) / 'novelty_metrics.tsv'
                 metrics_path.write_text(
@@ -549,12 +568,12 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 min_len=1,
                 max_n=10,
                 threads=1,
-                preload_dir=None,
+                previous_review=None,
                 kingdom=None,
                 collapse=False,
                 collapse_threshold=99.8,
                 taxa_assignments=str(ref_fasta),
-                user_colors=None,
+                user_colours=None,
                 anchor_file=None,
             )
 
@@ -565,10 +584,10 @@ class DatabaseBehaviorTests(unittest.TestCase):
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
                  mock.patch('branchmanager.cli.tree.initialise_or_update_tree'), \
                  mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.tree.summarise_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colours'), \
                  mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
-                cmd_run(args)
+                cmd_performance_review(args)
 
             self.assertEqual(classify_mock.call_args.kwargs['ref_fasta'], str(ref_fasta))
             self.assertEqual(novelty_mock.call_args.args[1], str(ref_fasta))
@@ -581,7 +600,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 rows = cur.fetchall()
             self.assertEqual(rows, [('d__Bacteria; p__Firmicutes',)])
 
-    def test_cmd_run_can_keep_canonical_ids_when_shortening_disabled(self):
+    def test_performance_review_can_keep_canonical_ids_when_shortening_disabled(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             input_fasta = tmp / 'input.fasta'
@@ -600,7 +619,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(class_path)
 
-            def fake_run_novelty(input_path, ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
+            def fake_run_novelty(input_path, _ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 novelty_path = Path(out_path) / 'novelty.tsv'
                 novelty_path.write_text(
@@ -609,7 +628,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(novelty_path)
 
-            def fake_build_reference_novelty_metrics(input_path, ref_path, novelty_out, out_path, threads=None, **kwargs):
+            def fake_build_reference_novelty_metrics(input_path, _ref_path, out_path, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 metrics_path = Path(out_path) / 'novelty_metrics.tsv'
                 metrics_path.write_text(
@@ -628,12 +647,12 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 min_len=1,
                 max_n=10,
                 threads=1,
-                preload_dir=None,
+                previous_review=None,
                 kingdom=None,
                 collapse=False,
                 collapse_threshold=99.8,
                 taxa_assignments=None,
-                user_colors=None,
+                user_colours=None,
                 anchor_file=None,
                 shorten_ids=False,
             )
@@ -645,10 +664,10 @@ class DatabaseBehaviorTests(unittest.TestCase):
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
                  mock.patch('branchmanager.cli.tree.initialise_or_update_tree'), \
                  mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.tree.summarise_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colours'), \
                  mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
-                cmd_run(args)
+                cmd_performance_review(args)
 
             headers = [h for h, _ in read_fasta(outdir / 'intermediate' / 'derep_short.fasta')]
             self.assertEqual(headers, ['origA extra words'])
@@ -659,7 +678,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
             self.assertTrue((outdir / 'baseline' / 'baseline_hits.tsv').exists())
             self.assertTrue((outdir / 'taxonomy' / 'ref.tsv').exists())
 
-    def test_cmd_run_defaults_to_bacterial_sequence_domain_filter(self):
+    def test_performance_review_defaults_to_bacterial_sequence_domain_filter(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             input_fasta = tmp / 'input.fasta'
@@ -680,7 +699,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                             handle.write(f'{h}\tREF_B\t99.0\td__Bacteria; p__Bacillota\t0.95\n')
                 return str(class_path)
 
-            def fake_run_novelty(input_path, ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
+            def fake_run_novelty(input_path, _ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 novelty_path = Path(out_path) / 'novelty.tsv'
                 novelty_path.write_text(
@@ -689,7 +708,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(novelty_path)
 
-            def fake_build_reference_novelty_metrics(input_path, ref_path, novelty_out, out_path, threads=None, **kwargs):
+            def fake_build_reference_novelty_metrics(input_path, _ref_path, out_path, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 metrics_path = Path(out_path) / 'novelty_metrics.tsv'
                 metrics_path.write_text(
@@ -709,13 +728,13 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 min_len=1,
                 max_n=10,
                 threads=1,
-                preload_dir=None,
+                previous_review=None,
                 kingdom=None,
                 sequence_domain=None,
                 collapse=False,
                 collapse_threshold=99.8,
                 taxa_assignments=None,
-                user_colors=None,
+                user_colours=None,
                 anchor_file=None,
                 shorten_ids=False,
             )
@@ -727,10 +746,10 @@ class DatabaseBehaviorTests(unittest.TestCase):
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
                  mock.patch('branchmanager.cli.tree.initialise_or_update_tree'), \
                  mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.tree.summarise_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colours'), \
                  mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
-                cmd_run(args)
+                cmd_performance_review(args)
 
             db = Database(str(db_path))
             db.initialise()
@@ -740,7 +759,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 rows = [r[0] for r in cur.fetchall()]
             self.assertEqual(rows, ['B1'])
 
-    def test_cmd_run_passes_preload_dir_to_tree_builder(self):
+    def test_performance_review_passes_previous_review_to_tree_builder(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             input_fasta = tmp / 'input.fasta'
@@ -748,8 +767,8 @@ class DatabaseBehaviorTests(unittest.TestCase):
             ref_fasta = tmp / 'ref.fasta'
             ref_fasta.write_text('>REF1 d__Bacteria;p__Firmicutes\nACGT\n')
             outdir = tmp / 'out'
-            preload_dir = tmp / 'preload'
-            preload_dir.mkdir()
+            previous_review = tmp / 'previous_review'
+            previous_review.mkdir()
             db_path = tmp / 'test.sqlite'
 
             def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
@@ -761,7 +780,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(class_path)
 
-            def fake_run_novelty(input_path, ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
+            def fake_run_novelty(input_path, _ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 novelty_path = Path(out_path) / 'novelty.tsv'
                 novelty_path.write_text(
@@ -770,7 +789,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 )
                 return str(novelty_path)
 
-            def fake_build_reference_novelty_metrics(input_path, ref_path, novelty_out, out_path, threads=None, **kwargs):
+            def fake_build_reference_novelty_metrics(input_path, _ref_path, out_path, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
                 metrics_path = Path(out_path) / 'novelty_metrics.tsv'
                 metrics_path.write_text(
@@ -789,12 +808,12 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 min_len=1,
                 max_n=10,
                 threads=1,
-                preload_dir=str(preload_dir),
+                previous_review=str(previous_review),
                 kingdom=None,
                 collapse=False,
                 collapse_threshold=99.8,
                 taxa_assignments=None,
-                user_colors=None,
+                user_colours=None,
                 anchor_file=None,
                 shorten_ids=True,
             )
@@ -806,14 +825,14 @@ class DatabaseBehaviorTests(unittest.TestCase):
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
                  mock.patch('branchmanager.cli.tree.initialise_or_update_tree') as tree_mock, \
                  mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
-                 mock.patch('branchmanager.cli.tree.summarize_alignment_quality', return_value=[]), \
-                 mock.patch('branchmanager.cli.itol.generate_itol_colors'), \
+                 mock.patch('branchmanager.cli.tree.summarise_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colours'), \
                  mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
-                cmd_run(args)
+                cmd_performance_review(args)
 
-            self.assertEqual(tree_mock.call_args.kwargs['preload_dir'], str(preload_dir))
+            self.assertEqual(tree_mock.call_args.kwargs['previous_review'], str(previous_review))
 
-    def test_evaluate_baseline_loads_sequences_and_taxonomy_before_run(self):
+    def test_performance_review_baseline_loads_sequences_and_taxonomy_before_run(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             baseline = tmp / 'hungate.fasta'
@@ -829,7 +848,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 baseline_dataset='Hungate',
                 baseline_taxa_assignments=None,
                 baseline_skip_classify=False,
-                baseline_colors=None,
+                baseline_colours=None,
                 baseline_shorten_ids=False,
                 dataset='Batch1',
             )
@@ -844,11 +863,11 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 return str(class_path)
 
             with mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification):
-                baseline_out = _load_evaluate_baseline(args, db, str(outdir), str(ref), None, 1)
+                baseline_out = _load_performance_review_baseline(args, db, str(outdir), str(ref), None, 1)
 
-            self.assertEqual(baseline_out, str(outdir / 'baseline_preload'))
-            self.assertTrue((outdir / 'baseline_preload' / 'baseline_id_map.tsv').exists())
-            self.assertTrue((outdir / 'baseline_preload' / 'baseline_combined_taxonomy.tsv').exists())
+            self.assertEqual(baseline_out, str(outdir / 'filing_cabinet_baseline'))
+            self.assertTrue((outdir / 'filing_cabinet_baseline' / 'baseline_id_map.tsv').exists())
+            self.assertTrue((outdir / 'filing_cabinet_baseline' / 'baseline_combined_taxonomy.tsv').exists())
 
             with db.connect() as conn:
                 cur = conn.cursor()
@@ -860,7 +879,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
                 rows = cur.fetchall()
             self.assertEqual(rows, [('HungateA source sequence', 'Hungate', 'd__Bacteria; p__Bacillota')])
 
-    def test_partner_metadata_loads_selected_wgs_status_for_run(self):
+    def test_partner_metadata_loads_already_sequenced_status_for_run(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             db = Database(str(tmp / 'test.sqlite'))
@@ -868,7 +887,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
             db.insert_sequences([('IsoA supplied id', 'ACGT'), ('IsoB supplied id', 'ACGA')], dataset='PartnerA')
             metadata = tmp / 'partner_metadata.tsv'
             metadata.write_text(
-                'sequence_id\tpartner_id\tselected_for_genome_sequencing\n'
+                'sequence_id\tpartner_id\talready_sequenced\n'
                 'IsoA supplied id\tQUB\tyes\n'
                 'IsoB supplied id\tUoG\tno\n'
                 'MissingIso\tQUB\tyes\n'
@@ -876,7 +895,7 @@ class DatabaseBehaviorTests(unittest.TestCase):
             args = Namespace(
                 partner_metadata=str(metadata),
                 dataset='PartnerA',
-                command='evaluate',
+                command='performance-review',
             )
 
             loaded = _load_partner_metadata_for_run(
@@ -894,14 +913,82 @@ class DatabaseBehaviorTests(unittest.TestCase):
             self.assertFalse(loaded['IsoB supplied id']['selected_for_wgs'])
             self.assertEqual(loaded['IsoA supplied id']['partner_id'], 'QUB')
             warnings = (tmp / 'partner_metadata_warnings.tsv').read_text()
-            self.assertIn('MissingIso\tmetadata_id_not_found_in_current_run', warnings)
+            self.assertIn('MissingIso\tmetadata_id_not_found_in_project_database_or_current_run', warnings)
+
+    def test_partner_metadata_can_update_an_isolate_from_an_earlier_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db = Database(str(tmp / 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('OldIso', 'ACGT')], dataset='PartnerA_001')
+            db.insert_sequences([('NewIso', 'ACGA')], dataset='PartnerB_001')
+            db.upsert_dataset_role('PartnerA_001', 'candidate')
+            db.upsert_dataset_role('PartnerB_001', 'candidate')
+            metadata = tmp / 'partner_metadata.tsv'
+            metadata.write_text(
+                'sequence_id\tpartner_id\talready_sequenced\n'
+                'OldIso\tQUB\tyes\n'
+                'NewIso\tUoG\tno\n'
+            )
+            args = Namespace(
+                partner_metadata=str(metadata),
+                dataset='PartnerB_001',
+                command='performance-review',
+            )
+
+            loaded = _load_partner_metadata_for_run(
+                args,
+                db,
+                str(tmp),
+                {'NewIso': 'NewIso'},
+                ['NewIso'],
+            )
+
+            self.assertFalse(loaded['NewIso']['selected_for_wgs'])
+            stored = db.get_sequencing_metadata_for_ids()
+            self.assertTrue(stored['OldIso']['selected_for_wgs'])
+            self.assertEqual(stored['OldIso']['dataset'], 'PartnerA_001')
+
+    def test_partner_metadata_persists_pending_selection_without_claiming_a_genome(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db = Database(str(tmp / 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('PendingIso', 'ACGT')], dataset='QUB_01')
+            db.upsert_dataset_role('QUB_01', 'candidate')
+            metadata = tmp / 'project_metadata.tsv'
+            metadata.write_text(
+                'sequence_id\tpartner_id\tselected_for_genome_sequencing\talready_sequenced\n'
+                'PendingIso\tQUB\tyes\tno\n'
+            )
+            args = Namespace(
+                partner_metadata=str(metadata), dataset='QUB_01', command='performance-review',
+            )
+
+            _load_partner_metadata_for_run(
+                args, db, str(tmp), {'PendingIso': 'PendingIso'}, ['PendingIso'],
+            )
+            stored = db.get_sequencing_metadata_for_ids(['PendingIso'])['PendingIso']
+
+            self.assertTrue(stored['selected_for_sequencing'])
+            self.assertFalse(stored['genome_available'])
+
+    def test_database_rejects_reused_id_with_changed_sequence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('StableIso', 'ac gt')], dataset='PartnerA')
+
+            self.assertEqual(db.assert_sequence_compatible('StableIso', 'ACGT'), 'StableIso')
+            with self.assertRaisesRegex(ValueError, 'Rolling sequence IDs are immutable'):
+                db.assert_sequence_compatible('StableIso', 'ACGA')
 
     def test_partner_metadata_requires_partner_acronym_column(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             metadata = tmp / 'partner_metadata.tsv'
             metadata.write_text(
-                'sequence_id\tselected_for_genome_sequencing\n'
+                'sequence_id\talready_sequenced\n'
                 'IsoA\tyes\n'
             )
             from branchmanager.partner_metadata import load_partner_sequencing_metadata
@@ -909,7 +996,38 @@ class DatabaseBehaviorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'partner acronym'):
                 load_partner_sequencing_metadata(str(metadata))
 
-    def test_preclassify_reports_high_quality_taxonomy_disagreements(self):
+    def test_partner_metadata_separates_selection_commitment_from_available_genome(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata = Path(tmpdir) / 'partner_metadata.tsv'
+            metadata.write_text(
+                'sequence_id\tpartner_id\tselected_for_genome_sequencing\talready_sequenced\n'
+                'PendingIso\tQUB\tyes\tno\n'
+                'GenomeIso\tUoG\tyes\tyes\n'
+            )
+            from branchmanager.partner_metadata import load_partner_sequencing_metadata
+
+            rows = {row['source_id']: row for row in load_partner_sequencing_metadata(metadata)}
+
+            self.assertTrue(rows['PendingIso']['selected_for_sequencing'])
+            self.assertFalse(rows['PendingIso']['genome_available'])
+            self.assertFalse(rows['PendingIso']['selected_for_wgs'])
+            self.assertTrue(rows['GenomeIso']['selected_for_sequencing'])
+            self.assertTrue(rows['GenomeIso']['genome_available'])
+
+    def test_partner_metadata_rejects_duplicate_isolate_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata = Path(tmpdir) / 'partner_metadata.csv'
+            metadata.write_text(
+                'sequence_id,partner_id,selected_for_genome_sequencing,already_sequenced\n'
+                'IsoA,QUB,no,no\n'
+                'IsoA,QUB,no,no\n'
+            )
+            from branchmanager.partner_metadata import load_partner_sequencing_metadata
+
+            with self.assertRaisesRegex(ValueError, 'exactly one row per isolate'):
+                load_partner_sequencing_metadata(metadata)
+
+    def test_background_check_reports_high_quality_taxonomy_disagreements(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             query = tmp / 'query.fasta'
@@ -939,8 +1057,8 @@ class DatabaseBehaviorTests(unittest.TestCase):
                     'Q2': ('R1', 99.9),
                 }
 
-            with mock.patch('branchmanager.pipeline.preclassify._run_vsearch_pass', side_effect=fake_run_vsearch_pass):
-                res = preclassify_pipeline.classify_fasta(
+            with mock.patch('branchmanager.pipeline.background_check._run_vsearch_pass', side_effect=fake_run_vsearch_pass):
+                res = background_check_pipeline.classify_fasta(
                     fasta_path=str(query),
                     ref_fasta=str(ref),
                     outdir=str(outdir),
@@ -990,12 +1108,12 @@ class OutputHelperTests(unittest.TestCase):
             ab1 = Path(tmpdir) / 'Iso001_27F.ab1'
             _write_minimal_ab1(ab1, 'NNACGTACGTNN', [5, 5, 35, 36, 37, 38, 39, 40, 30, 31, 5, 5])
 
-            seq, qual = sanger_pipeline.read_ab1(ab1)
+            seq, qual = paper_trail_pipeline.read_ab1(ab1)
 
             self.assertEqual(seq, 'NNACGTACGTNN')
             self.assertEqual(qual[:4], [5, 5, 35, 36])
 
-    def test_run_sanger_trims_orients_and_assembles_primer_reads(self):
+    def test_paper_trail_trims_orients_and_assembles_primer_reads(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             reads = tmp / 'reads'
@@ -1005,7 +1123,7 @@ class OutputHelperTests(unittest.TestCase):
             reverse_read = reverse_complement('CCCCGGGGTTTTAAAACCCC')
             (reads / 'Iso001_907R.fasta').write_text(f'>Iso001_907R\nNNNN{reverse_read}NNNN\n')
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [str(reads)],
                 tmp / 'out',
                 min_quality=20,
@@ -1020,8 +1138,13 @@ class OutputHelperTests(unittest.TestCase):
             self.assertEqual(assembled['Iso001'], 'AAAACCCCGGGGTTTTAAAACCCC')
             report = Path(out['assembly_tsv']).read_text()
             self.assertIn('Iso001\tassembled\t2\t2', report)
+            placements = Path(out['assembly_placements_tsv']).read_text()
+            self.assertIn('Iso001\tIso001_27F\t27F\tforward\tkept\tyes\t1\t20', placements)
+            self.assertIn('Iso001\tIso001_907R\t907R\treverse\tkept\tyes\t5\t24', placements)
+            self.assertEqual(Path(out['qc_policy_tsv']).name, 'paper_trail_qc_policy.tsv')
+            self.assertEqual(Path(out['summary']).name, 'paper_trail_summary.txt')
 
-    def test_run_sanger_gapped_fallback_assembles_indel_shifted_reads(self):
+    def test_paper_trail_gapped_fallback_assembles_indel_shifted_reads(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             reads = tmp / 'reads'
@@ -1034,7 +1157,7 @@ class OutputHelperTests(unittest.TestCase):
                 f'>IsoGap_907R\n{reverse_complement(reverse_oriented)}\n'
             )
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [str(reads)],
                 tmp / 'out',
                 min_quality=20,
@@ -1046,9 +1169,10 @@ class OutputHelperTests(unittest.TestCase):
 
             report = Path(out['assembly_tsv']).read_text()
             self.assertIn('IsoGap\tassembled\t2\t2', report)
-            self.assertIn('gapped_anchor', report)
+            self.assertIn('biopython_pairwise_overlap', report)
+            self.assertIn('ambiguous_overlap_conflicts_1', report)
 
-    def test_run_sanger_uses_read_metadata_when_filenames_do_not_encode_primer(self):
+    def test_paper_trail_uses_read_metadata_when_filenames_do_not_encode_primer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             fwd = tmp / 'well_A01.ab1'
@@ -1062,7 +1186,7 @@ class OutputHelperTests(unittest.TestCase):
                 'well_A02.ab1\tIsoA\t907R\treverse\n'
             )
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [str(tmp)],
                 tmp / 'out',
                 read_metadata=str(meta),
@@ -1074,7 +1198,7 @@ class OutputHelperTests(unittest.TestCase):
             assembled = dict(read_fasta(out['assembled_fasta']))
             self.assertEqual(assembled['IsoA'], 'AAAACCCCGGGGTTTTAAAACCCC')
 
-    def test_run_sanger_accepts_sample_map_and_writes_error_visuals(self):
+    def test_paper_trail_accepts_sample_map_and_writes_error_visuals(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             fwd = tmp / 'well_A01.ab1'
@@ -1089,7 +1213,7 @@ class OutputHelperTests(unittest.TestCase):
                 'IsoMap\twell_A01.ab1\twell_A02.ab1\n'
             )
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [],
                 tmp / 'out',
                 sample_map=str(sample_map),
@@ -1108,10 +1232,65 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('ErrorProbability', per_base)
             self.assertIn('left_trimmed', per_base)
             self.assertIn('right_trimmed', per_base)
-            self.assertIn('<svg', Path(out['read_error_svg']).read_text())
-            self.assertIn('IsoMap', Path(out['assembly_svg']).read_text())
+            from PIL import Image
+            for key in ('read_error_pngs', 'chromatogram_pngs', 'assembly_pngs'):
+                self.assertEqual(len(out[key]), 1)
+                image_path = Path(out[key][0])
+                self.assertEqual(image_path.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+                with Image.open(image_path) as image:
+                    self.assertEqual(image.format, 'PNG')
+                    self.assertGreater(image.width, 1000)
+                    self.assertGreater(image.height, 100)
+                    if key == 'assembly_pngs':
+                        self.assertGreater(image.height, 250)
+            self.assertTrue(Path(out['visual_manifest_tsv']).exists())
 
-    def test_run_sanger_sample_map_best_read_selects_highest_quality_read(self):
+    def test_paper_trail_paginates_all_tall_visual_reports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fasta = tmp / 'reads.fasta'
+            fasta.write_text(''.join(
+                f'>Iso{index:02d}_27F\n{"ACGT" * 10}\n'
+                for index in range(12)
+            ))
+            output_dir = tmp / 'out'
+            stale_dir = output_dir / 'visual_reports' / 'read_error_profiles'
+            stale_dir.mkdir(parents=True)
+            stale_page = stale_dir / 'read_error_profiles_page_999.png'
+            stale_page.write_bytes(b'stale')
+            obsolete_single_image = output_dir / 'read_error_profiles.png'
+            obsolete_single_image.write_bytes(b'stale')
+
+            out = paper_trail_pipeline.run_paper_trail(
+                [fasta],
+                output_dir,
+                min_length=8,
+                min_read_length=8,
+                max_report_image_height=600,
+            )
+
+            self.assertEqual(len(out['read_error_pngs']), 4)
+            self.assertEqual(len(out['chromatogram_pngs']), 6)
+            self.assertEqual(len(out['assembly_pngs']), 4)
+            self.assertFalse(stale_page.exists())
+            self.assertFalse(obsolete_single_image.exists())
+            from PIL import Image
+            all_pages = (
+                out['read_error_pngs']
+                + out['chromatogram_pngs']
+                + out['assembly_pngs']
+            )
+            for page in all_pages:
+                with Image.open(page) as image:
+                    self.assertEqual(image.format, 'PNG')
+                    self.assertLessEqual(image.height, 600)
+            with open(out['visual_manifest_tsv']) as handle:
+                rows = list(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(len(rows), 14)
+            self.assertTrue(all(int(row['HeightPixels']) <= 600 for row in rows))
+            self.assertEqual({row['MaxHeightPixels'] for row in rows}, {'600'})
+
+    def test_paper_trail_sample_map_best_read_selects_highest_quality_read(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             low = tmp / 'low_quality.ab1'
@@ -1124,7 +1303,7 @@ class OutputHelperTests(unittest.TestCase):
                 'IsoBest\tlow_quality.ab1;high_quality.ab1\tbest_read\n'
             )
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [],
                 tmp / 'out',
                 sample_map=str(sample_map),
@@ -1141,13 +1320,13 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('IsoBest\tbest_read\t2\t1\t10', report)
             self.assertIn('\tbest_read\thigh_quality\t', report)
 
-    def test_run_sanger_filters_final_outputs_below_minimum_length(self):
+    def test_paper_trail_filters_final_outputs_below_minimum_length(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             read = tmp / 'IsoShort_27F.ab1'
             _write_minimal_ab1(read, 'ACGTACGTACGT', [35] * 12)
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [str(read)],
                 tmp / 'out',
                 min_quality=20,
@@ -1157,11 +1336,15 @@ class OutputHelperTests(unittest.TestCase):
             )
 
             self.assertEqual(dict(read_fasta(out['assembled_fasta'])), {})
+            self.assertEqual(dict(read_fasta(out['failed_final_fasta'])), {'IsoShort': 'ACGTACGTACGT'})
+            self.assertEqual(dict(read_fasta(out['failed_read_fasta'])), {})
+            failed_manifest = Path(out['failed_manifest_tsv']).read_text()
+            self.assertIn('final\tIsoShort\tIsoShort\t\tFAIL_QC\tRESEQUENCE\tfiltered_output_length_lt_20', failed_manifest)
             report = Path(out['assembly_tsv']).read_text()
             self.assertIn('IsoShort\tfiltered_output_length_lt_20\t1\t1\t12', report)
-            self.assertIn('\tno\toutput_length_lt_20\t', report)
+            self.assertIn('\tno\toutput_length_lt_20;read_level_warnings\t', report)
 
-    def test_run_sanger_masks_internal_low_quality_and_recommends_resequence(self):
+    def test_paper_trail_masks_internal_low_quality_and_recommends_resequence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             read = tmp / 'IsoBad_27F.ab1'
@@ -1169,7 +1352,7 @@ class OutputHelperTests(unittest.TestCase):
             qual = [35] * 200 + [10] * 12 + [35] * 200
             _write_minimal_ab1(read, seq, qual)
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [str(read)],
                 tmp / 'out',
                 min_quality=20,
@@ -1180,6 +1363,10 @@ class OutputHelperTests(unittest.TestCase):
             )
 
             self.assertEqual(dict(read_fasta(out['assembled_fasta'])), {})
+            self.assertIn('IsoBad|read=IsoBad_27F', '\n'.join(dict(read_fasta(out['failed_read_fasta'])).keys()))
+            failed_manifest = Path(out['failed_manifest_tsv']).read_text()
+            self.assertIn('read\tIsoBad\tIsoBad_27F', failed_manifest)
+            self.assertIn('internal_low_quality_run_gt_5', failed_manifest)
             read_qc = Path(out['read_qc_tsv']).read_text()
             self.assertIn('internal_low_quality_run_gt_5', read_qc)
             self.assertIn('MaskedBases', read_qc)
@@ -1187,7 +1374,7 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('IsoBad\tRESEQUENCE\tFAIL_QC', recommendations)
             self.assertIn('failed_no_reads', recommendations)
 
-    def test_run_sanger_accepts_sequencing_id_mapping_with_prefixed_ab1_names(self):
+    def test_paper_trail_accepts_sequencing_id_mapping_with_prefixed_ab1_names(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             reads = tmp / 'All_AB1'
@@ -1203,7 +1390,7 @@ class OutputHelperTests(unittest.TestCase):
                 'KKY011-R,SW_0016,Reverse\n'
             )
 
-            out = sanger_pipeline.run_sanger(
+            out = paper_trail_pipeline.run_paper_trail(
                 [str(reads)],
                 tmp / 'out',
                 read_metadata=str(mapping),
@@ -1328,13 +1515,32 @@ class OutputHelperTests(unittest.TestCase):
             summary = (outdir / 'tree_orientation_summary.tsv').read_text()
             self.assertIn('incremental\tnew_sequences\tQ1\treverse\tTrue', summary)
 
-    def test_initialise_or_update_tree_seeds_preload_alignment_and_uses_mafft_add_for_full_length_sequences(self):
+    def test_incremental_tree_matching_preserves_complete_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            preload = tmp / 'preload'
-            preload.mkdir()
-            (preload / 'current_alignment.fasta').write_text('>BASE\n' + ('A' * 1500) + '\n')
-            (preload / 'current_tree.nwk').write_text('(BASE:0.1);\n')
+            alignment = tmp / 'current_alignment.fasta'
+            alignment.write_text('>Partner isolate_1\nACGT\n')
+            user = tmp / 'user.fasta'
+            user.write_text(
+                '>Partner isolate_1\nACGT\n'
+                '>Partner isolate_2\nACGA\n'
+                '>prefix|Partner isolate_1\nACGG\n'
+            )
+
+            new_records = _new_sequences_only(user, alignment, None, tmp)
+
+            self.assertEqual(
+                [header for header, _sequence in new_records],
+                ['Partner isolate_2', 'prefix|Partner isolate_1'],
+            )
+
+    def test_initialise_or_update_tree_seeds_previous_review_alignment_and_uses_mafft_add_for_full_length_sequences(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            previous_review = tmp / 'previous_review'
+            previous_review.mkdir()
+            (previous_review / 'current_alignment.fasta').write_text('>BASE\n' + ('A' * 1500) + '\n')
+            (previous_review / 'current_tree.nwk').write_text('(BASE:0.1);\n')
             outdir = tmp / 'run_out'
             user = tmp / 'user.fasta'
             user.write_text('>Q1\n' + ('A' * 1400) + '\n')
@@ -1348,7 +1554,7 @@ class OutputHelperTests(unittest.TestCase):
 
             def fake_add(new_fasta, backbone_aln, output_fasta, threads=4):
                 self.assertTrue(Path(backbone_aln).exists())
-                self.assertEqual(Path(backbone_aln).read_text(), (preload / 'current_alignment.fasta').read_text())
+                self.assertEqual(Path(backbone_aln).read_text(), (previous_review / 'current_alignment.fasta').read_text())
                 Path(output_fasta).write_text('>BASE\n' + ('A' * 1500) + '\n>Q1\n' + ('A' * 1400) + '\n')
                 return True
 
@@ -1364,12 +1570,58 @@ class OutputHelperTests(unittest.TestCase):
                     db=None,
                     db_dataset=None,
                     threads=1,
-                    preload_dir=str(preload),
+                    previous_review=str(previous_review),
                 )
 
             self.assertFalse(full_mock.called)
             self.assertTrue(add_mock.called)
             self.assertFalse(addfrag_mock.called)
+            self.assertTrue((outdir / 'current_alignment.fasta').exists())
+
+    def test_initialise_or_update_tree_reuses_organised_backbone_in_same_outdir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            outdir = tmp / 'run_out'
+            organised_tree = outdir / 'tree'
+            organised_tree.mkdir(parents=True)
+            prior_alignment = '>BASE\n' + ('A' * 1500) + '\n'
+            (organised_tree / 'current_alignment.fasta').write_text(prior_alignment)
+            (organised_tree / 'current_tree.nwk').write_text('(BASE:0.1);\n')
+            user = tmp / 'user.fasta'
+            user.write_text('>Q1\n' + ('A' * 1400) + '\n')
+            ref = tmp / 'ref.fasta'
+            ref.write_text('>REF1\n' + ('A' * 1500) + '\n')
+
+            def fake_run_cmd(cmd):
+                match = re.search(r'--blast6out\s+(\S+)', cmd)
+                self.assertIsNotNone(match)
+                Path(match.group(1)).write_text(
+                    'Q1\tREF1\t99.0\t1400\t0\t0\t1\t1400\t1\t1500\t1\t0\n'
+                )
+
+            def fake_add(new_fasta, backbone_aln, output_fasta, threads=4):
+                self.assertEqual(Path(backbone_aln).read_text(), prior_alignment)
+                Path(output_fasta).write_text(
+                    prior_alignment + '>Q1\n' + ('A' * 1400) + '\n'
+                )
+                return True
+
+            with mock.patch('branchmanager.pipeline.tree.run_cmd', side_effect=fake_run_cmd), \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_full', return_value=False) as full_mock, \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_add', side_effect=fake_add) as add_mock, \
+                 mock.patch('branchmanager.pipeline.tree._run_mafft_addfragments', return_value=False), \
+                 mock.patch('branchmanager.pipeline.tree._run_fasttree', return_value=True):
+                initialise_or_update_tree(
+                    ref_fasta=str(ref),
+                    user_fasta=str(user),
+                    outdir=str(outdir),
+                    db=None,
+                    db_dataset=None,
+                    threads=1,
+                )
+
+            self.assertFalse(full_mock.called)
+            self.assertTrue(add_mock.called)
             self.assertTrue((outdir / 'current_alignment.fasta').exists())
 
     def test_run_classification_searches_both_strands(self):
@@ -1416,7 +1668,7 @@ class OutputHelperTests(unittest.TestCase):
             write_dataset_membership_strip(
                 str(out),
                 ['A1', 'A2', 'A3'],
-                {'A1': 'preload', 'A2': 'run1', 'A3': ''},
+                {'A1': 'previous_review', 'A2': 'run1', 'A3': ''},
             )
             text = out.read_text()
             self.assertIn('DATASET_LABEL,Dataset membership', text)
@@ -1431,7 +1683,7 @@ class OutputHelperTests(unittest.TestCase):
                 'tax2': [('S3', 'TGCA')],
             }
             with mock.patch('branchmanager.pipeline.collapse.shutil.which', return_value=None):
-                artifacts = collapse_fasta_within_taxa(
+                artefacts = collapse_fasta_within_taxa(
                     taxa_groups,
                     tmpdir,
                     'collapsed.fasta',
@@ -1441,24 +1693,24 @@ class OutputHelperTests(unittest.TestCase):
                     threads=1,
                     log_prefix='[TEST COLLAPSE]',
                 )
-            self.assertTrue(artifacts.collapsed_path.exists())
-            fasta_text = artifacts.collapsed_path.read_text()
+            self.assertTrue(artefacts.collapsed_path.exists())
+            fasta_text = artefacts.collapsed_path.read_text()
             self.assertIn('>S1', fasta_text)
             self.assertIn('>S2', fasta_text)
             self.assertIn('>S3', fasta_text)
 
-    def test_internal_node_labeling_does_not_introduce_double_colons(self):
+    def test_internal_node_labelling_does_not_introduce_double_colons(self):
         newick = '((A:0.1,B:0.2)0.95:0.3,C:0.4);'
-        labeled = _label_internal_nodes(newick)
-        self.assertIn('NODE', labeled)
-        self.assertNotIn('::', labeled)
+        labelled = _label_internal_nodes(newick)
+        self.assertIn('NODE', labelled)
+        self.assertNotIn('::', labelled)
 
     def test_repair_internal_node_label_delimiters(self):
         broken = '((A:0.1,B:0.2)NODE0001::0.3,C:0.4);'
         repaired = _repair_internal_node_label_delimiters(broken)
         self.assertEqual(repaired, '((A:0.1,B:0.2)NODE0001:0.3,C:0.4);')
 
-    def test_generate_itol_colors_repairs_malformed_tree_labels(self):
+    def test_generate_itol_colours_repairs_malformed_tree_labels(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             taxonomy_tsv = tmp / 'combined_taxonomy.tsv'
@@ -1469,10 +1721,14 @@ class OutputHelperTests(unittest.TestCase):
             )
             tree_path = tmp / 'current_tree.nwk'
             tree_path.write_text('((A:0.1,B:0.2)NODE0001::0.3,C:0.4);')
-            generate_itol_colors(str(taxonomy_tsv), str(tmp), tree_file=str(tree_path))
+            generate_itol_colours(str(taxonomy_tsv), str(tmp), tree_file=str(tree_path))
             repaired = tree_path.read_text()
             self.assertIn('NODE0001:0.3', repaired)
             self.assertNotIn('NODE0001::0.3', repaired)
+            self.assertTrue((tmp / 'itol_phylum_colours.itol').exists())
+            self.assertTrue((tmp / 'itol_family_colours.itol').exists())
+            self.assertTrue((tmp / 'itol_genus_colours.itol').exists())
+            self.assertFalse((tmp / 'itol_phylum_colors.itol').exists())
 
     def test_tree_warning_helpers_report_partial_sequences_and_alignment_issues(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1488,7 +1744,7 @@ class OutputHelperTests(unittest.TestCase):
 
             aln = tmp / 'alignment.fasta'
             aln.write_text('>A\n----\n>B\nAC--\n')
-            aln_warnings = summarize_alignment_quality(str(aln))
+            aln_warnings = summarise_alignment_quality(str(aln))
             aln_cats = {w['category'] for w in aln_warnings}
             self.assertIn('ALL_GAP_ALIGNMENT_ROWS', aln_cats)
 
@@ -1568,10 +1824,8 @@ class OutputHelperTests(unittest.TestCase):
             tmp = Path(tmpdir)
             input_fasta = tmp / 'query.fasta'
             ref_fasta = tmp / 'ref.fasta'
-            novelty_tsv = tmp / 'novelty.tsv'
             input_fasta.write_text('>Q1\nACGT\n')
             ref_fasta.write_text('>R1 d__Bacteria;p__Firmicutes\nACGT\n')
-            novelty_tsv.write_text('ID\tNearestIdentity\tNearestHit\tNovel\nQ1\t96.5\tR1\tTrue\n')
 
             def fake_run_cmd(cmd):
                 parts = cmd.split()
@@ -1579,22 +1833,20 @@ class OutputHelperTests(unittest.TestCase):
                 density.write_text('Q1\tR1\t99.2\nQ1\tR2\t97.4\nQ1\tR3\t95.1\n')
 
             with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
-                out = build_reference_novelty_metrics(str(input_fasta), str(ref_fasta), str(novelty_tsv), str(tmp))
+                out = build_reference_novelty_metrics(str(input_fasta), str(ref_fasta), str(tmp))
 
             text = Path(out).read_text()
             self.assertIn('NoveltyScore', text)
             self.assertIn('MatchesGE99', text)
-            self.assertIn('Q1\t96.50\tR1\tTrue\t1\t2\t3', text)
+            self.assertIn('Q1\t99.20\tR1\tFalse\t1\t2\t3', text)
 
-    def test_build_reference_novelty_metrics_reports_baseline_and_all_known_scores(self):
+    def test_build_reference_novelty_metrics_reports_baseline_and_project_scores(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             input_fasta = tmp / 'query.fasta'
             ref_fasta = tmp / 'ref.fasta'
-            novelty_tsv = tmp / 'novelty.tsv'
             input_fasta.write_text('>Q1\nACGT\n')
             ref_fasta.write_text('>R1 d__Bacteria;p__Firmicutes\nACGT\n')
-            novelty_tsv.write_text('ID\tNearestIdentity\tNearestHit\tNovel\nQ1\t99.4\tPartnerHit\tFalse\n')
 
             db = Database(str(tmp / 'test.sqlite'))
             db.initialise()
@@ -1612,8 +1864,10 @@ class OutputHelperTests(unittest.TestCase):
                     out.write_text('Q1\tHungateHit\t96.2\n')
                 elif 'baseline_density' in out.name:
                     out.write_text('Q1\tHungateHit\t96.2\n')
-                elif 'all_known_density' in out.name:
-                    out.write_text('Q1\tPartnerHit\t99.4\nQ1\tHungateHit\t96.2\n')
+                elif 'project_nearest' in out.name:
+                    out.write_text('Q1\tPartnerHit\t99.4\n')
+                elif 'project_density' in out.name:
+                    out.write_text('Q1\tPartnerHit\t99.4\n')
                 elif 'reference_nearest' in out.name:
                     out.write_text('Q1\tGTDB_REF\t98.8\n')
                 elif 'reference_density' in out.name:
@@ -1625,7 +1879,6 @@ class OutputHelperTests(unittest.TestCase):
                 out = build_reference_novelty_metrics(
                     str(input_fasta),
                     str(ref_fasta),
-                    str(novelty_tsv),
                     str(tmp),
                     db=db,
                     run_dataset='CurrentBatch',
@@ -1634,10 +1887,10 @@ class OutputHelperTests(unittest.TestCase):
 
             text = Path(out).read_text()
             self.assertIn('BaselineNoveltyScore', text)
-            self.assertIn('AllKnownNoveltyScore', text)
+            self.assertIn('ProjectNoveltyScore', text)
             self.assertIn('ReferenceNoveltyScore', text)
             self.assertIn('Q1\t96.20\tHungateHit\tTrue', text)
-            self.assertIn('\t99.40\tPartnerHit\tFalse\t1\t1\t2\t', text)
+            self.assertIn('\t99.40\tPartnerHit\tFalse\t1\t1\t1\t', text)
             self.assertIn('\t98.80\tGTDB_REF\tFalse\t0\t1\t1\t', text)
 
     def test_build_reference_novelty_metrics_reports_selected_wgs_clade_context(self):
@@ -1645,10 +1898,8 @@ class OutputHelperTests(unittest.TestCase):
             tmp = Path(tmpdir)
             input_fasta = tmp / 'query.fasta'
             ref_fasta = tmp / 'ref.fasta'
-            novelty_tsv = tmp / 'novelty.tsv'
             input_fasta.write_text('>Q1\nACGT\n')
             ref_fasta.write_text('>R1 d__Bacteria;p__Firmicutes\nACGT\n')
-            novelty_tsv.write_text('ID\tNearestIdentity\tNearestHit\tNovel\nQ1\t99.5\tSelectedPrev\tFalse\n')
 
             db = Database(str(tmp / 'test.sqlite'))
             db.initialise()
@@ -1674,7 +1925,7 @@ class OutputHelperTests(unittest.TestCase):
                 out = Path(parts[parts.index('--blast6out') + 1])
                 if 'selected_for_wgs' in out.name:
                     out.write_text('Q1\tSelectedPrev\t99.5\n')
-                elif 'all_known_density' in out.name:
+                elif 'project_density' in out.name:
                     out.write_text('Q1\tSelectedPrev\t99.5\n')
                 elif 'reference_nearest' in out.name:
                     out.write_text('Q1\tR1\t99.0\n')
@@ -1687,17 +1938,16 @@ class OutputHelperTests(unittest.TestCase):
                 out = build_reference_novelty_metrics(
                     str(input_fasta),
                     str(ref_fasta),
-                    str(novelty_tsv),
                     str(tmp),
                     db=db,
                     run_dataset='CurrentBatch',
                 )
 
             text = Path(out).read_text()
-            self.assertIn('SelectedForGenomeSequencing', text)
-            self.assertIn('CladeAlreadySelectedForGenomeSequencing', text)
-            self.assertIn('PartnerQ1\tFalse\tSelectedPrev\t99.50\t1\t1\t1\tTrue', text)
-            self.assertIn('LOW_ALREADY_SELECTED_CLADE', text)
+            self.assertIn('GenomeAlreadySequenced', text)
+            self.assertIn('RelatedGenomeCladeGE97', text)
+            self.assertIn('PartnerQ1\tFalse\tFalse\tSelectedPrev\t99.50\t1\t1\t1\tTrue', text)
+            self.assertIn('\t3\t3\tbaseline_genomes_and_project_ledger', text)
 
     def test_build_sequence_assessment_rows_combines_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1714,8 +1964,8 @@ class OutputHelperTests(unittest.TestCase):
             class_tsv.write_text('ID\tBestHit\tIdentity\tTaxon\tConfidence\norigA\tREF1\t98.0\td__Bacteria; p__Firmicutes\t0.9\n')
             novelty_metrics = tmp / 'novelty_metrics.tsv'
             novelty_metrics.write_text(
-                'ID\tNearestIdentity\tNearestHit\tNovel\tMatchesGE99\tMatchesGE97\tMatchesGE95\tNoveltyScore\tCrowding\tSequencingPriority\n'
-                'S01\t96.50\tREF1\tTrue\t1\t2\t3\t25.00\tsparse\tHIGH\n'
+                'ID\tBaselineNearestIdentity\tBaselineNearestHit\tBaselineNovel\tBaselineMatchesGE99\tBaselineMatchesGE97\tBaselineMatchesGE95\tBaselineNoveltyScore\tBaselineCrowding\tBaselineSequencingPriority\tBaselineDensitySource\n'
+                'S01\t96.50\tREF1\tTrue\t1\t2\t3\t25.00\tsparse\tHIGH\tbaseline:Hungate\n'
             )
             warning_rows = [{'id': 'S01', 'flags': 'LOW_NEAREST_IDENTITY'}]
             rows = build_sequence_assessment_rows(['S01'], str(class_tsv), str(novelty_metrics), warning_rows, {'origA': 'S01'}, db)
@@ -1727,7 +1977,7 @@ class OutputHelperTests(unittest.TestCase):
             self.assertEqual(rows[0]['sequencing_priority'], 'HIGH')
             self.assertEqual(rows[0]['placement_flags'], 'LOW_NEAREST_IDENTITY')
 
-    def test_build_sequence_assessment_rows_reads_all_known_novelty_columns(self):
+    def test_build_sequence_assessment_rows_reads_project_novelty_columns(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             db = Database(os.path.join(tmpdir, 'test.sqlite'))
@@ -1749,11 +1999,11 @@ class OutputHelperTests(unittest.TestCase):
             novelty_metrics.write_text(
                 'ID\tNearestIdentity\tNearestHit\tNovel\tMatchesGE99\tMatchesGE97\tMatchesGE95\tNoveltyScore\tCrowding\tSequencingPriority\tDensitySource\t'
                 'BaselineNearestIdentity\tBaselineNearestHit\tBaselineNovel\tBaselineMatchesGE99\tBaselineMatchesGE97\tBaselineMatchesGE95\tBaselineNoveltyScore\tBaselineCrowding\tBaselineSequencingPriority\tBaselineDensitySource\t'
-                'AllKnownNearestIdentity\tAllKnownNearestHit\tAllKnownNovel\tAllKnownMatchesGE99\tAllKnownMatchesGE97\tAllKnownMatchesGE95\tAllKnownNoveltyScore\tAllKnownCrowding\tAllKnownSequencingPriority\tAllKnownDensitySource\t'
+                'ProjectNearestIdentity\tProjectNearestHit\tProjectNovel\tProjectMatchesGE99\tProjectMatchesGE97\tProjectMatchesGE95\tProjectNoveltyScore\tProjectCrowding\tProjectSequencingPriority\tProjectDensitySource\t'
                 'ReferenceNearestIdentity\tReferenceNearestHit\tReferenceNovel\tReferenceMatchesGE99\tReferenceMatchesGE97\tReferenceMatchesGE95\tReferenceNoveltyScore\tReferenceCrowding\tReferenceSequencingPriority\tReferenceDensitySource\n'
                 'S01\t96.20\tH1\tTrue\t0\t0\t1\t55.00\tisolated\tHIGH\tbaseline:Hungate\t'
                 '96.20\tH1\tTrue\t0\t0\t1\t55.00\tisolated\tHIGH\tbaseline:Hungate\t'
-                '99.40\tP1\tFalse\t1\t1\t2\t26.80\tisolated\tLOW\tall_known\t'
+                '99.40\tP1\tFalse\t1\t1\t2\t26.80\tisolated\tLOW\tproject_collection\t'
                 '98.80\tREF1\tFalse\t0\t1\t1\t33.60\tisolated\tLOW\treference_fasta\n'
             )
 
@@ -1761,9 +2011,9 @@ class OutputHelperTests(unittest.TestCase):
 
             self.assertEqual(rows[0]['nearest_hit'], 'H1')
             self.assertEqual(rows[0]['nearest_hit_dataset'], 'Hungate')
-            self.assertEqual(rows[0]['all_known_nearest_hit'], 'P1')
-            self.assertEqual(rows[0]['all_known_nearest_hit_dataset'], 'PartnerB')
-            self.assertEqual(rows[0]['all_known_novelty_score'], '26.80')
+            self.assertEqual(rows[0]['project_nearest_hit'], 'P1')
+            self.assertEqual(rows[0]['project_nearest_hit_dataset'], 'PartnerB')
+            self.assertEqual(rows[0]['project_novelty_score'], '26.80')
             self.assertEqual(rows[0]['reference_nearest_hit'], 'REF1')
             self.assertEqual(rows[0]['reference_nearest_hit_taxonomy'], 'd__Bacteria; p__Bacillota')
             self.assertEqual(rows[0]['reference_novelty_score'], '33.60')
@@ -1780,16 +2030,25 @@ class OutputHelperTests(unittest.TestCase):
                     'nearest_identity': '95.50',
                     'nearest_hit': 'HungateA',
                     'nearest_hit_taxonomy': 'd__Bacteria; p__Bacillota; g__Known',
-                    'all_known_nearest_identity': '96.10',
+                    'matches_ge_97': '0',
+                    'density_source': 'baseline:Hungate',
+                    'project_nearest_identity': '96.10',
+                    'project_matches_ge_97': '0',
+                    'project_density_source': 'project_collection',
+                    'project_novelty_score': '55.0',
                     'reference_nearest_identity': '98.80',
                     'reference_nearest_hit': 'GTDB_REF',
+                    'reference_density_source': 'reference_fasta',
                     'sequencing_priority': 'HIGH',
-                    'genome_sequencing_adjusted_priority': 'HIGH',
-                    'genome_sequencing_adjusted_novelty_score': '62.50',
                     'selected_for_genome_sequencing': 'False',
-                    'clade_already_selected_for_genome_sequencing': 'False',
-                    'nearest_selected_genome_hit': 'None',
-                    'nearest_selected_genome_identity': '0.00',
+                    'genome_committed_count_same_species': '0',
+                    'genome_available_count_same_species': '0',
+                    'genome_selected_count_same_species': '0',
+                    'pangenome_target': '3',
+                    'pangenome_gap': '3',
+                    'sequencing_set_id': 'SET_A',
+                    'sequencing_set_role': 'PRIMARY',
+                    'sequencing_set_rank': '1',
                     'mwl_match': 'Yes',
                     'mwl_matched_rank': 'genus',
                     'mwl_matched_taxon': 'g__Novel',
@@ -1798,6 +2057,7 @@ class OutputHelperTests(unittest.TestCase):
                     'cluster_representative': 'self',
                     'cluster_size': '1',
                     'placement_flags': '',
+                    'local_neighbourhood_figure': 'neighbourhoods/clade_001.png',
                 },
                 {
                     'id': 'Iso002',
@@ -1807,16 +2067,26 @@ class OutputHelperTests(unittest.TestCase):
                     'nearest_identity': '96.80',
                     'nearest_hit': 'HungateB',
                     'nearest_hit_taxonomy': 'd__Bacteria; p__Bacillota',
-                    'all_known_nearest_identity': '99.20',
+                    'matches_ge_97': '1',
+                    'density_source': 'baseline:Hungate',
+                    'project_nearest_identity': '99.20',
+                    'project_matches_ge_97': '5',
+                    'project_density_source': 'project_collection',
+                    'project_novelty_score': '10.0',
                     'reference_nearest_identity': '99.50',
                     'reference_nearest_hit': 'GTDB_REF2',
+                    'reference_density_source': 'reference_fasta',
                     'sequencing_priority': 'HIGH',
-                    'genome_sequencing_adjusted_priority': 'LOW_ALREADY_SELECTED_CLADE',
-                    'genome_sequencing_adjusted_novelty_score': '20.00',
                     'selected_for_genome_sequencing': 'False',
-                    'clade_already_selected_for_genome_sequencing': 'True',
-                    'nearest_selected_genome_hit': 'IsoPrev',
-                    'nearest_selected_genome_identity': '99.20',
+                    'nearest_genome_hit': 'IsoPrev',
+                    'nearest_genome_identity': '99.20',
+                    'genome_committed_count_same_species': '3',
+                    'genome_available_count_same_species': '2',
+                    'genome_selected_count_same_species': '1',
+                    'pangenome_target': '3',
+                    'pangenome_gap': '0',
+                    'sequencing_set_id': 'SET_B',
+                    'sequencing_set_role': 'TARGET_MET',
                     'mwl_match': 'No',
                     'in_tree': 'Yes',
                     'cluster_representative': 'self',
@@ -1828,11 +2098,484 @@ class OutputHelperTests(unittest.TestCase):
             path = write_selection_summary_tsv(out, rows)
             text = Path(path).read_text()
 
-            self.assertIn('SequenceID\tPartnerID\tRecommendation\tAdjustedPriority', text)
-            self.assertIn('Iso001\tQUB\tStrong candidate\tHIGH\t62.50', text)
-            self.assertIn('MWL match genus:g__Novel', text)
-            self.assertIn('Iso002\tUoG\tDeprioritise - clade represented\tLOW_ALREADY_SELECTED_CLADE', text)
-            self.assertIn('nearby selected genome >=97% 16S identity', text)
+            self.assertIn(
+                'SequenceID\tPartnerID\tSelectedForGenomeSequencing\t'
+                'GenomeAlreadySequenced\tRecommendation\tSequencingSetID',
+                text,
+            )
+            self.assertIn('Iso001\tQUB\tFalse\tNA\tPRIORITISE - SET PRIMARY\tSET_A\tPRIMARY\t1\tHIGH', text)
+            self.assertIn('MWL target match (g__Novel)', text)
+            self.assertIn('neighbourhoods/clade_001.png', text)
+            self.assertIn('Iso002\tUoG\tFalse\tNA\tLOWER PRIORITY - TARGET MET\tSET_B\tTARGET_MET', text)
+            self.assertIn('assessment-species pangenome target already met', text)
+
+    def test_selection_decision_does_not_treat_related_available_genome_as_duplicate(self):
+        decision = build_selection_decision({
+            'taxonomy': 'd__Bacteria; p__Bacillota',
+            'classification_identity': '98.0',
+            'nearest_identity': '96.0',
+            'density_source': 'baseline:Hungate',
+            'project_nearest_identity': '96.5',
+            'project_matches_ge_97': '0',
+            'project_density_source': 'project_collection',
+            'reference_nearest_identity': '97.5',
+            'reference_density_source': 'reference_fasta',
+            'selected_for_genome_sequencing': 'False',
+            'nearest_genome_identity': '97.8',
+            'mwl_match': 'No',
+            'placement_flags': '',
+        })
+        self.assertEqual(decision['decision'], 'STRONG CANDIDATE')
+        self.assertEqual(decision['genome_coverage'], 'RELATED AVAILABLE GENOME - 97.80%')
+
+    def test_sequencing_sets_propose_three_primaries_and_one_backup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            tree_path = tmp / 'tree.nwk'
+            tree_path.write_text(
+                '((Q1:0.01,Q2:0.02):0.01,(Q3:0.03,(Q4:0.04,Q5:0.05):0.01):0.02);'
+            )
+            rows = []
+            for index in range(1, 6):
+                rows.append({
+                    'id': f'Q{index}',
+                    'partner_id': 'QUB',
+                    'taxonomy': 'd__Bacteria; p__Bacillota; g__Novel; s__Novel species',
+                    'classification_identity': '99.0',
+                    'classification_confidence': '0.99',
+                    'nearest_identity': str(94.0 + index / 10),
+                    'density_source': 'baseline:Hungate',
+                    'project_nearest_identity': str(96.0 + index / 10),
+                    'project_density_source': 'project_collection',
+                    'reference_nearest_identity': '97.0',
+                    'reference_density_source': 'reference_fasta',
+                    'selected_for_genome_sequencing': 'False',
+                    'genome_available_count_same_species': '0',
+                    'genome_selected_count_same_species': '0',
+                    'genome_committed_count_same_species': '0',
+                    'pangenome_target': '3',
+                    'pangenome_gap': '3',
+                    'in_tree': 'Yes',
+                    'cluster_representative': 'self',
+                    'placement_flags': '',
+                })
+
+            output = selection_sets_pipeline.build_sequencing_sets(
+                rows,
+                tmp / 'sequencing_sets.tsv',
+                tree_path=tree_path,
+                pangenome_target=3,
+                candidate_set_size=4,
+            )
+
+            roles = [row['sequencing_set_role'] for row in rows]
+            self.assertEqual(roles.count('PRIMARY'), 3)
+            self.assertEqual(roles.count('BACKUP'), 1)
+            self.assertEqual(roles.count('ALTERNATE'), 1)
+            text = Path(output).read_text()
+            self.assertIn('CommittedGenomeCount\tCommittedGenomeIDs\tPangenomeTarget\tPangenomeGap', text)
+            self.assertIn('\tBACKUP\t4\tHIGH\t', text)
+
+    def test_sequencing_sets_count_every_baseline_as_genome_available(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db = Database(str(tmp / 'project.sqlite'))
+            db.initialise()
+            db.upsert_dataset_role('Hungate', 'baseline', genomes_available=True)
+            db.insert_sequences([('H1', 'ACGT'), ('H2', 'ACGT')], dataset='Hungate')
+            db.insert_sequences([('P1', 'ACGT'), ('Q1', 'ACGT')], dataset='Partners')
+            db.upsert_dataset_role('Partners', 'candidate', genomes_available=False)
+            taxonomy = 'd__Bacteria; p__Bacillota; g__Covered; s__Covered species'
+            db.insert_taxonomy([(sid, taxonomy, 1.0, dataset) for sid, dataset in (
+                ('H1', 'Hungate'), ('H2', 'Hungate'), ('P1', 'Partners'), ('Q1', 'Partners'),
+            )])
+            db.upsert_sequencing_metadata([{
+                'id': 'P1', 'partner_id': 'QUB', 'dataset': 'Partners', 'selected_for_wgs': True,
+            }])
+            rows = [{
+                'id': 'Q1', 'partner_id': 'QUB', 'taxonomy': taxonomy,
+                'classification_identity': '99.0', 'selected_for_genome_sequencing': 'False',
+                'nearest_identity': '99.0', 'density_source': 'baseline:Hungate',
+                'project_density_source': 'project_collection', 'reference_density_source': 'reference_fasta',
+                'genome_available_count_same_species': '2',
+                'genome_selected_count_same_species': '1',
+                'genome_committed_count_same_species': '3',
+                'pangenome_target': '3', 'pangenome_gap': '0',
+                'placement_flags': '',
+            }]
+
+            output = selection_sets_pipeline.build_sequencing_sets(
+                rows, tmp / 'sequencing_sets.tsv', db=db,
+            )
+
+            self.assertEqual(rows[0]['sequencing_set_role'], 'TARGET_MET')
+            text = Path(output).read_text()
+            self.assertIn('H1;H2;P1', text)
+            self.assertIn('\t2\t1\t0\t3\t', text)
+
+    def test_already_sequenced_is_a_state_not_a_new_recommendation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            row = {
+                'id': 'P1', 'partner_id': 'QUB',
+                'taxonomy': 'd__Bacteria; g__Covered; s__Covered species',
+                'classification_identity': '99.0',
+                'selected_for_genome_sequencing': 'True',
+                'already_sequenced': 'True',
+                'genome_available_count_same_species': '0',
+                'genome_selected_count_same_species': '1',
+                'genome_committed_count_same_species': '1',
+                'pangenome_target': '3', 'pangenome_gap': '2',
+                'density_source': 'baseline:Hungate',
+                'project_density_source': 'project_collection',
+                'reference_density_source': 'reference_fasta',
+                'placement_flags': '',
+            }
+
+            output = selection_sets_pipeline.build_sequencing_sets(
+                [row], Path(tmpdir) / 'sequencing_sets.tsv',
+            )
+
+            self.assertEqual(row['sequencing_set_role'], 'SEQUENCED')
+            self.assertEqual(row['sequencing_set_rank'], 'NA')
+            self.assertIn('\tSEQUENCED\tNA\t', Path(output).read_text())
+            self.assertEqual(build_selection_decision(row)['decision'], 'ALREADY SEQUENCED')
+
+    def test_selected_pending_is_committed_but_not_already_sequenced(self):
+        row = {
+            'id': 'Pending', 'partner_id': 'QUB',
+            'taxonomy': 'd__Bacteria; g__Covered; s__Covered species',
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'selected_for_genome_sequencing': 'True', 'already_sequenced': 'False',
+            'genome_available_count_same_species': '0',
+            'genome_selected_count_same_species': '0',
+            'genome_pending_count_same_species': '1',
+            'genome_committed_count_same_species': '1',
+            'pangenome_target': '3', 'pangenome_gap': '2',
+            'density_source': 'baseline:Hungate',
+            'project_density_source': 'project_collection',
+            'reference_density_source': 'reference_fasta',
+            'placement_flags': '',
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_sets_pipeline.build_sequencing_sets([row], Path(tmpdir) / 'pending_sets.tsv')
+            decision = build_selection_decision(row)
+
+        self.assertEqual(row['sequencing_set_role'], 'COMMITTED')
+        self.assertEqual(decision['decision'], 'ALREADY SELECTED - GENOME PENDING')
+        self.assertIn('GENOME PENDING', decision['genome_coverage'])
+
+    def test_database_keeps_latest_assessment_and_selection_round_audit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'project.sqlite'))
+            db.initialise()
+            db.save_assessment_snapshot('round_1', [{'id': 'A', 'nearest_identity': '99.0'}])
+            db.save_assessment_snapshot('round_2', [{'id': 'A', 'nearest_identity': '97.0'}])
+
+            latest = db.get_latest_assessment_rows()
+            self.assertEqual(latest['A']['nearest_identity'], '97.0')
+            self.assertEqual(latest['A']['_snapshot_id'], 'round_2')
+
+            recommendations = [{
+                'sequence_id': 'A', 'role': 'PRIMARY', 'round_rank': 1,
+                'source_snapshot': 'round_2',
+            }]
+            self.assertEqual(
+                db.save_selection_round('quarterly_review_1', recommendations, parameters={'GenomeBudget': 1}),
+                1,
+            )
+            with db.connect() as conn:
+                stored = conn.execute(
+                    'SELECT role, round_rank FROM selection_round_members WHERE round_id = ?',
+                    ('quarterly_review_1',),
+                ).fetchone()
+            self.assertEqual(stored, ('PRIMARY', 1))
+
+    def test_quarterly_review_fills_gaps_then_balances_post_target_diversity(self):
+        def row(sequence_id, species, available, nearest_genome, *, sequenced=False):
+            return {
+                'id': sequence_id,
+                'partner_id': 'QUB',
+                'taxonomy': f'd__Bacteria; g__Test; s__{species}',
+                'classification_identity': '99.5',
+                'classification_confidence': '0.99',
+                'nearest_identity': '98.0',
+                'project_nearest_identity': '98.0',
+                'reference_nearest_identity': '98.0',
+                'nearest_genome_identity': str(nearest_genome),
+                'selected_for_genome_sequencing': str(sequenced),
+                'already_sequenced': str(sequenced),
+                'genome_committed_count_same_species': str(available),
+                'pangenome_target': '3',
+                'placement_flags': '',
+            }
+
+        rows = [
+            row('BetaA', 'Beta species', 2, 99.5),
+            row('BetaB', 'Beta species', 2, 99.6),
+            row('AlphaA', 'Alpha species', 3, 97.0),
+            row('AlphaB', 'Alpha species', 3, 99.8),
+            row('GammaGenome', 'Gamma species', 3, 100.0, sequenced=True),
+        ]
+        recommendations = quarterly_review_pipeline.build_quarterly_review(
+            rows,
+            genome_budget=2,
+            backups_per_primary=1,
+            pangenome_target=3,
+        )
+        by_id = {item['sequence_id']: item for item in recommendations}
+
+        self.assertEqual(by_id['BetaA']['role'], 'PRIMARY')
+        self.assertEqual(by_id['BetaA']['round_rank'], 1)
+        self.assertEqual(by_id['BetaA']['priority_tier'], 'COVERAGE_GAP')
+        self.assertEqual(by_id['AlphaA']['role'], 'PRIMARY')
+        self.assertEqual(by_id['AlphaA']['round_rank'], 2)
+        self.assertEqual(by_id['AlphaA']['priority_tier'], 'NOVEL_GENOME_NEIGHBOURHOOD')
+        self.assertEqual(by_id['BetaB']['role'], 'BACKUP')
+        self.assertEqual(by_id['AlphaB']['role'], 'BACKUP')
+        self.assertEqual(by_id['GammaGenome']['role'], 'ALREADY_SEQUENCED')
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            outputs = quarterly_review_pipeline.write_quarterly_review_reports(
+                tmpdir, 'quarterly_review_test', recommendations, {'GenomeBudget': 2},
+            )
+            self.assertEqual(Path(outputs['summary']).name, 'quarterly_review_summary.tsv')
+            self.assertEqual(Path(outputs['manifest']).name, 'quarterly_review_manifest.tsv')
+            self.assertIn('BetaA', Path(outputs['selected']).read_text())
+            self.assertIn('GammaGenome', Path(outputs['summary']).read_text())
+            self.assertIn('ScientificScope', Path(outputs['manifest']).read_text())
+
+    def test_quarterly_review_refreshes_available_genome_identity_from_current_alignment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            alignment = Path(tmpdir) / 'current_alignment.fasta'
+            alignment.write_text('>Candidate\nACGT\n>Genome\nACGA\n')
+            common = {
+                'partner_id': 'QUB',
+                'taxonomy': 'd__Bacteria; g__Test; s__Test species',
+                'classification_identity': '99.0',
+                'classification_confidence': '0.99',
+                'genome_committed_count_same_species': '1',
+                'placement_flags': '',
+                'in_tree': 'Yes',
+            }
+            rows = [
+                {
+                    **common, 'id': 'Candidate',
+                    'selected_for_genome_sequencing': 'False',
+                    'nearest_genome_hit': 'OldGenome',
+                    'nearest_genome_identity': '99.9',
+                },
+                {
+                    **common, 'id': 'Genome',
+                    'selected_for_genome_sequencing': 'True',
+                    'already_sequenced': 'True',
+                    'nearest_genome_identity': '100.0',
+                },
+            ]
+
+            recommendations = quarterly_review_pipeline.build_quarterly_review(
+                rows, genome_budget=1, backups_per_primary=0,
+                alignment_path=alignment,
+            )
+            candidate = next(row for row in recommendations if row['sequence_id'] == 'Candidate')
+            self.assertEqual(candidate['nearest_available_genome'], 'Genome')
+            self.assertEqual(candidate['nearest_available_identity'], '75.00')
+            self.assertIn('current_alignment:4_comparable_acgt_columns', candidate['nearest_available_identity_source'])
+
+    def test_local_neighbourhood_groups_assessed_sequences_in_one_png(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            tree_path = tmp / 'current_tree.nwk'
+            tree_path.write_text(
+                '(((Q1:0.01,Q2:0.01)NODE0001:0.01,H1:0.02)NODE0002:0.01,'
+                '(P1:0.02,P2:0.02)NODE0003:0.02)NODE0000;'
+            )
+            db = Database(str(tmp / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('Q1', 'ACGT'), ('Q2', 'ACGT')], dataset='Current')
+            db.insert_sequences([('H1', 'ACGT')], dataset='Hungate')
+            db.insert_sequences([('P1', 'ACGT'), ('P2', 'ACGT')], dataset='Prior')
+            db.upsert_sequencing_metadata([{
+                'id': 'P1',
+                'partner_id': 'QUB',
+                'dataset': 'Prior',
+                'selected_for_wgs': True,
+            }])
+            rows = [
+                {
+                    'id': 'Q1', 'cluster_representative': 'self',
+                    'taxonomy': 'd__Bacteria; g__Alpha', 'partner_id': 'QUB',
+                    'density_source': 'baseline:Hungate',
+                    'selected_for_genome_sequencing': 'False',
+                },
+                {
+                    'id': 'Q2', 'cluster_representative': 'self',
+                    'taxonomy': 'd__Bacteria; g__Alpha', 'partner_id': 'UoG',
+                    'density_source': 'baseline:Hungate',
+                    'selected_for_genome_sequencing': 'False',
+                },
+            ]
+
+            result = neighbourhood_pipeline.generate_local_neighbourhood_visuals(
+                tree_path,
+                rows,
+                db,
+                tmp / 'neighbourhoods',
+                min_context_leaves=3,
+                max_context_leaves=5,
+                image_format='png',
+            )
+
+            self.assertEqual(len(result['figures']), 1)
+            self.assertEqual(rows[0]['local_neighbourhood_figure'], rows[1]['local_neighbourhood_figure'])
+            png_path = Path(result['figures'][0])
+            self.assertEqual(png_path.suffix, '.png')
+            self.assertEqual(png_path.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+            manifest = Path(result['manifest']).read_text()
+            self.assertIn('Q1;Q2', manifest)
+            with open(result['manifest']) as handle:
+                manifest_rows = list(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(manifest_rows[0]['TreeLeavesShown'], '3')
+            self.assertEqual(manifest_rows[0]['BaselineLeavesShown'], '1')
+            self.assertEqual(manifest_rows[0]['SequencedGenomeLeavesShown'], '0')
+
+    def test_local_neighbourhood_forces_nearest_baseline_and_labels_rank_and_pident(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            tree_path = tmp / 'current_tree.nwk'
+            tree_path.write_text(
+                '((Q1:0.01,Q2:0.01)NODE0001:0.01,'
+                '(H1:0.01,(P1:0.01,P2:0.01)NODE0002:0.01)NODE0003:0.01)NODE0000;'
+            )
+            alignment = tmp / 'current_alignment.fasta'
+            alignment.write_text(
+                '>Q1\nACGT\n>Q2\nACGA\n>H1\nAGGT\n>P1\nAAAA\n>P2\nTTTT\n'
+            )
+            db = Database(str(tmp / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('Q1', 'ACGT'), ('Q2', 'ACGA')], dataset='Current')
+            db.insert_sequences([('H1', 'AGGT')], dataset='Hungate')
+            db.insert_sequences([('P1', 'AAAA'), ('P2', 'TTTT')], dataset='Prior')
+            rows = [
+                {
+                    'id': 'Q1', 'cluster_representative': 'self',
+                    'taxonomy': 'd__Bacteria; g__Alpha', 'partner_id': 'QUB',
+                    'density_source': 'baseline:Hungate',
+                    'nearest_hit': 'H1', 'nearest_identity': '98.50',
+                    'sequencing_set_id': 'BMSET_TEST',
+                    'sequencing_set_role': 'PRIMARY', 'sequencing_set_rank': '1',
+                    'selected_for_genome_sequencing': 'False',
+                },
+                {
+                    'id': 'Q2', 'cluster_representative': 'self',
+                    'taxonomy': 'd__Bacteria; g__Alpha', 'partner_id': 'UoG',
+                    'density_source': 'baseline:Hungate',
+                    'nearest_hit': 'H1', 'nearest_identity': '97.50',
+                    'sequencing_set_id': 'BMSET_TEST',
+                    'sequencing_set_role': 'BACKUP', 'sequencing_set_rank': '2',
+                    'selected_for_genome_sequencing': 'False',
+                },
+            ]
+
+            result = neighbourhood_pipeline.generate_local_neighbourhood_visuals(
+                tree_path,
+                rows,
+                db,
+                tmp / 'neighbourhoods',
+                alignment_path=alignment,
+                min_context_leaves=2,
+                max_context_leaves=2,
+                image_format='png',
+            )
+
+            png_path = Path(result['figures'][0])
+            self.assertEqual(png_path.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')
+            root, _, _ = neighbourhood_pipeline._parse_tree(tree_path)
+            targets = [
+                {'row': row, 'tree_leaf_id': row['id']}
+                for row in rows
+            ]
+            metadata = neighbourhood_pipeline._load_metadata(
+                db, ['Q1', 'Q2', 'H1', 'P1', 'P2'], rows,
+            )
+            geometry = neighbourhood_pipeline._figure_geometry(
+                root,
+                targets,
+                metadata,
+                {'Hungate'},
+                aligned_sequences=dict(read_fasta(alignment)),
+                identity_anchor='Q1',
+                baseline_context={'H1': {'identity': 98.50, 'queries': ['Q1', 'Q2']}},
+            )
+            labels = '\n'.join(geometry['display_labels'])
+            self.assertIn('[P1] Q1', labels)
+            self.assertIn('[B2] Q2', labels)
+            self.assertIn('H1', labels)
+            self.assertIn('nearest baseline context; max 98.50% vsearch', labels)
+            self.assertIn('MSA pident 75.00%', labels)
+            pairwise = tmp / 'neighbourhoods' / 'clade_001_pairwise_pident.tsv'
+            self.assertTrue(pairwise.exists())
+            self.assertIn('Q1\tQ2\t75.00\t4', pairwise.read_text())
+            with open(result['manifest']) as handle:
+                manifest_rows = list(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(manifest_rows[0]['NearestBaselineHitsShown'], 'H1')
+            self.assertEqual(manifest_rows[0]['IdentityAnchor'], 'Q1')
+            self.assertEqual(manifest_rows[0]['BaselineLeavesShown'], '1')
+            self.assertEqual(manifest_rows[0]['TreeLeavesShown'], '3')
+            self.assertEqual(
+                rows[0]['local_pairwise_pident_table'],
+                'neighbourhoods/clade_001_pairwise_pident.tsv',
+            )
+
+    def test_msa_pident_excludes_terminal_gaps_and_ambiguous_columns(self):
+        identity, compared = neighbourhood_pipeline._msa_pident('ACGT--N', 'ACG---A')
+        self.assertEqual(compared, 3)
+        self.assertAlmostEqual(identity, 100.0)
+
+    def test_cluster_reports_write_one_consolidated_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = [
+                {
+                    'id': 'A', 'cluster_representative': 'self', 'cluster_size': '2',
+                    'clustered_members': 'B', 'taxonomy': 'd__Bacteria; g__Alpha',
+                    'classification_identity': '99.0', 'nearest_identity': '98.0',
+                    'matches_ge_99': '0', 'matches_ge_97': '2', 'matches_ge_95': '3',
+                    'novelty_score': '40.0', 'crowding': 'sparse',
+                    'sequencing_priority': 'MEDIUM', 'in_tree': 'Yes', 'placement_flags': '',
+                },
+                {
+                    'id': 'B', 'cluster_representative': 'A', 'cluster_size': '2',
+                    'clustered_members': '', 'taxonomy': 'd__Bacteria; g__Alpha',
+                    'classification_identity': '98.8', 'nearest_identity': '97.8',
+                    'matches_ge_99': '0', 'matches_ge_97': '2', 'matches_ge_95': '3',
+                    'novelty_score': '42.0', 'crowding': 'sparse',
+                    'sequencing_priority': 'MEDIUM', 'in_tree': 'No', 'placement_flags': '',
+                },
+                {
+                    'id': 'C', 'cluster_representative': 'self', 'cluster_size': '1',
+                    'clustered_members': '', 'taxonomy': 'd__Bacteria; g__Beta',
+                    'classification_identity': '99.2', 'nearest_identity': '99.1',
+                    'matches_ge_99': '1', 'matches_ge_97': '4', 'matches_ge_95': '5',
+                    'novelty_score': '20.0', 'crowding': 'moderate',
+                    'sequencing_priority': 'LOW', 'in_tree': 'Yes', 'placement_flags': '',
+                },
+            ]
+
+            summary, clusters_csv, backups = cluster_report_pipeline.generate_cluster_reports(
+                tmpdir,
+                rows,
+                tree_path=None,
+            )
+
+            self.assertTrue(Path(summary).exists())
+            self.assertTrue(Path(backups).exists())
+            self.assertEqual(Path(clusters_csv).name, 'clusters.csv')
+            self.assertFalse((Path(tmpdir) / 'clusters').exists())
+            cluster_text = Path(clusters_csv).read_text()
+            self.assertIn('ClusterID,ID,IsRepresentative,BackupRank', cluster_text)
+            self.assertIn('A,A,True', cluster_text)
+            self.assertIn('A,B,False', cluster_text)
+            self.assertIn('C,C,True', cluster_text)
 
 
 if __name__ == '__main__':

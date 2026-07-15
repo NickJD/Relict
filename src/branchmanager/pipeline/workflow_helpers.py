@@ -4,14 +4,29 @@ import gzip
 import os
 import csv
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from branchmanager.taxonomy_io import iter_taxonomy_assignment_rows
-from branchmanager.taxonomy import parse_reference_header_taxonomy, taxonomy_matches_kingdom
+from branchmanager.taxonomy import (
+    normalise_taxon_name,
+    parse_reference_header_taxonomy,
+    parse_taxon_string,
+    taxonomy_matches_kingdom,
+)
 from branchmanager.utils.fasta import read_fasta
 
 
 ClassificationRow = Dict[str, object]
+
+
+def _optional_numeric(parts: Sequence[str], index: int, *, integer: bool = False):
+    if index >= len(parts) or parts[index] in ('', 'NA', 'None'):
+        return None
+    try:
+        value = float(parts[index])
+        return int(value) if integer else value
+    except (TypeError, ValueError):
+        return None
 
 
 def _assignment_source_is_fasta(assignments_path: str, source_fasta_path: Optional[str] = None) -> bool:
@@ -93,11 +108,18 @@ def iter_classification_rows(classification_tsv: str) -> Iterator[Classification
                 'identity': identity,
                 'tax': parts[3] if len(parts) > 3 and parts[3] != '' else None,
                 'confidence': confidence,
+                'query_coverage': _optional_numeric(parts, 5),
+                'target_coverage': _optional_numeric(parts, 6),
+                'alignment_length': _optional_numeric(parts, 7, integer=True),
+                'query_length': _optional_numeric(parts, 8, integer=True),
+                'target_length': _optional_numeric(parts, 9, integer=True),
+                'mismatches': _optional_numeric(parts, 10, integer=True),
+                'gaps': _optional_numeric(parts, 11, integer=True),
             }
 
 
 def iter_assignment_rows(assignments_path: str, source_fasta_path: Optional[str] = None) -> Iterator[dict[str, object]]:
-    """Yield normalized taxonomy-assignment rows from table files or FASTA headers.
+    """Yield normalised taxonomy-assignment rows from table files or FASTA headers.
 
     If `assignments_path` is the same file as `source_fasta_path`, taxonomy is
     parsed from GTDB-style FASTA headers. Otherwise TSV/CSV and .gz variants are
@@ -178,7 +200,7 @@ def prune_dataset_by_kingdom(db, dataset: str, kingdom: str | None):
         for iid in to_delete:
             cur.execute('DELETE FROM distances WHERE id = ?', (iid,))
             cur.execute('DELETE FROM taxonomy WHERE id = ?', (iid,))
-            cur.execute('DELETE FROM colors WHERE id = ?', (iid,))
+            cur.execute('DELETE FROM colours WHERE id = ?', (iid,))
             cur.execute('DELETE FROM sequences WHERE id = ?', (iid,))
         conn.commit()
     return len(to_delete)
@@ -277,6 +299,7 @@ def build_placement_warning_rows(classification_tsv: str, novelty_tsv: Optional[
         best = row.get('best')
         identity = row.get('identity')
         confidence = row.get('confidence')
+        query_coverage = row.get('query_coverage')
         tax = row.get('tax')
         nov = novelty_by_qid.get(qid, {})
         nearest_identity = nov.get('nearest_identity')
@@ -287,6 +310,8 @@ def build_placement_warning_rows(classification_tsv: str, novelty_tsv: Optional[
             flags.append('LOW_CLASSIFICATION_IDENTITY')
         if isinstance(confidence, (int, float)) and float(confidence) < 0.8:
             flags.append('LOW_CONFIDENCE')
+        if isinstance(query_coverage, (int, float)) and float(query_coverage) < 90.0:
+            flags.append('LOW_QUERY_COVERAGE')
         if isinstance(nearest_identity, (int, float)) and float(nearest_identity) < 97.0:
             flags.append('LOW_NEAREST_IDENTITY')
             if tax not in (None, '', 'NA'):
@@ -318,7 +343,26 @@ def write_placement_warning_tsv(path: str | Path, warning_rows):
                 f"{row['classification_confidence']}\t{row['nearest_identity']}\t{row['nearest_hit']}\t{row['flags']}\n"
             )
     return str(p)
-    return str(p)
+
+
+def _taxonomy_agreement(query_taxonomy, comparison_taxonomy) -> tuple[str, str]:
+    """Return deepest shared rank and first explicit conflict for two lineages."""
+    ranks = [('d', 'domain'), ('p', 'phylum'), ('c', 'class'), ('o', 'order'),
+             ('f', 'family'), ('g', 'genus'), ('s', 'species')]
+    query = parse_taxon_string(str(query_taxonomy or ''))
+    comparison = parse_taxon_string(str(comparison_taxonomy or ''))
+    if not query or not comparison:
+        return 'NA', 'NA'
+    deepest = 'none'
+    for key, name in ranks:
+        left = normalise_taxon_name(query.get(key, ''))
+        right = normalise_taxon_name(comparison.get(key, ''))
+        if not left or not right:
+            continue
+        if left != right:
+            return deepest, f'{name}:{query.get(key)}!={comparison.get(key)}'
+        deepest = name
+    return deepest, 'none'
 
 
 def build_sequence_assessment_rows(
@@ -365,6 +409,52 @@ def build_sequence_assessment_rows(
         if mapped:
             class_by_id[mapped] = row
 
+    # Earlier partner submissions are re-assessed on every Performance Review run. Their
+    # authoritative GTDB classification is loaded from the project DB because
+    # the current classification file contains only the newest submission.
+    if run_id_set:
+        try:
+            placeholders = ','.join('?' for _ in run_id_set)
+            with db.connect() as conn:
+                taxonomy_rows = conn.execute(
+                    f"SELECT id, taxonomy, confidence FROM taxonomy "
+                    f"WHERE id IN ({placeholders}) ORDER BY rowid",
+                    tuple(sorted(run_id_set)),
+                ).fetchall()
+                distance_rows = conn.execute(
+                    f"SELECT id, nearest, identity FROM distances "
+                    f"WHERE id IN ({placeholders}) ORDER BY rowid",
+                    tuple(sorted(run_id_set)),
+                ).fetchall()
+            db_classification = {}
+            for sid, taxonomy, confidence in taxonomy_rows:
+                entry = db_classification.setdefault(str(sid), {'qid': str(sid)})
+                if taxonomy not in (None, ''):
+                    entry['tax'] = taxonomy
+                if confidence is not None:
+                    entry['confidence'] = confidence
+            for sid, nearest, identity in distance_rows:
+                entry = db_classification.setdefault(str(sid), {'qid': str(sid)})
+                if nearest not in (None, ''):
+                    entry['best'] = nearest
+                if identity is not None:
+                    entry['identity'] = identity
+            for sid, entry in db_classification.items():
+                class_by_id.setdefault(sid, entry)
+            evidence_rows = db.get_classification_evidence(run_id_set)
+            evidence_by_id = {}
+            for (sid, _ref_db), evidence in evidence_rows.items():
+                evidence_by_id.setdefault(sid, evidence)
+            for sid, evidence in evidence_by_id.items():
+                class_by_id.setdefault(sid, {'qid': sid}).update({
+                    key: evidence.get(key) for key in (
+                        'query_coverage', 'target_coverage', 'alignment_length', 'query_length',
+                        'target_length', 'mismatches', 'gaps',
+                    )
+                })
+        except Exception:
+            pass
+
     novelty_by_id = {}
     try:
         with open(novelty_metrics_tsv) as fh:
@@ -384,36 +474,42 @@ def build_sequence_assessment_rows(
                 baseline_source = row.get('BaselineDensitySource') or ''
                 baseline_available = baseline_source not in ('', 'none', 'NA')
 
-                def primary_val(baseline_name, fallback_name, default='NA'):
+                def baseline_val(name, default='NA'):
                     if baseline_available:
-                        got = row.get(baseline_name)
+                        got = row.get(name)
                         if got not in (None, ''):
                             return got
-                    return val(fallback_name, default=default)
+                    return default
 
                 novelty_by_id[qid] = {
-                    'nearest_identity': primary_val('BaselineNearestIdentity', 'NearestIdentity'),
-                    'nearest_hit': primary_val('BaselineNearestHit', 'NearestHit'),
-                    'novel': primary_val('BaselineNovel', 'Novel'),
-                    'matches_ge_99': primary_val('BaselineMatchesGE99', 'MatchesGE99'),
-                    'matches_ge_97': primary_val('BaselineMatchesGE97', 'MatchesGE97'),
-                    'matches_ge_95': primary_val('BaselineMatchesGE95', 'MatchesGE95'),
-                    'novelty_score': primary_val('BaselineNoveltyScore', 'NoveltyScore'),
-                    'crowding': primary_val('BaselineCrowding', 'Crowding'),
-                    'sequencing_priority': primary_val('BaselineSequencingPriority', 'SequencingPriority'),
-                    'density_source': primary_val('BaselineDensitySource', 'DensitySource'),
-                    'all_known_nearest_identity': val('AllKnownNearestIdentity', 'NearestIdentity'),
-                    'all_known_nearest_hit': val('AllKnownNearestHit', 'NearestHit'),
-                    'all_known_novel': val('AllKnownNovel', 'Novel'),
-                    'all_known_matches_ge_99': val('AllKnownMatchesGE99', 'MatchesGE99'),
-                    'all_known_matches_ge_97': val('AllKnownMatchesGE97', 'MatchesGE97'),
-                    'all_known_matches_ge_95': val('AllKnownMatchesGE95', 'MatchesGE95'),
-                    'all_known_novelty_score': val('AllKnownNoveltyScore', 'NoveltyScore'),
-                    'all_known_crowding': val('AllKnownCrowding', 'Crowding'),
-                    'all_known_sequencing_priority': val('AllKnownSequencingPriority', 'SequencingPriority'),
-                    'all_known_density_source': val('AllKnownDensitySource', 'DensitySource'),
+                    'nearest_identity': baseline_val('BaselineNearestIdentity'),
+                    'nearest_hit': baseline_val('BaselineNearestHit'),
+                    'nearest_query_coverage': baseline_val('BaselineNearestQueryCoverage'),
+                    'nearest_alignment_length': baseline_val('BaselineNearestAlignmentLength'),
+                    'novel': baseline_val('BaselineNovel'),
+                    'matches_ge_99': baseline_val('BaselineMatchesGE99'),
+                    'matches_ge_97': baseline_val('BaselineMatchesGE97'),
+                    'matches_ge_95': baseline_val('BaselineMatchesGE95'),
+                    'novelty_score': baseline_val('BaselineNoveltyScore'),
+                    'crowding': baseline_val('BaselineCrowding'),
+                    'sequencing_priority': baseline_val('BaselineSequencingPriority'),
+                    'density_source': baseline_val('BaselineDensitySource'),
+                    'project_nearest_identity': val('ProjectNearestIdentity'),
+                    'project_nearest_hit': val('ProjectNearestHit'),
+                    'project_nearest_query_coverage': val('ProjectNearestQueryCoverage'),
+                    'project_nearest_alignment_length': val('ProjectNearestAlignmentLength'),
+                    'project_novel': val('ProjectNovel'),
+                    'project_matches_ge_99': val('ProjectMatchesGE99'),
+                    'project_matches_ge_97': val('ProjectMatchesGE97'),
+                    'project_matches_ge_95': val('ProjectMatchesGE95'),
+                    'project_novelty_score': val('ProjectNoveltyScore'),
+                    'project_crowding': val('ProjectCrowding'),
+                    'project_sequencing_priority': val('ProjectSequencingPriority'),
+                    'project_density_source': val('ProjectDensitySource'),
                     'reference_nearest_identity': val('ReferenceNearestIdentity'),
                     'reference_nearest_hit': val('ReferenceNearestHit'),
+                    'reference_nearest_query_coverage': val('ReferenceNearestQueryCoverage'),
+                    'reference_nearest_alignment_length': val('ReferenceNearestAlignmentLength'),
                     'reference_novel': val('ReferenceNovel'),
                     'reference_matches_ge_99': val('ReferenceMatchesGE99'),
                     'reference_matches_ge_97': val('ReferenceMatchesGE97'),
@@ -424,14 +520,31 @@ def build_sequence_assessment_rows(
                     'reference_density_source': val('ReferenceDensitySource'),
                     'partner_id': val('PartnerID'),
                     'selected_for_genome_sequencing': val('SelectedForGenomeSequencing'),
-                    'nearest_selected_genome_hit': val('NearestSelectedGenomeHit'),
-                    'nearest_selected_genome_identity': val('NearestSelectedGenomeIdentity'),
-                    'selected_genome_matches_ge_99': val('SelectedGenomeMatchesGE99'),
-                    'selected_genome_matches_ge_97': val('SelectedGenomeMatchesGE97'),
-                    'selected_genome_matches_ge_95': val('SelectedGenomeMatchesGE95'),
-                    'clade_already_selected_for_genome_sequencing': val('CladeAlreadySelectedForGenomeSequencing'),
-                    'genome_sequencing_adjusted_novelty_score': val('GenomeSequencingAdjustedNoveltyScore'),
-                    'genome_sequencing_adjusted_priority': val('GenomeSequencingAdjustedPriority'),
+                    'already_sequenced': val('GenomeAlreadySequenced'),
+                    'nearest_genome_hit': val('NearestGenomeHit'),
+                    'nearest_genome_identity': val('NearestGenomeIdentity'),
+                    'genome_collection_matches_ge_99': val('GenomeCollectionMatchesGE99'),
+                    'genome_collection_matches_ge_97': val('GenomeCollectionMatchesGE97'),
+                    'genome_collection_matches_ge_95': val('GenomeCollectionMatchesGE95'),
+                    'related_genome_clade_ge_97': val('RelatedGenomeCladeGE97'),
+                    'genome_committed_count_same_species': val(
+                        'CommittedGenomeCountSameAssessmentSpecies',
+                        default=val('AvailableGenomeCountSameAssessmentSpecies',
+                                    default=val('GenomeCommittedCountSameAssessmentSpecies')),
+                    ),
+                    'genome_available_count_same_species': val(
+                        'BaselineGenomeCountSameAssessmentSpecies',
+                        default=val('GenomeAvailableCountSameAssessmentSpecies'),
+                    ),
+                    'genome_selected_count_same_species': val(
+                        'SequencedPartnerGenomeCountSameAssessmentSpecies',
+                        default=val('GenomeSelectedCountSameAssessmentSpecies'),
+                    ),
+                    'genome_pending_count_same_species': val(
+                        'SelectedPendingGenomeCountSameAssessmentSpecies',
+                    ),
+                    'pangenome_target': val('PangenomeTarget', default='3'),
+                    'pangenome_gap': val('PangenomeGap'),
                     'genome_sequencing_metadata_source': val('GenomeSequencingMetadataSource'),
                 }
     except FileNotFoundError:
@@ -447,9 +560,9 @@ def build_sequence_assessment_rows(
         for row in novelty_by_id.values()
         if row.get('nearest_hit') not in (None, '', 'NA')
     } | {
-        str(row.get('all_known_nearest_hit'))
+        str(row.get('project_nearest_hit'))
         for row in novelty_by_id.values()
-        if row.get('all_known_nearest_hit') not in (None, '', 'NA')
+        if row.get('project_nearest_hit') not in (None, '', 'NA')
     } | {
         str(row.get('reference_nearest_hit'))
         for row in novelty_by_id.values()
@@ -487,7 +600,6 @@ def build_sequence_assessment_rows(
         n = novelty_by_id.get(iid, {})
         w = warnings_by_id.get(iid, {})
 
-        # ── Cluster info ────────────────────────────────────────────────────
         if _m2r or _r2m:
             if iid in _r2m:
                 # This sequence IS the cluster representative
@@ -512,7 +624,6 @@ def build_sequence_assessment_rows(
             cluster_size = '1'
             clustered_members = ''
 
-        # ── Tree membership ─────────────────────────────────────────────────
         if _tree is not None:
             in_tree = 'Yes' if iid in _tree else 'No'
         elif cluster_rep not in ('N/A', 'self'):
@@ -535,6 +646,12 @@ def build_sequence_assessment_rows(
         if in_tree == 'No' and cluster_rep == 'self':
             cluster_rep = 'duplicate'
 
+        baseline_hit_taxonomy = nearest_meta.get(str(n.get('nearest_hit')), {}).get('taxonomy', 'NA')
+        baseline_agreement_rank, baseline_taxonomy_conflict = _taxonomy_agreement(
+            _tax,
+            baseline_hit_taxonomy,
+        )
+
         assessment_rows.append({
             'id': iid,
             # ClassificationHit = best vsearch hit in the REFERENCE DB (GTDB/SILVA) → drives Taxonomy
@@ -542,11 +659,23 @@ def build_sequence_assessment_rows(
             'classification_hit': _best if _best is not None else 'NA',
             'classification_identity': _ident if _ident is not None else 'NA',
             'classification_confidence': _conf if _conf is not None else 'NA',
-            # NearestHit = best vsearch hit among PRELOAD sequences already in the DB → drives NoveltyScore
+            'classification_query_coverage': c.get('query_coverage', 'NA'),
+            'classification_target_coverage': c.get('target_coverage', 'NA'),
+            'classification_alignment_length': c.get('alignment_length', 'NA'),
+            'classification_query_length': c.get('query_length', 'NA'),
+            'classification_target_length': c.get('target_length', 'NA'),
+            'classification_mismatches': c.get('mismatches', 'NA'),
+            'classification_gaps': c.get('gaps', 'NA'),
+            # NearestHit = best vsearch hit among registered baseline sequences already in the DB → drives NoveltyScore
             'nearest_hit': n.get('nearest_hit', 'NA'),
             'nearest_hit_dataset': nearest_meta.get(str(n.get('nearest_hit')), {}).get('dataset', 'NA'),
-            'nearest_hit_taxonomy': nearest_meta.get(str(n.get('nearest_hit')), {}).get('taxonomy', 'NA'),
+            'nearest_hit_taxonomy': baseline_hit_taxonomy,
+            'baseline_taxonomy_agreement_rank': baseline_agreement_rank,
+            'baseline_taxonomy_conflict': baseline_taxonomy_conflict,
             'nearest_identity': n.get('nearest_identity', 'NA'),
+            'nearest_query_coverage': n.get('nearest_query_coverage', 'NA'),
+            'nearest_alignment_length': n.get('nearest_alignment_length', 'NA'),
+            'novel': n.get('novel', 'NA'),
             'matches_ge_99': n.get('matches_ge_99', 'NA'),
             'matches_ge_97': n.get('matches_ge_97', 'NA'),
             'matches_ge_95': n.get('matches_ge_95', 'NA'),
@@ -554,20 +683,26 @@ def build_sequence_assessment_rows(
             'crowding': n.get('crowding', 'NA'),
             'sequencing_priority': n.get('sequencing_priority', 'NA'),
             'density_source': n.get('density_source', 'NA'),
-            'all_known_nearest_hit': n.get('all_known_nearest_hit', 'NA'),
-            'all_known_nearest_hit_dataset': nearest_meta.get(str(n.get('all_known_nearest_hit')), {}).get('dataset', 'NA'),
-            'all_known_nearest_hit_taxonomy': nearest_meta.get(str(n.get('all_known_nearest_hit')), {}).get('taxonomy', 'NA'),
-            'all_known_nearest_identity': n.get('all_known_nearest_identity', 'NA'),
-            'all_known_matches_ge_99': n.get('all_known_matches_ge_99', 'NA'),
-            'all_known_matches_ge_97': n.get('all_known_matches_ge_97', 'NA'),
-            'all_known_matches_ge_95': n.get('all_known_matches_ge_95', 'NA'),
-            'all_known_novelty_score': n.get('all_known_novelty_score', 'NA'),
-            'all_known_crowding': n.get('all_known_crowding', 'NA'),
-            'all_known_sequencing_priority': n.get('all_known_sequencing_priority', 'NA'),
-            'all_known_density_source': n.get('all_known_density_source', 'NA'),
+            'project_nearest_hit': n.get('project_nearest_hit', 'NA'),
+            'project_nearest_hit_dataset': nearest_meta.get(str(n.get('project_nearest_hit')), {}).get('dataset', 'NA'),
+            'project_nearest_hit_taxonomy': nearest_meta.get(str(n.get('project_nearest_hit')), {}).get('taxonomy', 'NA'),
+            'project_nearest_identity': n.get('project_nearest_identity', 'NA'),
+            'project_nearest_query_coverage': n.get('project_nearest_query_coverage', 'NA'),
+            'project_nearest_alignment_length': n.get('project_nearest_alignment_length', 'NA'),
+            'project_novel': n.get('project_novel', 'NA'),
+            'project_matches_ge_99': n.get('project_matches_ge_99', 'NA'),
+            'project_matches_ge_97': n.get('project_matches_ge_97', 'NA'),
+            'project_matches_ge_95': n.get('project_matches_ge_95', 'NA'),
+            'project_novelty_score': n.get('project_novelty_score', 'NA'),
+            'project_crowding': n.get('project_crowding', 'NA'),
+            'project_sequencing_priority': n.get('project_sequencing_priority', 'NA'),
+            'project_density_source': n.get('project_density_source', 'NA'),
             'reference_nearest_hit': reference_hit,
             'reference_nearest_hit_taxonomy': reference_hit_taxonomy,
             'reference_nearest_identity': n.get('reference_nearest_identity', 'NA'),
+            'reference_nearest_query_coverage': n.get('reference_nearest_query_coverage', 'NA'),
+            'reference_nearest_alignment_length': n.get('reference_nearest_alignment_length', 'NA'),
+            'reference_novel': n.get('reference_novel', 'NA'),
             'reference_matches_ge_99': n.get('reference_matches_ge_99', 'NA'),
             'reference_matches_ge_97': n.get('reference_matches_ge_97', 'NA'),
             'reference_matches_ge_95': n.get('reference_matches_ge_95', 'NA'),
@@ -577,14 +712,19 @@ def build_sequence_assessment_rows(
             'reference_density_source': n.get('reference_density_source', 'NA'),
             'partner_id': n.get('partner_id', 'NA'),
             'selected_for_genome_sequencing': n.get('selected_for_genome_sequencing', 'NA'),
-            'nearest_selected_genome_hit': n.get('nearest_selected_genome_hit', 'NA'),
-            'nearest_selected_genome_identity': n.get('nearest_selected_genome_identity', 'NA'),
-            'selected_genome_matches_ge_99': n.get('selected_genome_matches_ge_99', 'NA'),
-            'selected_genome_matches_ge_97': n.get('selected_genome_matches_ge_97', 'NA'),
-            'selected_genome_matches_ge_95': n.get('selected_genome_matches_ge_95', 'NA'),
-            'clade_already_selected_for_genome_sequencing': n.get('clade_already_selected_for_genome_sequencing', 'NA'),
-            'genome_sequencing_adjusted_novelty_score': n.get('genome_sequencing_adjusted_novelty_score', 'NA'),
-            'genome_sequencing_adjusted_priority': n.get('genome_sequencing_adjusted_priority', 'NA'),
+            'already_sequenced': n.get('already_sequenced', 'NA'),
+            'nearest_genome_hit': n.get('nearest_genome_hit', 'NA'),
+            'nearest_genome_identity': n.get('nearest_genome_identity', 'NA'),
+            'genome_collection_matches_ge_99': n.get('genome_collection_matches_ge_99', 'NA'),
+            'genome_collection_matches_ge_97': n.get('genome_collection_matches_ge_97', 'NA'),
+            'genome_collection_matches_ge_95': n.get('genome_collection_matches_ge_95', 'NA'),
+            'related_genome_clade_ge_97': n.get('related_genome_clade_ge_97', 'NA'),
+            'genome_committed_count_same_species': n.get('genome_committed_count_same_species', 'NA'),
+            'genome_available_count_same_species': n.get('genome_available_count_same_species', 'NA'),
+            'genome_selected_count_same_species': n.get('genome_selected_count_same_species', 'NA'),
+            'genome_pending_count_same_species': n.get('genome_pending_count_same_species', 'NA'),
+            'pangenome_target': n.get('pangenome_target', '3'),
+            'pangenome_gap': n.get('pangenome_gap', 'NA'),
             'genome_sequencing_metadata_source': n.get('genome_sequencing_metadata_source', 'NA'),
             'placement_flags': w.get('flags', ''),
             'in_tree': in_tree,
@@ -629,46 +769,13 @@ def _build_alt_tax_cols(
     return cols
 
 
-def write_sequence_assessment_tsv(path: str | Path, rows):
-    """Write sequence_assessment.tsv.
-
-    Column groups
-    -------------
-    Taxonomy / ClassificationHit / ClassificationIdentity / ClassificationConfidence
-        — from the primary REFERENCE DATABASE (GTDB, SILVA, etc.).
-          ClassificationHit is the specific reference accession vsearch matched.
-
-    NearestHit / NearestHitDataset / NearestHitTaxonomy / NearestIdentity / MatchesGE* / NoveltyScore / Crowding / SequencingPriority
-        — from the baseline/cultured sequences already stored in the DB
-          when a baseline pool is configured, otherwise from the all-known pool.
-          NearestHit is the closest sequence YOU have previously submitted.
-          These columns drive the novelty assessment.
-
-    AllKnownNearestHit / AllKnownNearestIdentity / AllKnownNoveltyScore / ...
-        — same novelty metrics against all non-current datasets stored in
-          the DB, so cultured-baseline novelty can be compared to wider
-          project-level novelty.
-
-    ReferenceNearestHit / ReferenceNearestIdentity / ReferenceNoveltyScore / ...
-        — same nearest-hit and density metrics against the selected external
-          reference FASTA, usually the main GTDB reference supplied with --ref.
-          This separates "closest cultured/project isolate" from "closest
-          taxonomic reference sequence".
-
-    PartnerID / SelectedForGenomeSequencing / NearestSelectedGenomeHit / ...
-        — rolling partner metadata and selected-for-WGS neighbourhood metrics.
-          If a nearby sequence at >=97% identity has already been selected for
-          WGS, the clade is marked as already represented.
-
-    Taxonomy_<DB> / ClassificationHit_<DB> / Identity_<DB> / Confidence_<DB>  (repeated per alt-ref DB)
-        — same information from each additional reference database supplied via
-          --alt-ref / --alt-taxa.  The <DB> suffix is the database name derived
-          from the filename or --alt-ref-name.
-    """
-    import re as _re
+def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: str = 'GTDB'):
+    """Write the complete, component-based per-isolate assessment audit."""
     p = Path(path)
-
-    # Discover alt-db column groups from the first row that contains them
+    rows = list(rows)
+    label = 'GTDB' if 'gtdb' in str(assessment_db_name).lower() else ''.join(
+        char if char.isalnum() else '_' for char in str(assessment_db_name or 'Assessment')
+    ).strip('_') or 'Assessment'
     alt_ref_safes: List[str] = []
     include_mwl = False
     for row in rows:
@@ -679,172 +786,106 @@ def write_sequence_assessment_tsv(path: str | Path, rows):
         )
         include_mwl = any(k.startswith('mwl_') or k == 'evaluation_score' for k in row)
         break
+    fields = [
+        ('ID', 'id'), ('PartnerID', 'partner_id'),
+        (f'{label}Taxonomy', 'taxonomy'), (f'{label}ClassificationHit', 'classification_hit'),
+        (f'{label}ClassificationIdentity', 'classification_identity'),
+        (f'{label}ClassificationConfidence', 'classification_confidence'),
+        (f'{label}QueryCoverage', 'classification_query_coverage'),
+        (f'{label}TargetCoverage', 'classification_target_coverage'),
+        (f'{label}AlignmentLength', 'classification_alignment_length'),
+        (f'{label}QueryLength', 'classification_query_length'),
+        (f'{label}TargetLength', 'classification_target_length'),
+        (f'{label}Mismatches', 'classification_mismatches'),
+        (f'{label}Gaps', 'classification_gaps'),
+        ('BaselineNearestHit', 'nearest_hit'), ('BaselineNearestHitDataset', 'nearest_hit_dataset'),
+        ('BaselineNearestHitTaxonomy', 'nearest_hit_taxonomy'),
+        ('BaselineTaxonomyAgreementRank', 'baseline_taxonomy_agreement_rank'),
+        ('BaselineTaxonomyConflict', 'baseline_taxonomy_conflict'),
+        ('BaselineNearestIdentity', 'nearest_identity'), ('BaselineNovel', 'novel'),
+        ('BaselineNearestQueryCoverage', 'nearest_query_coverage'),
+        ('BaselineNearestAlignmentLength', 'nearest_alignment_length'),
+        ('BaselineMatchesGE99', 'matches_ge_99'), ('BaselineMatchesGE97', 'matches_ge_97'),
+        ('BaselineMatchesGE95', 'matches_ge_95'), ('BaselineNoveltyScore', 'novelty_score'),
+        ('BaselineCrowding', 'crowding'), ('BaselinePriority', 'sequencing_priority'),
+        ('BaselineSource', 'density_source'),
+        ('ProjectNearestHit', 'project_nearest_hit'),
+        ('ProjectNearestHitDataset', 'project_nearest_hit_dataset'),
+        ('ProjectNearestHitTaxonomy', 'project_nearest_hit_taxonomy'),
+        ('ProjectNearestIdentity', 'project_nearest_identity'), ('ProjectNovel', 'project_novel'),
+        ('ProjectNearestQueryCoverage', 'project_nearest_query_coverage'),
+        ('ProjectNearestAlignmentLength', 'project_nearest_alignment_length'),
+        ('ProjectMatchesGE99', 'project_matches_ge_99'), ('ProjectMatchesGE97', 'project_matches_ge_97'),
+        ('ProjectMatchesGE95', 'project_matches_ge_95'), ('ProjectNoveltyScore', 'project_novelty_score'),
+        ('ProjectCrowding', 'project_crowding'), ('ProjectPriority', 'project_sequencing_priority'),
+        ('ProjectSource', 'project_density_source'),
+        (f'{label}ReferenceNearestHit', 'reference_nearest_hit'),
+        (f'{label}ReferenceNearestHitTaxonomy', 'reference_nearest_hit_taxonomy'),
+        (f'{label}ReferenceNearestIdentity', 'reference_nearest_identity'),
+        (f'{label}ReferenceNearestQueryCoverage', 'reference_nearest_query_coverage'),
+        (f'{label}ReferenceNearestAlignmentLength', 'reference_nearest_alignment_length'),
+        (f'{label}ReferenceNovel', 'reference_novel'),
+        (f'{label}ReferenceMatchesGE99', 'reference_matches_ge_99'),
+        (f'{label}ReferenceMatchesGE97', 'reference_matches_ge_97'),
+        (f'{label}ReferenceMatchesGE95', 'reference_matches_ge_95'),
+        (f'{label}ReferenceNoveltyScore', 'reference_novelty_score'),
+        (f'{label}ReferenceCrowding', 'reference_crowding'),
+        (f'{label}ReferenceSource', 'reference_density_source'),
+        ('SelectedForGenomeSequencing', 'selected_for_genome_sequencing'),
+        ('GenomeAlreadySequenced', 'already_sequenced'),
+        ('NearestGenomeHit', 'nearest_genome_hit'), ('NearestGenomeIdentity', 'nearest_genome_identity'),
+        ('GenomeCollectionMatchesGE99', 'genome_collection_matches_ge_99'),
+        ('GenomeCollectionMatchesGE97', 'genome_collection_matches_ge_97'),
+        ('GenomeCollectionMatchesGE95', 'genome_collection_matches_ge_95'),
+        ('RelatedGenomeCladeGE97', 'related_genome_clade_ge_97'),
+        ('BaselineGenomesSameAssessmentSpecies', 'genome_available_count_same_species'),
+        ('SequencedPartnerGenomesSameAssessmentSpecies', 'genome_selected_count_same_species'),
+        ('SelectedPendingGenomesSameAssessmentSpecies', 'genome_pending_count_same_species'),
+        ('CommittedGenomesSameAssessmentSpecies', 'genome_committed_count_same_species'),
+        ('PangenomeTarget', 'pangenome_target'), ('PangenomeGap', 'pangenome_gap'),
+        ('GenomeCollectionSource', 'genome_sequencing_metadata_source'),
+        ('MarkerQCClass', 'marker_qc_class'),
+        ('MarkerQCRecommendation', 'marker_qc_recommendation'),
+        ('MarkerManualReviewStatus', 'marker_manual_review_status'),
+        ('MarkerQCFlag', 'marker_qc_flag'),
+        ('MarkerQCReasons', 'marker_qc_reasons'),
+        ('MarkerSourceManifest', 'marker_source_manifest'),
+        ('ChimeraCall', 'chimera_call'), ('UCHIMEScore', 'chimera_score'),
+    ]
+    if include_mwl:
+        fields.extend([
+            ('MWLMatch', 'mwl_match'), ('MWLID', 'mwl_id'),
+            ('MWLMatchedRank', 'mwl_matched_rank'), ('MWLMatchedTaxon', 'mwl_matched_taxon'),
+            ('MWLTaxonomicScore', 'mwl_taxonomic_score'), ('MWLIdentity', 'mwl_identity'),
+            ('MWLScore', 'mwl_score'), ('MWLRole', 'mwl_role'),
+        ])
+    fields.extend([
+        ('SequencingSetID', 'sequencing_set_id'), ('SequencingSetRole', 'sequencing_set_role'),
+        ('SequencingSetRank', 'sequencing_set_rank'), ('SequencingSetReason', 'sequencing_set_reason'),
+        ('SelectionGroupBasis', 'selection_group_basis'), ('SelectionGroupTaxon', 'selection_group_taxon'),
+        ('NovelLookingClade', 'novel_looking_clade'),
+        ('PhyloIsolation', 'phylo_isolation'), ('LocalNeighbourhoodFigure', 'local_neighbourhood_figure'),
+        ('LocalPairwisePidentTable', 'local_pairwise_pident_table'),
+        ('TreeContextLeafCount', 'tree_context_leaf_count'),
+        ('AssessedSequencesInTreeContext', 'assessed_sequences_in_tree_context'),
+        ('InTree', 'in_tree'), ('ClusterRepresentative', 'cluster_representative'),
+        ('ClusterSize', 'cluster_size'), ('ClusteredMembers', 'clustered_members'),
+        ('PlacementFlags', 'placement_flags'),
+    ])
+    for safe in alt_ref_safes:
+        fields.extend([
+            (f'Taxonomy_{safe}', f'alt_tax_{safe}'),
+            (f'ClassificationHit_{safe}', f'alt_class_hit_{safe}'),
+            (f'Identity_{safe}', f'alt_ident_{safe}'),
+            (f'Confidence_{safe}', f'alt_conf_{safe}'),
+        ])
 
-    with open(p, 'w') as fh:
-        # ── Fixed columns ────────────────────────────────────────────────────
-        mwl_header = ''
-        if include_mwl:
-            mwl_header = (
-                '\tEvaluationScore'          # optional MWL-aware score; InvestigationScore blended with MWLScore
-                '\tMWLMatch'
-                '\tMWLID'
-                '\tMWLMatchedRank'
-                '\tMWLMatchedTaxon'
-                '\tMWLTaxonomicScore'
-                '\tMWLIdentity'
-                '\tMWLScore'
-                '\tMWLRole'
-            )
-        base_header = (
-            'ID'
-            '\tTaxonomy'                    # primary ref DB  ─┐ classification
-            '\tClassificationHit'           # ref accession    │ (reference DB)
-            '\tClassificationIdentity'      # vsearch %id      │
-            '\tClassificationConfidence'    # score 0–1       ─┘
-            '\tNearestHit'                  # preload seq ─┐ novelty
-            '\tNearestHitDataset'           # dataset label │
-            '\tNearestHitTaxonomy'          # taxonomy      │
-            '\tNearestIdentity'             # %id           │ (preload DB)
-            '\tMatchesGE99'                 # density        │
-            '\tMatchesGE97'                 #               │
-            '\tMatchesGE95'                 #              ─┘
-            '\tNoveltyScore'
-            '\tCrowding'
-            '\tSequencingPriority'
-            '\tDensitySource'
-            '\tAllKnownNearestHit'
-            '\tAllKnownNearestHitDataset'
-            '\tAllKnownNearestHitTaxonomy'
-            '\tAllKnownNearestIdentity'
-            '\tAllKnownMatchesGE99'
-            '\tAllKnownMatchesGE97'
-            '\tAllKnownMatchesGE95'
-            '\tAllKnownNoveltyScore'
-            '\tAllKnownCrowding'
-            '\tAllKnownSequencingPriority'
-            '\tAllKnownDensitySource'
-            '\tReferenceNearestHit'
-            '\tReferenceNearestHitTaxonomy'
-            '\tReferenceNearestIdentity'
-            '\tReferenceMatchesGE99'
-            '\tReferenceMatchesGE97'
-            '\tReferenceMatchesGE95'
-            '\tReferenceNoveltyScore'
-            '\tReferenceCrowding'
-            '\tReferenceSequencingPriority'
-            '\tReferenceDensitySource'
-            '\tPartnerID'
-            '\tSelectedForGenomeSequencing'
-            '\tNearestSelectedGenomeHit'
-            '\tNearestSelectedGenomeIdentity'
-            '\tSelectedGenomeMatchesGE99'
-            '\tSelectedGenomeMatchesGE97'
-            '\tSelectedGenomeMatchesGE95'
-            '\tCladeAlreadySelectedForGenomeSequencing'
-            '\tGenomeSequencingAdjustedNoveltyScore'
-            '\tGenomeSequencingAdjustedPriority'
-            '\tGenomeSequencingMetadataSource'
-            '\tPhyloIsolation'              # normalised leaf branch length (0–1); higher = more isolated in tree
-            '\tInvestigationScore'          # composite score (0–100) combining novelty + phylo isolation + density + taxonomy conflict
-            + mwl_header +
-            '\tInTree'
-            '\tClusterRepresentative'
-            '\tClusterSize'
-            '\tClusteredMembers'
-            '\tPlacementFlags'
-        )
-        # ── Alt-db columns (one group per additional reference database) ─────
-        alt_header = ''
-        for safe in alt_ref_safes:
-            alt_header += (
-                f'\tTaxonomy_{safe}'
-                f'\tClassificationHit_{safe}'
-                f'\tIdentity_{safe}'
-                f'\tConfidence_{safe}'
-            )
-        fh.write(base_header + alt_header + '\n')
-
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, 'w', newline='') as fh:
+        writer = csv.writer(fh, delimiter='\t', lineterminator='\n')
+        writer.writerow([header for header, _ in fields])
         for row in rows:
-            base = (
-                f"{row['id']}"
-                f"\t{row['taxonomy']}"
-                f"\t{row.get('classification_hit', row.get('best_hit', 'NA'))}"
-                f"\t{row['classification_identity']}"
-                f"\t{row['classification_confidence']}"
-                f"\t{row['nearest_hit']}"
-                f"\t{row.get('nearest_hit_dataset', 'NA')}"
-                f"\t{row.get('nearest_hit_taxonomy', 'NA')}"
-                f"\t{row['nearest_identity']}"
-                f"\t{row['matches_ge_99']}"
-                f"\t{row['matches_ge_97']}"
-                f"\t{row['matches_ge_95']}"
-                f"\t{row['novelty_score']}"
-                f"\t{row['crowding']}"
-                f"\t{row['sequencing_priority']}"
-                f"\t{row.get('density_source', 'NA')}"
-                f"\t{row.get('all_known_nearest_hit', 'NA')}"
-                f"\t{row.get('all_known_nearest_hit_dataset', 'NA')}"
-                f"\t{row.get('all_known_nearest_hit_taxonomy', 'NA')}"
-                f"\t{row.get('all_known_nearest_identity', 'NA')}"
-                f"\t{row.get('all_known_matches_ge_99', 'NA')}"
-                f"\t{row.get('all_known_matches_ge_97', 'NA')}"
-                f"\t{row.get('all_known_matches_ge_95', 'NA')}"
-                f"\t{row.get('all_known_novelty_score', 'NA')}"
-                f"\t{row.get('all_known_crowding', 'NA')}"
-                f"\t{row.get('all_known_sequencing_priority', 'NA')}"
-                f"\t{row.get('all_known_density_source', 'NA')}"
-                f"\t{row.get('reference_nearest_hit', 'NA')}"
-                f"\t{row.get('reference_nearest_hit_taxonomy', 'NA')}"
-                f"\t{row.get('reference_nearest_identity', 'NA')}"
-                f"\t{row.get('reference_matches_ge_99', 'NA')}"
-                f"\t{row.get('reference_matches_ge_97', 'NA')}"
-                f"\t{row.get('reference_matches_ge_95', 'NA')}"
-                f"\t{row.get('reference_novelty_score', 'NA')}"
-                f"\t{row.get('reference_crowding', 'NA')}"
-                f"\t{row.get('reference_sequencing_priority', 'NA')}"
-                f"\t{row.get('reference_density_source', 'NA')}"
-                f"\t{row.get('partner_id', 'NA')}"
-                f"\t{row.get('selected_for_genome_sequencing', 'NA')}"
-                f"\t{row.get('nearest_selected_genome_hit', 'NA')}"
-                f"\t{row.get('nearest_selected_genome_identity', 'NA')}"
-                f"\t{row.get('selected_genome_matches_ge_99', 'NA')}"
-                f"\t{row.get('selected_genome_matches_ge_97', 'NA')}"
-                f"\t{row.get('selected_genome_matches_ge_95', 'NA')}"
-                f"\t{row.get('clade_already_selected_for_genome_sequencing', 'NA')}"
-                f"\t{row.get('genome_sequencing_adjusted_novelty_score', 'NA')}"
-                f"\t{row.get('genome_sequencing_adjusted_priority', 'NA')}"
-                f"\t{row.get('genome_sequencing_metadata_source', 'NA')}"
-                f"\t{row.get('phylo_isolation', 'NA')}"
-                f"\t{row.get('investigation_score', 'NA')}"
-            )
-            if include_mwl:
-                base += (
-                    f"\t{row.get('evaluation_score', 'NA')}"
-                    f"\t{row.get('mwl_match', 'NA')}"
-                    f"\t{row.get('mwl_id', 'NA')}"
-                    f"\t{row.get('mwl_matched_rank', 'NA')}"
-                    f"\t{row.get('mwl_matched_taxon', 'NA')}"
-                    f"\t{row.get('mwl_taxonomic_score', 'NA')}"
-                    f"\t{row.get('mwl_identity', 'NA')}"
-                    f"\t{row.get('mwl_score', 'NA')}"
-                    f"\t{row.get('mwl_role', 'NA')}"
-                )
-            base += (
-                f"\t{row.get('in_tree', 'Unknown')}"
-                f"\t{row.get('cluster_representative', 'N/A')}"
-                f"\t{row.get('cluster_size', '1')}"
-                f"\t{row.get('clustered_members', '')}"
-                f"\t{row['placement_flags']}"
-            )
-            alt_part = ''
-            for safe in alt_ref_safes:
-                alt_part += (
-                    f"\t{row.get(f'alt_tax_{safe}', 'NA')}"
-                    f"\t{row.get(f'alt_class_hit_{safe}', 'NA')}"
-                    f"\t{row.get(f'alt_ident_{safe}', 'NA')}"
-                    f"\t{row.get(f'alt_conf_{safe}', 'NA')}"
-                )
-            fh.write(base + alt_part + '\n')
+            writer.writerow([row.get(key, 'NA') for _, key in fields])
     return str(p)
 
 
@@ -857,126 +898,327 @@ def _as_float(value, default=None):
         return default
 
 
-def _board_recommendation(row: dict) -> tuple[str, str]:
-    """Return a concise WGS-selection recommendation and short rationale."""
-    flags = []
-    placement_flags = str(row.get('placement_flags', '') or '')
-    adjusted_priority = row.get('genome_sequencing_adjusted_priority')
-    raw_priority = row.get('sequencing_priority', 'NA')
-    priority = adjusted_priority if adjusted_priority not in (None, '', 'NA') else raw_priority
-    selected = str(row.get('selected_for_genome_sequencing', 'NA')).lower() == 'true'
-    clade_selected = str(row.get('clade_already_selected_for_genome_sequencing', 'NA')).lower() == 'true'
-    mwl_match = str(row.get('mwl_match', 'No') or 'No')
-    baseline_identity = _as_float(row.get('nearest_identity'))
-    reference_identity = _as_float(row.get('reference_nearest_identity'))
+def _as_int(value, default=None):
+    try:
+        if value in (None, '', 'NA', 'None'):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _pool_available(row: dict, source_key: str) -> bool:
+    return str(row.get(source_key) or '').lower() not in ('', 'na', 'none')
+
+
+def _cultured_gap(row: dict) -> str:
+    identity = _as_float(row.get('nearest_identity'))
+    if not _pool_available(row, 'density_source') or identity is None:
+        return 'UNKNOWN - no cultured baseline'
+    if identity < 97.0:
+        return 'LARGE - no match >=97%'
+    if identity < 98.65:
+        return 'MODERATE - nearest 97-98.65%'
+    return 'SMALL - close match >=98.65%'
+
+
+def _project_coverage(row: dict) -> str:
+    if not _pool_available(row, 'project_density_source'):
+        return 'UNKNOWN - no project collection'
+    count = _as_int(row.get('project_matches_ge_97'), 0)
+    if count == 0:
+        return 'UNCOVERED - 0 neighbours >=97%'
+    if count <= 3:
+        return f'SPARSE - {count} neighbour(s) >=97%'
+    if count <= 10:
+        return f'MODERATE - {count} neighbours >=97%'
+    return f'DENSE - {count} neighbours >=97%'
+
+
+def _reference_context(row: dict) -> str:
+    identity = _as_float(row.get('reference_nearest_identity'))
+    if not _pool_available(row, 'reference_density_source') or identity is None:
+        return 'UNKNOWN - no external reference comparison'
+    if identity < 94.5:
+        return 'HIGH DIVERGENCE - <94.5%'
+    if identity < 98.65:
+        return 'MODERATE DIVERGENCE - 94.5-98.65%'
+    return 'CLOSE REFERENCE - >=98.65%'
+
+
+def _genome_coverage(row: dict) -> str:
+    if str(row.get('already_sequenced') or '').lower() == 'true':
+        return 'CURRENT ISOLATE ALREADY SEQUENCED'
+    if str(row.get('selected_for_genome_sequencing') or '').lower() == 'true':
+        return 'CURRENT ISOLATE SELECTED - GENOME PENDING'
+    committed = _as_int(row.get('genome_committed_count_same_species'))
+    target = _as_int(row.get('pangenome_target'), 3)
+    gap = _as_int(row.get('pangenome_gap'))
+    if committed is not None and gap is not None:
+        if gap <= 0:
+            return f'TARGET MET - {committed}/{target} assessment-species genomes'
+        return f'PANGENOME GAP - {committed}/{target} genomes committed; {gap} required'
+    identity = _as_float(row.get('nearest_genome_identity'))
+    if identity is None or identity <= 0:
+        return 'NOT REPRESENTED'
+    if identity >= 98.65:
+        return f'NEAR-DUPLICATE AVAILABLE GENOME - {identity:.2f}%'
+    if identity >= 97.0:
+        return f'RELATED AVAILABLE GENOME - {identity:.2f}%'
+    return f'NOT CLOSELY REPRESENTED - nearest {identity:.2f}%'
+
+
+def _evidence_quality(row: dict) -> str:
+    flags = {
+        flag.strip().upper()
+        for flag in str(row.get('placement_flags') or '').split(';')
+        if flag.strip()
+    }
     classification_identity = _as_float(row.get('classification_identity'))
+    classification_confidence = _as_float(row.get('classification_confidence'))
+    query_coverage = _as_float(row.get('classification_query_coverage'))
+    taxonomy = str(row.get('taxonomy') or '').strip().lower()
+    marker_flag = str(row.get('marker_qc_flag') or '').upper()
+    if marker_flag in {'MARKER_QC_FAILED', 'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED'}:
+        return 'LOW'
+    if marker_flag == 'MARKER_QC_REVIEW_APPROVED':
+        return 'MODERATE'
+    severe = any(
+        marker in flag
+        for flag in flags
+        for marker in ('NO_CLASSIFICATION', 'CHIMERA', 'VERY_SHORT', 'HIGH_N_CONTENT')
+    )
+    if severe or (classification_identity is not None and classification_identity < 90.0):
+        return 'LOW'
+    if query_coverage is not None and query_coverage < 80.0:
+        return 'LOW'
+    if classification_identity is None and taxonomy in ('', 'na', 'none'):
+        return 'LOW'
+    moderate = any(
+        marker in flag
+        for flag in flags
+        for marker in ('LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT')
+    )
+    if (
+        moderate
+        or (classification_identity is not None and classification_identity < 95.0)
+        or (classification_confidence is not None and classification_confidence < 0.8)
+        or (query_coverage is not None and query_coverage < 90.0)
+    ):
+        return 'MODERATE'
+    return 'HIGH'
+
+
+def build_selection_decision(row: dict) -> dict:
+    """Build transparent, categorical genome-sequencing recommendation evidence."""
+    cultured_gap = _cultured_gap(row)
+    project_coverage = _project_coverage(row)
+    reference_context = _reference_context(row)
+    genome_coverage = _genome_coverage(row)
+    evidence_quality = _evidence_quality(row)
+    selected = genome_coverage == 'CURRENT ISOLATE ALREADY SEQUENCED'
+    pending = genome_coverage == 'CURRENT ISOLATE SELECTED - GENOME PENDING'
+    pangenome_gap = _as_int(row.get('pangenome_gap'))
+    target_met = pangenome_gap == 0
+    set_role = str(row.get('sequencing_set_role') or '').upper()
+    mwl_match = str(row.get('mwl_match') or '').lower() == 'yes'
+    mwl_rank = str(row.get('mwl_matched_rank') or '').lower()
+    strong_mwl = mwl_match and mwl_rank in ('species', 's', 'genus', 'g', 'family', 'f')
+    moderate_mwl = mwl_match and mwl_rank in ('order', 'o')
+    baseline_identity = _as_float(row.get('nearest_identity'))
+    project_identity = _as_float(row.get('project_nearest_identity'))
+    reference_identity = _as_float(row.get('reference_nearest_identity'))
+
+    positive = []
+    caution = []
+    if selected:
+        caution.append('current isolate already has a genome available')
+    elif pending:
+        caution.append('current isolate is already selected; genome pending')
+    if strong_mwl:
+        matched = row.get('mwl_matched_taxon', 'NA')
+        positive.append(f'MWL target match ({matched})')
+    elif moderate_mwl:
+        positive.append(f'MWL order-level context ({row.get("mwl_matched_taxon", "NA")})')
+    if baseline_identity is not None and _pool_available(row, 'density_source') and baseline_identity < 97.0:
+        positive.append(f'no close cultured isolate ({baseline_identity:.2f}%)')
+    if project_identity is not None and _pool_available(row, 'project_density_source') and project_identity < 97.0:
+        positive.append(f'no close project isolate ({project_identity:.2f}%)')
+    if reference_identity is not None and _pool_available(row, 'reference_density_source') and reference_identity < 98.65:
+        positive.append(f'divergent from external reference ({reference_identity:.2f}%)')
+    if evidence_quality != 'HIGH':
+        caution.append(f'{evidence_quality.lower()} marker evidence')
+    if target_met:
+        caution.append('assessment-species pangenome target already met')
+    elif pangenome_gap is not None:
+        positive.append(f'{pangenome_gap} genome(s) still required for pangenome target')
+    if project_coverage.startswith('DENSE'):
+        caution.append('dense prior project neighbourhood')
+    if cultured_gap.startswith('SMALL'):
+        caution.append('close cultured-baseline match')
+    if cultured_gap.startswith('UNKNOWN') and project_coverage.startswith('UNKNOWN'):
+        caution.append('baseline and prior-project comparisons unavailable')
 
     if selected:
-        recommendation = 'Already selected'
-        flags.append('current isolate marked selected')
-    elif clade_selected:
-        recommendation = 'Deprioritise - clade represented'
-        flags.append('nearby selected genome >=97% 16S identity')
-    elif placement_flags:
-        recommendation = 'Review before selection'
-        flags.append(f'placement flags: {placement_flags}')
-    elif priority == 'HIGH':
-        recommendation = 'Strong candidate'
-    elif priority == 'MEDIUM':
-        recommendation = 'Secondary candidate'
-    elif mwl_match == 'Yes':
-        recommendation = 'Review MWL candidate'
+        decision = 'ALREADY SEQUENCED'
+    elif pending:
+        decision = 'ALREADY SELECTED - GENOME PENDING'
+    elif evidence_quality != 'HIGH':
+        decision = 'REVIEW BEFORE SELECTION'
+    elif set_role == 'PRIMARY':
+        decision = 'PRIORITISE - SET PRIMARY'
+    elif set_role == 'BACKUP':
+        decision = 'RESERVE - SET BACKUP'
+    elif set_role == 'DIVERSITY_CANDIDATE':
+        decision = 'SECONDARY - STRAIN DIVERSITY'
+    elif target_met:
+        decision = 'LOWER PRIORITY - TARGET MET'
+    elif set_role == 'ALTERNATE':
+        decision = 'SECONDARY CANDIDATE'
+    elif strong_mwl or len(positive) >= 2:
+        decision = 'STRONG CANDIDATE'
+    elif positive:
+        decision = 'SECONDARY CANDIDATE'
+    elif cultured_gap.startswith('SMALL') and project_coverage.startswith(('MODERATE', 'DENSE')):
+        decision = 'LOWER PRIORITY - LIMITED ADDED VALUE'
+    elif cultured_gap.startswith('UNKNOWN') and project_coverage.startswith('UNKNOWN'):
+        decision = 'REVIEW BEFORE SELECTION'
     else:
-        recommendation = 'Lower priority'
+        decision = 'SECONDARY CANDIDATE'
 
-    if mwl_match == 'Yes':
-        matched = row.get('mwl_matched_taxon', 'NA')
-        rank = row.get('mwl_matched_rank', 'NA')
-        flags.append(f'MWL match {rank}:{matched}')
-    if baseline_identity is not None:
-        flags.append(f'baseline nearest {baseline_identity:.2f}%')
-    if reference_identity is not None:
-        flags.append(f'reference nearest {reference_identity:.2f}%')
-    if classification_identity is not None and classification_identity < 95.0:
-        flags.append(f'low taxonomy identity {classification_identity:.2f}%')
+    reasons = positive[:3] + caution[:2]
+    if not reasons:
+        reasons.append('no strong novelty or redundancy signal')
+    return {
+        'decision': decision,
+        'evidence_quality': evidence_quality,
+        'cultured_gap': cultured_gap,
+        'project_coverage': project_coverage,
+        'reference_context': reference_context,
+        'genome_coverage': genome_coverage,
+        'decision_reason': '; '.join(reasons),
+    }
 
-    return recommendation, '; '.join(flags) if flags else 'No major flags'
+
+def _board_recommendation(row: dict) -> tuple[str, str]:
+    """Compatibility helper returning the transparent decision and rationale."""
+    support = build_selection_decision(row)
+    return support['decision'], support['decision_reason']
 
 
-def write_selection_summary_tsv(path: str | Path, rows):
-    """Write a concise SAB-facing WGS selection summary.
-
-    This is intentionally much smaller than sequence_assessment.tsv. It keeps
-    the evidence needed for a selection discussion while leaving the full audit
-    trail in the main assessment table.
-    """
+def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str = 'GTDB'):
+    """Write the decision-facing table while retaining auditable evidence."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    label = 'GTDB' if 'gtdb' in str(assessment_db_name).lower() else ''.join(
+        char if char.isalnum() else '_' for char in str(assessment_db_name or 'Assessment')
+    ).strip('_') or 'Assessment'
     headers = [
         'SequenceID',
         'PartnerID',
+        'SelectedForGenomeSequencing',
+        'GenomeAlreadySequenced',
         'Recommendation',
-        'AdjustedPriority',
-        'AdjustedNoveltyScore',
-        'RawNoveltyPriority',
-        'BaselineNearestIdentity',
+        'SequencingSetID',
+        'SequencingSetRole',
+        'SequencingSetRank',
+        'EvidenceQuality',
+        'MarkerQC',
+        'MarkerReview',
+        f'{label}Taxonomy',
+        f'{label}ClassificationIdentity',
+        f'{label}QueryCoverage',
+        'CulturedGap',
         'BaselineNearestHit',
-        'BaselineNearestHitTaxonomy',
-        'AllKnownNearestIdentity',
-        'ReferenceNearestIdentity',
-        'ReferenceNearestHit',
-        'Taxonomy',
-        'ClassificationIdentity',
-        'MWLMatch',
+        'BaselineNearestIdentity',
+        'BaselineNearestQueryCoverage',
+        'BaselineTaxonomyAgreementRank',
+        'BaselineTaxonomyConflict',
+        'BaselineNoveltyScore',
+        'ProjectCoverage',
+        'ProjectNearestIdentity',
+        'ProjectNearestQueryCoverage',
+        'ProjectCloseNeighboursGE97',
+        'ProjectNoveltyScore',
+        f'{label}ReferenceContext',
+        f'{label}ReferenceNearestIdentity',
+        f'{label}ReferenceNearestQueryCoverage',
         'MWLMatchedRank',
         'MWLMatchedTaxon',
         'MWLScore',
-        'SelectedForGenomeSequencing',
-        'CladeAlreadySelectedForGenomeSequencing',
-        'NearestSelectedGenomeHit',
-        'NearestSelectedGenomeIdentity',
-        'InTree',
-        'ClusterRepresentative',
-        'ClusterSize',
-        'KeyRationale',
+        'BaselineGenomesSameSpecies',
+        'SequencedPartnerGenomesSameSpecies',
+        'SelectedPendingGenomesSameSpecies',
+        'CommittedGenomesSameSpecies',
+        'PangenomeTarget',
+        'PangenomeGap',
+        'GenomeCoverage',
+        'LocalTreeFigure',
+        'RecommendationReason',
     ]
     with open(p, 'w') as fh:
         fh.write('\t'.join(headers) + '\n')
-        for row in rows:
-            recommendation, rationale = _board_recommendation(row)
-            adjusted_priority = row.get('genome_sequencing_adjusted_priority')
-            if adjusted_priority in (None, '', 'NA'):
-                adjusted_priority = row.get('sequencing_priority', 'NA')
-            adjusted_score = row.get('genome_sequencing_adjusted_novelty_score')
-            if adjusted_score in (None, '', 'NA'):
-                adjusted_score = row.get('novelty_score', 'NA')
+        prepared = [(build_selection_decision(row), row) for row in rows]
+        decision_order = {
+            'PRIORITISE - SET PRIMARY': 0,
+            'RESERVE - SET BACKUP': 1,
+            'STRONG CANDIDATE': 2,
+            'SECONDARY - STRAIN DIVERSITY': 3,
+            'SECONDARY CANDIDATE': 4,
+            'REVIEW BEFORE SELECTION': 5,
+            'LOWER PRIORITY - LIMITED ADDED VALUE': 6,
+            'LOWER PRIORITY - TARGET MET': 7,
+            'ALREADY SELECTED - GENOME PENDING': 8,
+            'ALREADY SEQUENCED': 9,
+        }
+        prepared.sort(key=lambda item: (
+            decision_order.get(item[0]['decision'], 99),
+            str(item[1].get('partner_id', '')),
+            str(item[1].get('id', '')),
+        ))
+        for support, row in prepared:
             values = [
                 row.get('id', 'NA'),
                 row.get('partner_id', 'NA'),
-                recommendation,
-                adjusted_priority,
-                adjusted_score,
-                row.get('sequencing_priority', 'NA'),
-                row.get('nearest_identity', 'NA'),
-                row.get('nearest_hit', 'NA'),
-                row.get('nearest_hit_taxonomy', 'NA'),
-                row.get('all_known_nearest_identity', 'NA'),
-                row.get('reference_nearest_identity', 'NA'),
-                row.get('reference_nearest_hit', 'NA'),
+                row.get('selected_for_genome_sequencing', 'NA'),
+                row.get('already_sequenced', 'NA'),
+                support['decision'],
+                row.get('sequencing_set_id', 'NA'),
+                row.get('sequencing_set_role', 'NA'),
+                row.get('sequencing_set_rank', 'NA'),
+                support['evidence_quality'],
+                row.get('marker_qc_class', 'QUALITY_UNVERIFIED'),
+                row.get('marker_manual_review_status', 'NOT_REVIEWED'),
                 row.get('taxonomy', 'NA'),
                 row.get('classification_identity', 'NA'),
-                row.get('mwl_match', 'NA'),
+                row.get('classification_query_coverage', 'NA'),
+                support['cultured_gap'],
+                row.get('nearest_hit', 'NA'),
+                row.get('nearest_identity', 'NA'),
+                row.get('nearest_query_coverage', 'NA'),
+                row.get('baseline_taxonomy_agreement_rank', 'NA'),
+                row.get('baseline_taxonomy_conflict', 'NA'),
+                row.get('novelty_score', 'NA'),
+                support['project_coverage'],
+                row.get('project_nearest_identity', 'NA'),
+                row.get('project_nearest_query_coverage', 'NA'),
+                row.get('project_matches_ge_97', 'NA'),
+                row.get('project_novelty_score', 'NA'),
+                support['reference_context'],
+                row.get('reference_nearest_identity', 'NA'),
+                row.get('reference_nearest_query_coverage', 'NA'),
                 row.get('mwl_matched_rank', 'NA'),
                 row.get('mwl_matched_taxon', 'NA'),
                 row.get('mwl_score', 'NA'),
-                row.get('selected_for_genome_sequencing', 'NA'),
-                row.get('clade_already_selected_for_genome_sequencing', 'NA'),
-                row.get('nearest_selected_genome_hit', 'NA'),
-                row.get('nearest_selected_genome_identity', 'NA'),
-                row.get('in_tree', 'Unknown'),
-                row.get('cluster_representative', 'N/A'),
-                row.get('cluster_size', '1'),
-                rationale,
+                row.get('genome_available_count_same_species', 'NA'),
+                row.get('genome_selected_count_same_species', 'NA'),
+                row.get('genome_pending_count_same_species', 'NA'),
+                row.get('genome_committed_count_same_species', 'NA'),
+                row.get('pangenome_target', 'NA'),
+                row.get('pangenome_gap', 'NA'),
+                support['genome_coverage'],
+                row.get('local_neighbourhood_figure', 'NA'),
+                support['decision_reason'],
             ]
             safe = [str(v if v is not None else 'NA').replace('\t', ' ').replace('\n', ' ') for v in values]
             fh.write('\t'.join(safe) + '\n')
@@ -984,7 +1226,7 @@ def write_selection_summary_tsv(path: str | Path, rows):
 
 
 def write_baseline_hits_tsv(path: str | Path, rows):
-    """Write a concise nearest-baseline hit report for evaluated sequences."""
+    """Write a concise nearest-baseline hit report for assessed sequences."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, 'w') as fh:

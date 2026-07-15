@@ -1,14 +1,14 @@
 """
-cluster_report.py — Cluster-level summarisation and per-cluster detail files.
+cluster_report.py — Cluster-level summarisation and consolidated membership reporting.
 
-After `branchmanager run --collapse`, multiple sequences are grouped into clusters
+After `branchmanager performance-review --collapse`, multiple sequences are grouped into clusters
 (representatives + members).  This module:
 
   1. Aggregates per-sequence assessment rows into *cluster-level summaries*
      (cluster_summary.tsv) so humans can prioritise whole groups at a glance.
 
-  2. Writes per-cluster detail CSV files (clusters/<rep_id>.csv) containing
-     every member's individual metrics, including backup rank.
+  2. Writes one cluster-membership CSV (clusters.csv) containing every
+     cluster and every member, including backup rank.
 
   3. Computes a *phylogenetic isolation* score from the Newick tree using the
      leaf's own branch length as a proxy for how much unique evolution it
@@ -19,13 +19,13 @@ After `branchmanager run --collapse`, multiple sequences are grouped into cluste
        • NoveltyScore       (sequence-similarity distance from known DB)
        • PhyloIsolation     (branch-length isolation in the tree)
        • TaxonomyConflict   (alt-ref DBs disagree on assignment)
-       • NeighborhoodSparsity (density counts at 97%/99%)
+       • NeighbourhoodSparsity (density counts at 97%/99%)
 
   5. Ranks **backup candidates** within each cluster so that if the primary
      candidate cannot be genome-sequenced (DNA quality failure, PCR dropout,
      chimera confirmed, etc.) the user immediately knows which sequence to
      try next.  Written to backup_candidates.tsv (wide format, one row per
-     primary) and embedded in each per-cluster CSV.
+     primary) and embedded in the consolidated clusters.csv.
 
 Suggested additional analyses (see docstring at bottom of file).
 """
@@ -39,9 +39,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Minimal Newick parser — extract (leaf_name, own_branch_length) pairs
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _tokenise(nwk: str) -> list:
     """Return a flat list of tokens from a Newick string."""
@@ -154,9 +152,7 @@ def compute_phylogenetic_isolation(tree_path: str) -> Dict[str, float]:
     return {k: round(v / max_bl, 6) for k, v in leaf_branches.items()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Composite investigation score
-# ─────────────────────────────────────────────────────────────────────────────
 
 def compute_investigation_composite(
     novelty_score: float,
@@ -172,7 +168,7 @@ def compute_investigation_composite(
     -------------------
     • NoveltyScore (30 pts max)  — already encodes distance + density
     • PhyloIsolation (25 pts max) — uniqueness in the evolutionary tree
-    • NeighborhoodSparsity (25 pts max) — how many near-identical seqs exist
+    • NeighbourhoodSparsity (25 pts max) — how many near-identical seqs exist
     • TaxonomyConflict (10 pts) — disagreement between ref DBs signals ambiguity
     • DistanceBonus (10 pts) — raw sequence distance from nearest known seq
 
@@ -238,9 +234,7 @@ def _safe_int(val, default: int = 0) -> int:
         return default
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Cluster aggregation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _taxonomy_consensus(taxonomies: List[str]) -> Tuple[str, float, str]:
     """Return (consensus_taxonomy, agreement_fraction, mode).
@@ -286,7 +280,6 @@ def aggregate_cluster_rows(
 
     Each returned dict has the columns written by ``write_cluster_summary_tsv``.
     """
-    # ── Group rows by representative ─────────────────────────────────────────
     iso: Dict[str, float] = phylo_isolation or {}
     clusters: Dict[str, List[dict]] = {}
 
@@ -298,7 +291,6 @@ def aggregate_cluster_rows(
             rep = row['id']
         clusters.setdefault(rep, []).append(row)
 
-    # ── Aggregate per cluster ─────────────────────────────────────────────────
     cluster_rows = []
     for rep_id, members in clusters.items():
         # The representative row is the one whose id matches rep_id, or first
@@ -401,9 +393,7 @@ def aggregate_cluster_rows(
     return cluster_rows
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Writers
-# ─────────────────────────────────────────────────────────────────────────────
 
 _CLUSTER_SUMMARY_COLUMNS = [
     'ClusterID',
@@ -452,9 +442,7 @@ def write_cluster_summary_tsv(path: str | Path, cluster_rows: List[dict]) -> str
     return str(p)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Backup candidate helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _backup_rationale(row: dict, rank: int) -> str:
     """Build a short human-readable string explaining why this sequence is a backup.
@@ -593,16 +581,17 @@ def write_backup_candidates_tsv(
     return str(p)
 
 
-def write_per_cluster_csvs(
+def write_clusters_csv(
     outdir: str | Path,
     assessment_rows: List[dict],
     phylo_isolation: Optional[Dict[str, float]] = None,
     cluster_rows: Optional[List[dict]] = None,
-) -> List[str]:
-    """Write one CSV per cluster to ``outdir/clusters/<rep_id>.csv``.
+) -> str:
+    """Write all cluster members to one ``outdir/clusters.csv`` file.
 
-    Each CSV contains every sequence that belongs to the cluster (including the
-    representative), with all assessment columns plus:
+    The CSV contains every sequence in every cluster, including representatives,
+    with all assessment columns plus:
+      - ``ClusterID``         (representative ID identifying the cluster)
       - ``IsRepresentative``  (True/False)
       - ``PhyloIsolation``    (normalised leaf branch length)
       - ``InvestigationScore``(composite per-sequence score)
@@ -610,8 +599,8 @@ def write_per_cluster_csvs(
       - ``PrimaryID``         (ID of the primary sequence for this cluster)
       - ``BackupRationale``   (human-readable reason for this rank)
     """
-    clusters_dir = Path(outdir) / 'clusters'
-    clusters_dir.mkdir(parents=True, exist_ok=True)
+    out_path = Path(outdir) / 'clusters.csv'
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     iso = phylo_isolation or {}
 
@@ -632,8 +621,6 @@ def write_per_cluster_csvs(
             rep = row['id']
         cluster_map.setdefault(rep, []).append(row)
 
-    written_paths = []
-
     # Discover alt-db column keys from the first row
     alt_keys: List[str] = []
     if assessment_rows:
@@ -641,7 +628,7 @@ def write_per_cluster_csvs(
 
     # Build fieldnames dynamically
     base_fields = [
-        'ID', 'IsRepresentative', 'BackupRank', 'PrimaryID', 'BackupRationale',
+        'ClusterID', 'ID', 'IsRepresentative', 'BackupRank', 'PrimaryID', 'BackupRationale',
         'Taxonomy', 'ClassificationHit', 'ClassificationIdentity', 'ClassificationConfidence',
         'NearestHit', 'NearestIdentity',
         'MatchesGE99', 'MatchesGE97', 'MatchesGE95',
@@ -662,10 +649,16 @@ def write_per_cluster_csvs(
         ]
     fieldnames = base_fields + alt_fields
 
-    for rep_id, member_rows in cluster_map.items():
-        # Safe filename: strip non-alphanumeric characters
-        safe_name = re.sub(r'[^A-Za-z0-9_.\-]+', '_', rep_id)[:80]
-        out_path = clusters_dir / f'{safe_name}.csv'
+    ordered_reps: List[str] = []
+    for cluster in cluster_rows or []:
+        rep_id = str(cluster.get('RepresentativeID') or '')
+        if rep_id in cluster_map and rep_id not in ordered_reps:
+            ordered_reps.append(rep_id)
+    ordered_reps.extend(sorted(rep for rep in cluster_map if rep not in ordered_reps))
+    output_rows: List[dict] = []
+
+    for rep_id in ordered_reps:
+        member_rows = cluster_map[rep_id]
 
         # Determine backup ranking for this cluster
         # Use pre-computed scored_members if available, else score on the fly
@@ -688,100 +681,94 @@ def write_per_cluster_csvs(
         rank_map: Dict[str, int] = {r['id']: i for i, (_, r) in enumerate(sm)}
         primary_id: str = sm[0][1]['id'] if sm else rep_id
 
-        with open(out_path, 'w', newline='') as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction='ignore', restval='NA')
-            writer.writeheader()
+        # Write rows in backup-rank order (primary first, then backups).
+        sorted_rows = sorted(member_rows, key=lambda r: rank_map.get(r['id'], 999))
+        for row in sorted_rows:
+            seq_id = str(row['id'])
+            r_iso: float = float(iso.get(seq_id, 0.0))
+            brank = rank_map.get(seq_id, 0)
+            inv_score = compute_investigation_composite(
+                novelty_score=_safe_float(row.get('novelty_score')),
+                phylo_isolation=_safe_float(r_iso),
+                matches_ge_97=_safe_int(row.get('matches_ge_97')),
+                matches_ge_99=_safe_int(row.get('matches_ge_99')),
+                taxonomy_conflict=_has_taxonomy_conflict(row),
+                min_nearest_identity=_safe_float(row.get('nearest_identity'), 100.0),
+            )
+            row_with_score: Dict[str, object] = dict(row)
+            row_with_score['investigation_score'] = round(inv_score, 2)
+            rationale = (
+                'Primary candidate (highest InvestigationScore in cluster)'
+                if brank == 0
+                else _backup_rationale(row_with_score, brank)
+            )
 
-            # Write rows in backup-rank order (primary first, then backups)
-            sorted_rows = sorted(member_rows, key=lambda r: rank_map.get(r['id'], 999))
+            flat_alt: dict = {}
+            for key in alt_keys:
+                safe = key[len('alt_tax_'):]
+                flat_alt[f'Taxonomy_{safe}'] = row.get(f'alt_tax_{safe}', 'NA')
+                flat_alt[f'ClassificationHit_{safe}'] = row.get(f'alt_class_hit_{safe}', 'NA')
+                flat_alt[f'Identity_{safe}'] = row.get(f'alt_ident_{safe}', 'NA')
+                flat_alt[f'Confidence_{safe}'] = row.get(f'alt_conf_{safe}', 'NA')
 
-            for row in sorted_rows:
-                seq_id = str(row['id'])
-                r_iso: float = float(iso.get(seq_id, 0.0))
-                brank = rank_map.get(seq_id, 0)
-                inv_score = compute_investigation_composite(
-                    novelty_score=_safe_float(row.get('novelty_score')),
-                    phylo_isolation=_safe_float(r_iso),
-                    matches_ge_97=_safe_int(row.get('matches_ge_97')),
-                    matches_ge_99=_safe_int(row.get('matches_ge_99')),
-                    taxonomy_conflict=_has_taxonomy_conflict(row),
-                    min_nearest_identity=_safe_float(row.get('nearest_identity'), 100.0),
-                )
-                row_with_score: Dict[str, object] = dict(row)
-                row_with_score['investigation_score'] = round(inv_score, 2)
-                rationale = (
-                    'Primary candidate (highest InvestigationScore in cluster)'
-                    if brank == 0
-                    else _backup_rationale(row_with_score, brank)
-                )
+            output_rows.append({
+                'ClusterID': rep_id,
+                'ID': seq_id,
+                'IsRepresentative': seq_id == rep_id,
+                'BackupRank': brank,
+                'PrimaryID': primary_id,
+                'BackupRationale': rationale,
+                'Taxonomy': row.get('taxonomy', 'NA'),
+                'ClassificationHit': row.get('classification_hit', row.get('best_hit', 'NA')),
+                'ClassificationIdentity': row.get('classification_identity', 'NA'),
+                'ClassificationConfidence': row.get('classification_confidence', 'NA'),
+                'NearestHit': row.get('nearest_hit', 'NA'),
+                'NearestIdentity': row.get('nearest_identity', 'NA'),
+                'MatchesGE99': row.get('matches_ge_99', 'NA'),
+                'MatchesGE97': row.get('matches_ge_97', 'NA'),
+                'MatchesGE95': row.get('matches_ge_95', 'NA'),
+                'NoveltyScore': row.get('novelty_score', 'NA'),
+                'Crowding': row.get('crowding', 'NA'),
+                'SequencingPriority': row.get('sequencing_priority', 'NA'),
+                'PhyloIsolation': round(r_iso, 6),
+                'InvestigationScore': inv_score,
+                'InTree': row.get('in_tree', 'Unknown'),
+                'ClusterRepresentative': row.get('cluster_representative', 'N/A'),
+                'ClusterSize': row.get('cluster_size', '1'),
+                'ClusteredMembers': row.get('clustered_members', ''),
+                'PlacementFlags': row.get('placement_flags', ''),
+                **flat_alt,
+            })
 
-                # Flatten alt-db columns to human-friendly names
-                flat_alt: dict = {}
-                for key in alt_keys:
-                    safe = key[len('alt_tax_'):]
-                    flat_alt[f'Taxonomy_{safe}'] = row.get(f'alt_tax_{safe}', 'NA')
-                    flat_alt[f'ClassificationHit_{safe}'] = row.get(f'alt_class_hit_{safe}', 'NA')
-                    flat_alt[f'Identity_{safe}'] = row.get(f'alt_ident_{safe}', 'NA')
-                    flat_alt[f'Confidence_{safe}'] = row.get(f'alt_conf_{safe}', 'NA')
-
-                out_row = {
-                    'ID': seq_id,
-                    'IsRepresentative': seq_id == rep_id,
-                    'BackupRank': brank,
-                    'PrimaryID': primary_id,
-                    'BackupRationale': rationale,
-                    'Taxonomy': row.get('taxonomy', 'NA'),
-                    'ClassificationHit': row.get('classification_hit', row.get('best_hit', 'NA')),
-                    'ClassificationIdentity': row.get('classification_identity', 'NA'),
-                    'ClassificationConfidence': row.get('classification_confidence', 'NA'),
-                    'NearestHit': row.get('nearest_hit', 'NA'),
-                    'NearestIdentity': row.get('nearest_identity', 'NA'),
-                    'MatchesGE99': row.get('matches_ge_99', 'NA'),
-                    'MatchesGE97': row.get('matches_ge_97', 'NA'),
-                    'MatchesGE95': row.get('matches_ge_95', 'NA'),
-                    'NoveltyScore': row.get('novelty_score', 'NA'),
-                    'Crowding': row.get('crowding', 'NA'),
-                    'SequencingPriority': row.get('sequencing_priority', 'NA'),
-                    'PhyloIsolation': round(r_iso, 6),
-                    'InvestigationScore': inv_score,
-                    'InTree': row.get('in_tree', 'Unknown'),
-                    'ClusterRepresentative': row.get('cluster_representative', 'N/A'),
-                    'ClusterSize': row.get('cluster_size', '1'),
-                    'ClusteredMembers': row.get('clustered_members', ''),
-                    'PlacementFlags': row.get('placement_flags', ''),
-                    **flat_alt,
-                }
-                writer.writerow(out_row)
-
-        written_paths.append(str(out_path))
-
-    return written_paths
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction='ignore', restval='NA')
+        writer.writeheader()
+        writer.writerows(output_rows)
+    return str(out_path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # High-level entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 def generate_cluster_reports(
     outdir: str | Path,
     assessment_rows: List[dict],
     tree_path: Optional[str] = None,
-) -> Tuple[Optional[str], List[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Generate all cluster-level output files.
 
     Parameters
     ----------
-    outdir          : Run output directory.
+    outdir          : Performance Review output directory.
     assessment_rows : Per-sequence rows from ``build_sequence_assessment_rows``.
     tree_path       : Path to ``current_tree.nwk``; used for phylo isolation.
 
     Returns
     -------
-    (cluster_summary_path, [per_cluster_csv_paths], backup_candidates_path)
-      Any entry may be None/empty if *assessment_rows* is empty.
+    (cluster_summary_path, clusters_csv_path, backup_candidates_path)
+      Any entry may be None if *assessment_rows* is empty.
     """
     if not assessment_rows:
-        return None, [], None
+        return None, None, None
 
     import logging as _logging
     log = _logging.getLogger(__name__)
@@ -831,20 +818,18 @@ def generate_cluster_reports(
     )
     log.info("[CLUSTER] Wrote backup candidates table to %s", backup_path)
 
-    per_cluster_paths = write_per_cluster_csvs(
+    clusters_path = write_clusters_csv(
         outdir, assessment_rows, phylo_isolation, cluster_rows=cluster_rows
     )
     log.info(
-        "[CLUSTER] Wrote %d per-cluster CSV files to %s/clusters/",
-        len(per_cluster_paths), outdir,
+        "[CLUSTER] Wrote all cluster members to %s",
+        clusters_path,
     )
 
-    return summary_path, per_cluster_paths, backup_path
+    return summary_path, clusters_path, backup_path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Suggested additional analyses (comments for future work / explanation)
-# ─────────────────────────────────────────────────────────────────────────────
 """
 ADDITIONAL ANALYSES THAT COULD BE ADDED
 ========================================
@@ -857,7 +842,7 @@ ADDITIONAL ANALYSES THAT COULD BE ADDED
    Implementation: parse tree, walk up to LCA, count leaves.
 
 2. **Multi-run novelty trajectory**
-   Track how NoveltyScore for each sequence changes across successive `branchmanager run`
+   Track how NoveltyScore for each sequence changes across successive Performance Reviews
    calls.  A sequence that remains novel even after adding more data is a stronger
    candidate than one that becomes crowded quickly.
    Implementation: store novelty_score per run in a new DB table `novelty_history`.
@@ -893,10 +878,6 @@ ADDITIONAL ANALYSES THAT COULD BE ADDED
    sequence further or which are truly redundant.
    Implementation: pairwise alignment to cluster representative.
 """
-
-
-
-
 
 
 

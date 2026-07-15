@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shlex
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class CollapseArtifacts:
+class CollapseArtefacts:
     collapsed_path: Path
     map_path: Path
     members_path: Path
@@ -31,11 +32,12 @@ def collapse_fasta_within_taxa(
     threshold: float,
     threads: int = 1,
     log_prefix: str = '[COLLAPSE]',
+    strict: bool = False,
 ):
     """Collapse records within taxonomic groups using vsearch cluster_fast.
 
     `taxa_groups` should be a mapping of taxon -> list[(header, sequence)].
-    Output filenames are passed explicitly so preload/run can preserve their
+    Output filenames are passed explicitly so Filing Cabinet/Performance Review can preserve their
     existing contracts.
     """
     outdir_p = Path(outdir)
@@ -46,6 +48,8 @@ def collapse_fasta_within_taxa(
     member_to_rep: Dict[str, str] = {}
 
     if shutil.which('vsearch') is None:
+        if strict:
+            raise RuntimeError('vsearch is required when sequence collapsing is requested')
         logger.warning('%s vsearch not found on PATH; skipping collapse step', log_prefix)
         for recs in taxa_groups.values():
             collapsed_records.extend(recs)
@@ -64,8 +68,9 @@ def collapse_fasta_within_taxa(
             id_flag = threshold / 100.0
             try:
                 cmd = (
-                    f'vsearch --cluster_fast {tmp_path} --id {id_flag} '
-                    f'--centroids {centroids} --uc {ucfile} --threads {int(threads)}'
+                    f'vsearch --cluster_fast {shlex.quote(str(tmp_path))} --id {id_flag} '
+                    f'--centroids {shlex.quote(str(centroids))} '
+                    f'--uc {shlex.quote(str(ucfile))} --threads {int(threads)}'
                 )
                 logger.info('%s Running vsearch cluster for tax=%s (n=%d) threshold=%s', log_prefix, str(tax), len(recs), threshold)
                 run_cmd(cmd)
@@ -115,8 +120,16 @@ def collapse_fasta_within_taxa(
                                     ';'.join(sorted(non_rep)) if non_rep else 'none',
                                 )
                 else:
+                    if strict:
+                        raise RuntimeError(
+                            f'vsearch produced no centroid records for taxonomy group {tax!r}'
+                        )
                     collapsed_records.extend(recs)
             except Exception as e:
+                if strict:
+                    raise RuntimeError(
+                        f'vsearch clustering failed for taxonomy group {tax!r}: {e}'
+                    ) from e
                 logger.warning('%s vsearch clustering failed for tax=%s: %s', log_prefix, str(tax), e)
                 collapsed_records.extend(recs)
             finally:
@@ -152,11 +165,10 @@ def collapse_fasta_within_taxa(
         map_path.name, members_path.name,
     )
 
-    return CollapseArtifacts(
+    return CollapseArtefacts(
         collapsed_path=collapsed_path,
         map_path=map_path,
         members_path=members_path,
         collapsed_records=collapsed_records,
         member_to_rep=member_to_rep,
     )
-

@@ -26,7 +26,7 @@ than as visible biological results.
 Anchors are topology scaffolds only - they never appear in your sequence
 assessment, novelty metrics, or iTOL outputs.  The goal is to give FastTree
 enough long-range signal to place the phylum-level branches correctly so that
-your Hungate preload and run sequences always end up in the right neighbourhood.
+your Hungate Filing Cabinet and Performance Review sequences always end up in the right neighbourhood.
 
 Phyla covered
 -------------
@@ -66,10 +66,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
 # Anchor definitions
 # Each entry: (branchmanager_label, ncbi_accession, description)
-# ---------------------------------------------------------------------------
 ANCHORS = [
     # ── Bacillota (Firmicutes) ────────────────────────────────────────────
     ("Bacillota_Ruminococcus",   "NR_025930", "Ruminococcus albus 7 - rumen fibre degrader (Lachnospiraceae s.l.)"),
@@ -136,7 +134,6 @@ NCBI_EFETCH = (
     "?db=nuccore&id={acc}&rettype=fasta&retmode=text"
 )
 
-# ---------------------------------------------------------------------------
 
 def fetch_sequence(acc: str, email: str, retries: int = 3) -> str:
     """Fetch a single FASTA sequence from NCBI eutils.  Returns raw FASTA text."""
@@ -168,7 +165,7 @@ def parse_fasta_sequence(fasta_text: str) -> tuple[str, str]:
     if not lines or not lines[0].startswith(">"):
         raise ValueError(f"Unexpected FASTA format: {fasta_text[:120]!r}")
     header = lines[0][1:].strip()
-    seq = "".join(l.strip() for l in lines[1:] if not l.startswith(">"))
+    seq = "".join(line.strip() for line in lines[1:] if not line.startswith(">"))
     return header, seq
 
 
@@ -199,7 +196,6 @@ def build_anchor_fasta(out_path: Path, email: str, skip_existing: bool = False):
             print(f"FAILED - {e}")
             failed.append((acc, branchmanager_label, str(e)))
 
-    # Write output
     with open(out_path, "w") as fh:
         for header, seq in records:
             fh.write(f">{header}\n")
@@ -217,7 +213,6 @@ def build_anchor_fasta(out_path: Path, email: str, skip_existing: bool = False):
         print("  >BRANCHMANAGER_REF_<PhylumName> accession=<ACC> source=NCBI_RefSeq")
 
 
-# ---------------------------------------------------------------------------
 
 def main():
     default_out = Path(__file__).resolve().parent.parent / "src" / "branchmanager" / "data" / "reference_anchors.fasta"

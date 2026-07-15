@@ -1,0 +1,4 @@
+sequence_id	partner_id	selected_for_genome_sequencing	already_sequenced
+UoG_example_001	UoG	no	no
+QUB_example_001	QUB	yes	no
+QUB_example_002	QUB	yes	yes
