@@ -183,25 +183,26 @@ def _evidence_quality(row: dict) -> str:
     explicit = str(row.get('evidence_quality') or '').strip().upper()
     if explicit in {'HIGH', 'MODERATE', 'LOW'}:
         return explicit
-    flags = str(row.get('placement_flags') or '').upper()
+    flag_set = {f.strip() for f in str(row.get('placement_flags') or '').upper().split(';') if f.strip()}
     identity = _float(row.get('classification_identity'))
     confidence = _float(row.get('classification_confidence'))
     coverage = _float(row.get('classification_query_coverage'))
     taxonomy = str(row.get('taxonomy') or '').strip().lower()
-    if any(flag in flags for flag in (
-        'NO_REFERENCE_HIT', 'NO_CLASSIFICATION', 'CHIMERA', 'VERY_SHORT', 'HIGH_N_CONTENT',
-        'MARKER_QC_FAILED', 'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED',
-    )):
+    # Use exact flag membership to avoid CHIMERA_INDETERMINATE matching as CHIMERA.
+    if flag_set & {
+        'NO_REFERENCE_HIT', 'NO_CLASSIFICATION', 'CHIMERA', 'CHIMERA_CONFIRMED',
+        'VERY_SHORT', 'HIGH_N_CONTENT', 'MARKER_QC_FAILED',
+        'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED',
+    }:
         return 'LOW'
-    if 'MARKER_QC_REVIEW_APPROVED' in flags:
-        return 'MODERATE'
+    # MARKER_QC_REVIEW_APPROVED: fall through to standard checks.
     if identity is not None and identity < 90.0:
         return 'LOW'
     if coverage is not None and coverage < 80.0:
         return 'LOW'
     if identity is None and taxonomy in {'', 'na', 'none'}:
         return 'LOW'
-    if any(flag in flags for flag in ('LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT')):
+    if flag_set & {'LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT'}:
         return 'MODERATE'
     if (identity is not None and identity < 95.0) or (confidence is not None and confidence < 0.8) or (coverage is not None and coverage < 90.0):
         return 'MODERATE'

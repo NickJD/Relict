@@ -1,0 +1,99 @@
+{
+  "schema_version": "1.0",
+  "workflow": "performance_review",
+  "stage_label": "Performance Review",
+  "status": "FAILED",
+  "started_at": "2026-07-15T18:45:59Z",
+  "completed_at": "2026-07-15T18:45:59Z",
+  "branchmanager_version": "0.1",
+  "git_revision": "0d4943b3fc5f3d3b9b39b31ef6f53aded39465fa",
+  "command": [
+    "cli.py",
+    "performance-review",
+    "--input",
+    ".../02_paper_trail_merge_meeting/assembled.fasta",
+    "--partner-metadata",
+    ".../Sequence_Metadata.csv",
+    "--db",
+    ".../project.db",
+    "--dataset",
+    "UoG_1",
+    "--ref",
+    ".../gtdb_r232_bac_arch_ssu_reps.fna.gz",
+    "--marker-review",
+    ".../review.tsv",
+    "-o",
+    ".../UoG_01/03_performance_review_v3"
+  ],
+  "environment": {
+    "python": "3.14.6 free-threading build | packaged by conda-forge | (main, Jun 12 2026, 08:51:40) [GCC 14.3.0]",
+    "executable": "/home/nickd/anaconda3/envs/branchmanager/bin/python",
+    "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.39",
+    "hostname": "nickd-home",
+    "cwd": "/home/nickd/Git/BranchManager/src/branchmanager"
+  },
+  "external_tools": {
+    "vsearch": {
+      "available": true,
+      "path": "/home/nickd/anaconda3/envs/branchmanager/bin/vsearch",
+      "version": "Rognes T, Flouri T, Nichols B, Quince C, Mahe F (2016)"
+    },
+    "mafft": {
+      "available": true,
+      "path": "/home/nickd/anaconda3/envs/branchmanager/bin/mafft",
+      "version": "v7.526 (2024/Apr/26)"
+    },
+    "fasttree": {
+      "available": true,
+      "path": "/home/nickd/anaconda3/envs/branchmanager/bin/FastTree",
+      "version": "FastTree 2.2.0 Double precision:"
+    },
+    "iqtree": {
+      "available": false,
+      "path": "",
+      "version": ""
+    }
+  },
+  "inputs": [
+    {
+      "role": "marker_fasta",
+      "path": "/home/nickd/Git/BranchManager/src/branchmanager/.../02_paper_trail_merge_meeting/assembled.fasta",
+      "required": true,
+      "exists": false,
+      "kind": "missing"
+    },
+    {
+      "role": "partner_metadata",
+      "path": "/home/nickd/Git/BranchManager/src/branchmanager/.../Sequence_Metadata.csv",
+      "required": true,
+      "exists": false,
+      "kind": "missing"
+    },
+    {
+      "role": "primary_reference",
+      "path": "/home/nickd/Git/BranchManager/src/branchmanager/.../gtdb_r232_bac_arch_ssu_reps.fna.gz",
+      "required": true,
+      "exists": false,
+      "kind": "missing"
+    },
+    {
+      "role": "marker_review",
+      "path": "/home/nickd/Git/BranchManager/src/branchmanager/.../review.tsv",
+      "required": true,
+      "exists": false,
+      "kind": "missing"
+    }
+  ],
+  "stages": [
+    {
+      "name": "performance_review",
+      "label": "Performance Review",
+      "status": "RUNNING",
+      "time": "2026-07-15T18:45:59Z",
+      "detail": "taxonomy, novelty, MSA/tree, and assessment"
+    }
+  ],
+  "outputs": [],
+  "warnings": [],
+  "error": "[PERFORMANCE REVIEW] No cultured baseline is registered. Supply --baseline-fasta for this run or establish it first with `branchmanager filing-cabinet`."
+}

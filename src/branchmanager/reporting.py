@@ -129,8 +129,11 @@ def write_annual_report(db, outdir: str | Path) -> dict:
     with db.connect() as conn:
         dataset_rows = conn.execute(
             'SELECT s.dataset, COALESCE(r.role, "unregistered"), '
-            'COALESCE(r.genomes_available, 0), COUNT(*) FROM sequences s '
+            'CASE WHEN COALESCE(r.genomes_available, 0) = 1 THEN COUNT(s.id) '
+            '     ELSE COALESCE(SUM(COALESCE(m.selected_for_wgs, 0)), 0) END, '
+            'COUNT(s.id) FROM sequences s '
             'LEFT JOIN dataset_roles r ON r.dataset=s.dataset '
+            'LEFT JOIN sequencing_metadata m ON m.id=s.id '
             'GROUP BY s.dataset, r.role, r.genomes_available ORDER BY s.dataset'
         ).fetchall()
         status_rows = conn.execute(

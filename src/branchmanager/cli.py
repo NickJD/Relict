@@ -3161,6 +3161,10 @@ def cmd_label_maker(args):
 
 
 def build_parser():
+    _Fmt = type('_Fmt', (
+        argparse.ArgumentDefaultsHelpFormatter,
+        argparse.RawDescriptionHelpFormatter,
+    ), {'max_help_position': 40, 'width': 120})
     parser = argparse.ArgumentParser(
         prog='branchmanager',
         description=(
@@ -3189,7 +3193,7 @@ def build_parser():
             '  3. branchmanager quarterly-review --db project.db --genome-budget 24 --tree review_out/tree/current_tree.nwk -o quarterly_review_01\n'
             '  4. branchmanager org-chart --db project.db --taxon archaea --from-dir filing_cabinet_out -o archaea_out\n'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     sub = parser.add_subparsers(dest='command')
 
@@ -3203,7 +3207,7 @@ def build_parser():
             'This is always the first step. All subsequent Performance Reviews measure novelty against\n'
             'sequences stored by this command.'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     filing_cabinet_parser.add_argument('--fasta', required=True,
         help='Input FASTA file containing the baseline sequences to load.')
@@ -3308,7 +3312,7 @@ def build_parser():
             'not the full external reference. Each successive Performance Review extends the partner collection and\n'
             'updates same-species genome coverage and candidate sets.'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     performance_review_parser.add_argument('--input', required=True,
         help='FASTA file of new sequences to analyse.')
@@ -3464,7 +3468,7 @@ def build_parser():
             'never change already_sequenced status. Use genome ANI/phylogenomics to validate\n'
             'strain-level diversity once genome data are available.'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     quarterly_review_parser.add_argument('--db', required=True,
         help='Rolling BranchManager SQLite database containing all partner and baseline sequences.')
@@ -3501,7 +3505,7 @@ def build_parser():
             'from the taxonomy already stored in the DB. Useful after changing --group-phyla\n'
             'options or after manually editing the database.'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     label_maker_parser.add_argument('--db', required=True,
         help='Path to the BranchManager SQLite database.')
@@ -3547,7 +3551,7 @@ def build_parser():
             '  f__Lachnospiraceae         → GTDB-prefixed family\n'
             '  g__Ruminococcus            → GTDB-prefixed genus\n'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     org_chart_parser.add_argument('--db', required=True,
         help='Path to the BranchManager SQLite database.')
@@ -3607,7 +3611,7 @@ def build_parser():
             'If --sample-map is omitted, sequence IDs and primer names are '
             'inferred from filenames such as Iso001_27F.ab1 and Iso001_907R.ab1.'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     paper_trail_parser.add_argument(
         '--input', nargs='+', required=False, default=[],
@@ -3636,8 +3640,8 @@ def build_parser():
         help='Remove confidently matched primer sequence from the retained read (default: enabled).')
     paper_trail_parser.add_argument('--secondary-peak-ratio', dest='secondary_peak_ratio', type=float, default=0.33,
         help='Secondary/called chromatogram peak ratio considered mixed (default: 0.33).')
-    paper_trail_parser.add_argument('--max-mixed-peak-percent', dest='max_mixed_peak_percent', type=float, default=5.0,
-        help='Maximum percent retained high-quality positions with mixed peaks before read QC failure (default: 5).')
+    paper_trail_parser.add_argument('--max-mixed-peak-percent', dest='max_mixed_peak_percent', type=float, default=15.0,
+        help='Maximum percent retained high-quality positions with mixed peaks before read QC failure (default: 15).')
     paper_trail_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=20,
         help='Minimum Phred score for a mixed-peak position to count (default: 20).')
     paper_trail_parser.add_argument('--screen-ref', dest='screen_ref', default=None,
@@ -3648,22 +3652,22 @@ def build_parser():
         help='CPU threads for optional primer-read taxonomy screening (default: 4).')
     paper_trail_parser.add_argument('--min-quality', dest='min_quality', type=int, default=20,
         help='Phred cutoff for Mott-style end trimming (default: 20).')
-    paper_trail_parser.add_argument('--window', type=int, default=20,
+    paper_trail_parser.add_argument('--window', type=int, default=10,
         help='Window size retained in reports for trimming context; rigorous trimming uses the Phred cutoff directly.')
     paper_trail_parser.add_argument('--min-length', dest='min_length', type=int, default=800,
         help='Minimum final sequence length to write to assembled.fasta (default: 800 bp).')
     paper_trail_parser.add_argument('--min-read-length', dest='min_read_length', type=int, default=None,
         help='Minimum trimmed read length to retain before assembly/best-read selection. Defaults to --min-length.')
-    paper_trail_parser.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=25.0,
-        help='Minimum mean Phred score after trimming/masking for read and final QC (default: 25).')
+    paper_trail_parser.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=20.0,
+        help='Minimum mean Phred score after trimming/masking for read and final QC (default: 20).')
     paper_trail_parser.add_argument('--mask-quality', dest='mask_quality', type=int, default=20,
         help='Mask internal bases below this Phred score to N before assembly (default: 20).')
     paper_trail_parser.add_argument('--max-read-expected-errors', dest='max_read_expected_errors', type=float, default=8.0,
         help='Maximum expected base-call errors allowed per retained read (default: 8).')
-    paper_trail_parser.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=5.0,
-        help='Maximum expected base-call errors allowed in the final isolate sequence (default: 5).')
-    paper_trail_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=1.0,
-        help='Maximum percent N allowed after masking for reads and final output (default: 1.0).')
+    paper_trail_parser.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=10.0,
+        help='Maximum expected base-call errors allowed in the final isolate sequence (default: 10).')
+    paper_trail_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=2.0,
+        help='Maximum percent N allowed after masking for reads and final output (default: 2.0).')
     paper_trail_parser.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=20,
         help='Maximum internal low-quality/ambiguous run length before read failure (default: 20 bp).')
     paper_trail_parser.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=1.0,
@@ -3675,8 +3679,8 @@ def build_parser():
         help='Allow AB1 reads missing PCON quality scores to pass with warnings. By default they fail QC.')
     paper_trail_parser.add_argument('--min-overlap', dest='min_overlap', type=int, default=40,
         help='Minimum overlap length for assembling multiple primer reads (default: 40 bp).')
-    paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=0.85,
-        help='Minimum overlap identity for assembly, 0-1 (default: 0.85).')
+    paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=0.95,
+        help='Minimum overlap identity for assembly, 0-1 (default: 0.95).')
     paper_trail_parser.add_argument('--assemble', dest='assemble',
         action=argparse.BooleanOptionalAction, default=True,
         help='Assemble multiple reads per sequence_id when possible (default). Use --no-assemble to keep the best read.')
@@ -3696,7 +3700,7 @@ def build_parser():
             'metadata, embedded ABIF fields, or explicit batch-level forward/reverse settings. '
             'Unresolved primers are reported for review and are never silently inferred as fact.'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     mailroom_parser.add_argument('--read-dir', required=True,
         help='Directory containing the AB1/ABI files for one partner batch.')
@@ -3718,6 +3722,7 @@ def build_parser():
     onboarding_parser = sub.add_parser(
         'onboarding',
         help='Onboarding: validate partner IDs, metadata, and either raw-read ownership or a supplied FASTA.',
+        formatter_class=_Fmt,
     )
     onboarding_inputs = onboarding_parser.add_mutually_exclusive_group(required=True)
     onboarding_inputs.add_argument('--sample-map',
@@ -3740,6 +3745,7 @@ def build_parser():
     status_meeting_parser = sub.add_parser(
         'status-meeting',
         help='Status Meeting: import factual isolate lifecycle changes into the project ledger.',
+        formatter_class=_Fmt,
     )
     status_meeting_parser.add_argument('--db', required=True)
     status_meeting_parser.add_argument('--input', required=True,
@@ -3749,6 +3755,7 @@ def build_parser():
     records_update_parser = sub.add_parser(
         'records-update',
         help='Records Update: import completed genome/QC/GTDB/ANI evidence.',
+        formatter_class=_Fmt,
     )
     records_update_parser.add_argument('--db', required=True)
     records_update_parser.add_argument('--input', required=True,
@@ -3768,6 +3775,7 @@ def build_parser():
             'selection, provenance, status, and metadata records while retaining an immutable '
             'tombstone. Baseline and genome-backed records are protected by default.'
         ),
+        formatter_class=_Fmt,
     )
     exit_source = exit_interview_parser.add_mutually_exclusive_group(required=True)
     exit_source.add_argument('--sequence-id', action='append',
@@ -3790,6 +3798,7 @@ def build_parser():
     annual_report_parser = sub.add_parser(
         'annual-report',
         help='Annual Report: create a point-in-time project overview, ledgers, and decision-change report.',
+        formatter_class=_Fmt,
     )
     annual_report_parser.add_argument('--db', required=True)
     annual_report_parser.add_argument('-o', '--out', required=True)
@@ -3797,6 +3806,7 @@ def build_parser():
     it_desk_parser = sub.add_parser(
         'it-desk',
         help='IT Desk: check dependencies, references, database integrity, and output location.',
+        formatter_class=_Fmt,
     )
     it_desk_parser.add_argument('--db', default=None)
     it_desk_parser.add_argument('--ref', dest='references', action='append', default=[])
@@ -3808,6 +3818,7 @@ def build_parser():
     assistant_parser = sub.add_parser(
         'assistant',
         help='Assistant to the Branch Manager: run Onboarding through the Hiring Panel.',
+        formatter_class=_Fmt,
     )
     assistant_input = assistant_parser.add_mutually_exclusive_group(required=True)
     assistant_input.add_argument('--sample-map', help='AB1/primer-read sample map; runs Paper Trail and Merge Meeting.')
@@ -3829,7 +3840,8 @@ def build_parser():
     assistant_parser.add_argument('--baseline-taxa-assignments', default=None)
     assistant_parser.add_argument('--mwl', default=None)
     assistant_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default='bacteria')
-    assistant_parser.add_argument('--threads', type=int, default=4)
+    assistant_parser.add_argument('--threads', type=int, default=4,
+        help='CPU threads for vsearch and MAFFT (default: 4).')
     assistant_parser.add_argument('--tree-method', choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree')
     assistant_parser.add_argument('--pangenome-target', type=int, default=3)
     assistant_parser.add_argument('--candidate-set-size', type=int, default=4)
@@ -3838,15 +3850,26 @@ def build_parser():
         metavar='NAME=SEQUENCE', help='Primer sequence used for IUPAC-aware trimming; repeatable.')
     assistant_parser.add_argument('--trim-primers', dest='trim_primers',
         action=argparse.BooleanOptionalAction, default=True)
-    assistant_parser.add_argument('--min-quality', type=int, default=20)
-    assistant_parser.add_argument('--quality-window', dest='window', type=int, default=20)
-    assistant_parser.add_argument('--min-marker-length', dest='min_length', type=int, default=800)
-    assistant_parser.add_argument('--min-mean-quality', type=float, default=25.0)
-    assistant_parser.add_argument('--max-read-expected-errors', type=float, default=8.0)
-    assistant_parser.add_argument('--max-output-expected-errors', type=float, default=5.0)
-    assistant_parser.add_argument('--max-n-percent', type=float, default=1.0)
-    assistant_parser.add_argument('--secondary-peak-ratio', type=float, default=0.33)
-    assistant_parser.add_argument('--max-mixed-peak-percent', type=float, default=5.0)
+    assistant_parser.add_argument('--min-quality', type=int, default=15,
+        help='Phred cutoff for Mott-style end trimming (default: 15).')
+    assistant_parser.add_argument('--quality-window', dest='window', type=int, default=10,
+        help='Window size for trimming context reports (default: 10).')
+    assistant_parser.add_argument('--min-marker-length', dest='min_length', type=int, default=800,
+        help='Minimum final assembled sequence length in bp (default: 800).')
+    assistant_parser.add_argument('--min-mean-quality', type=float, default=20.0,
+        help='Minimum mean Phred quality after trimming (default: 20.0).')
+    assistant_parser.add_argument('--max-read-expected-errors', type=float, default=8.0,
+        help='Maximum expected errors per retained read (default: 8.0).')
+    assistant_parser.add_argument('--max-output-expected-errors', type=float, default=5.0,
+        help='Maximum expected errors in the final assembled sequence (default: 5.0).')
+    assistant_parser.add_argument('--max-n-percent', type=float, default=3.0,
+        help='Maximum percent N bases allowed after masking (default: 3.0).')
+    assistant_parser.add_argument('--secondary-peak-ratio', type=float, default=0.33,
+        help='Secondary/called peak ratio threshold for mixed-base detection (default: 0.33).')
+    assistant_parser.add_argument('--max-mixed-peak-percent', type=float, default=15.0,
+        help='Maximum percent mixed-peak positions before read QC failure (default: 15.0).')
+    assistant_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=20,
+        help='Minimum Phred score for a mixed-peak position to count (default: 20).')
     assistant_parser.add_argument('--max-report-image-height', type=int, default=2400,
         help='Maximum Paper Trail visual-report PNG height before automatic pagination (minimum: 600, default: 2400).')
     assistant_parser.add_argument('--min-overlap', type=int, default=40)
@@ -3896,7 +3919,7 @@ def build_parser():
             '    --taxa-assignments background_check_out/pipeline_taxonomy.tsv \\\n'
             '    --db project.db --dataset Hungate -o filing_cabinet_out/'
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_Fmt,
     )
     background_check_parser.add_argument(
         '--dataset', dest='datasets', nargs='+', metavar='NAME FASTA',
@@ -4081,20 +4104,20 @@ def cmd_paper_trail(args):
             primer_sequences=primer_sequences,
             trim_primers=bool(getattr(args, 'trim_primers', True)),
             secondary_peak_ratio=float(getattr(args, 'secondary_peak_ratio', 0.33)),
-            max_mixed_peak_percent=float(getattr(args, 'max_mixed_peak_percent', 5.0)),
+            max_mixed_peak_percent=float(getattr(args, 'max_mixed_peak_percent', 15.0)),
             mixed_peak_min_quality=int(getattr(args, 'mixed_peak_min_quality', 20)),
             screen_ref=getattr(args, 'screen_ref', None),
             screen_taxa=getattr(args, 'screen_taxa', None),
             threads=int(getattr(args, 'threads', 4) or 4),
-            min_quality=int(getattr(args, 'min_quality', 20) or 20),
-            window=int(getattr(args, 'window', 20) or 20),
-            min_length=int(getattr(args, 'min_length', 800) or 800),
+            min_quality=int(getattr(args, 'min_quality', 15) or 15),
+            window=int(getattr(args, 'window', 10) or 10),
+            min_length=int(getattr(args, 'min_length', 700) or 700),
             min_read_length=getattr(args, 'min_read_length', None),
-            min_mean_quality=float(getattr(args, 'min_mean_quality', 25.0) or 25.0),
+            min_mean_quality=float(getattr(args, 'min_mean_quality', 20.0) or 20.0),
             mask_quality=int(getattr(args, 'mask_quality', 20) or 20),
-            max_read_expected_errors=float(getattr(args, 'max_read_expected_errors', 8.0) or 8.0),
-            max_output_expected_errors=float(getattr(args, 'max_output_expected_errors', 5.0) or 5.0),
-            max_n_percent=float(getattr(args, 'max_n_percent', 1.0) or 1.0),
+            max_read_expected_errors=float(getattr(args, 'max_read_expected_errors', 20.0) or 20.0),
+            max_output_expected_errors=float(getattr(args, 'max_output_expected_errors', 10.0) or 10.0),
+            max_n_percent=float(getattr(args, 'max_n_percent', 3.0) or 3.0),
             max_internal_low_quality_run=int(getattr(args, 'max_internal_low_quality_run', 20) or 20),
             max_conflict_density=float(getattr(args, 'max_conflict_density', 1.0) or 1.0),
             quality_difference=int(getattr(args, 'quality_difference', 10) or 10),

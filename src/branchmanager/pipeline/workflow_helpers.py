@@ -981,24 +981,17 @@ def _evidence_quality(row: dict) -> str:
     marker_flag = str(row.get('marker_qc_flag') or '').upper()
     if marker_flag in {'MARKER_QC_FAILED', 'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED'}:
         return 'LOW'
-    if marker_flag == 'MARKER_QC_REVIEW_APPROVED':
-        return 'MODERATE'
-    severe = any(
-        marker in flag
-        for flag in flags
-        for marker in ('NO_CLASSIFICATION', 'CHIMERA', 'VERY_SHORT', 'HIGH_N_CONTENT')
-    )
+    # MARKER_QC_REVIEW_APPROVED: manual approval has addressed QC concerns; fall through to
+    # standard identity/coverage checks so clean assemblies can still reach HIGH.
+    # Use exact flag membership to avoid CHIMERA_INDETERMINATE matching as CHIMERA.
+    severe = bool(flags & {'NO_CLASSIFICATION', 'CHIMERA', 'CHIMERA_CONFIRMED', 'VERY_SHORT', 'HIGH_N_CONTENT'})
     if severe or (classification_identity is not None and classification_identity < 90.0):
         return 'LOW'
     if query_coverage is not None and query_coverage < 80.0:
         return 'LOW'
     if classification_identity is None and taxonomy in ('', 'na', 'none'):
         return 'LOW'
-    moderate = any(
-        marker in flag
-        for flag in flags
-        for marker in ('LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT')
-    )
+    moderate = bool(flags & {'LOW_CLASSIFICATION', 'LOW_CONFIDENCE', 'DISAGREEMENT', 'CONFLICT'})
     if (
         moderate
         or (classification_identity is not None and classification_identity < 95.0)
@@ -1063,7 +1056,7 @@ def build_selection_decision(row: dict) -> dict:
         decision = 'ALREADY SEQUENCED'
     elif pending:
         decision = 'ALREADY SELECTED - GENOME PENDING'
-    elif evidence_quality != 'HIGH':
+    elif evidence_quality == 'LOW':
         decision = 'REVIEW BEFORE SELECTION'
     elif set_role == 'PRIMARY':
         decision = 'PRIORITISE - SET PRIMARY'

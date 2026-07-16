@@ -147,7 +147,7 @@ def run_novelty(
             f"--db {shlex.quote(str(db_fasta))} "
             f"--id 0.5 "                          # low floor — we want real distances
             f"--strand both "
-            f"--blast6out {shlex.quote(str(matches_path))} "
+            f"--userout {shlex.quote(str(matches_path))} "
             f"--userfields {VSEARCH_USERFIELDS} "
             f"--maxaccepts 1 --maxhits 1 "
             f"--query_cov 0.7"                    # require 70% query coverage to avoid spurious hits
@@ -225,7 +225,7 @@ def _parse_best_hits(matches_path: str) -> dict[str, tuple[float, str, Optional[
                     try:
                         alignment_length = int(float(parts[3]))
                         query_length = int(float(parts[10]))
-                        query_coverage = 100.0 * alignment_length / query_length if query_length else None
+                        query_coverage = 100.0 * alignment_length / query_length if query_length > 0 else None
                     except (TypeError, ValueError, ZeroDivisionError):
                         pass
                 if qid not in best or pct_id > best[qid][0]:
@@ -428,7 +428,8 @@ def compute_db_nearest_identities(mapped_derep: str, outdir: str, db, run_datase
             cmd = (
                 f"vsearch --usearch_global {shlex.quote(str(mapped_derep))} "
                 f"--db {shlex.quote(str(db_preset_fasta))} --id 0.5 --strand both "
-                f"--blast6out {shlex.quote(str(novelty_matches))} "
+                f"--userout {shlex.quote(str(novelty_matches))} "
+                f"--userfields {VSEARCH_USERFIELDS} "
                 f"--maxaccepts 1 --maxhits 1{thread_flag}"
             )
             logger.info("[NOVELTY] Running vsearch against registered project collection to compute novelty")
@@ -662,7 +663,7 @@ def _run_nearest_search(
         f"--db {shlex.quote(str(db_fasta))} "
         f"--id 0.5 "
         f"--strand both "
-        f"--blast6out {shlex.quote(str(matches_path))} "
+        f"--userout {shlex.quote(str(matches_path))} "
         f"--userfields {VSEARCH_USERFIELDS} "
         f"--maxaccepts {2 if exclude_self else 1} --maxhits {2 if exclude_self else 1} "
         f"--query_cov 0.7{thread_flag}"
@@ -688,7 +689,7 @@ def _run_nearest_search(
                         try:
                             alignment_length = int(float(parts[3]))
                             query_length = int(float(parts[10]))
-                            query_coverage = 100.0 * alignment_length / query_length if query_length else None
+                            query_coverage = 100.0 * alignment_length / query_length if query_length > 0 else None
                         except (TypeError, ValueError, ZeroDivisionError):
                             pass
                     best[parts[0]] = (pct, parts[1], query_coverage, alignment_length)
@@ -709,7 +710,7 @@ def _run_density_search(
         f"--db {shlex.quote(str(db_fasta))} "
         f"--id 0.95 "
         f"--strand both "
-        f"--blast6out {shlex.quote(str(matches_path))} "
+        f"--userout {shlex.quote(str(matches_path))} "
         f"--userfields {VSEARCH_USERFIELDS} "
         f"--maxaccepts 0 --maxhits 0 "
         f"--query_cov 0.7{thread_flag}"

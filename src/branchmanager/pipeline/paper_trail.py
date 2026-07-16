@@ -18,8 +18,15 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_PRIMERS = (
-    '27F', '341F', '515F', '519F', '785F',
-    '534R', '806R', '907R', '926R', '1100R', '1392R', '1406R', '1492R',
+    # 16S rRNA
+    '8F', '27F', '63F', '338F', '341F', '357F', '515F', '519F', '785F', '1055F',
+    '534R', '806R', '907R', '926R', '1100R', '1392R', '1406R', '1492R', '1525R',
+    # 18S rRNA
+    'NS1', 'NS2', 'NS3', 'NS4', 'NS5', 'NS6', 'NS7', 'NS8', '528F', '1391F', 'EukBr',
+    # ITS
+    'ITS1', 'ITS1F', 'ITS2', 'ITS3', 'ITS4', 'ITS4B', 'ITS5',
+    # 28S / LSU rRNA
+    'LR0R', 'LR3', 'LR5', 'LR6', 'NL1', 'NL4',
 )
 
 DEFAULT_MAX_REPORT_IMAGE_HEIGHT = 2400
@@ -32,37 +39,53 @@ ASSEMBLY_HEADER_HEIGHT = 104
 
 
 DEFAULT_PRIMER_SEQUENCES = {
-    # 16S
-    '27F': 'AGAGTTTGATCMTGGCTCAG', # Standard near full-length forward
-    '63F': 'CAGGCCTAACACATGCAAGTC', # Universal forward primer
-    '341F': 'CCTACGGGNGGCWGCAG', # V3-V4 forward
-    '515F': 'GTGYCAGCMGCCGCGGTAA', # V4 forward (Earth Microbiome Project)
-    '519F': 'CAGCMGCCGCGGTAANWC', # Alternative V4 forward
-    '534R': 'ATTACCGCGGCTGCTGG', # V1-V3 reverse
-    '806R': 'GGACTACNVGGGTWTCTAAT',  # V4 reverse (Earth Microbiome Project)
-    '907R': 'CCGTCAATTCMTTTRAGTTT', # V5 reverse
-    '926R': 'CCGYCAATTYMTTTRAGTTT', # V4-V5 reverse
-    '1100R': 'GGGTTGCGCTCGTTG', # V6 reverse
-    '1392R': 'ACGGGCGGTGTGTRC', # Near full-length reverse
-    '1406R': 'ACGGGCGGTGTGTRCAA', # Extended near full-length reverse
-    '1492R': 'TACGGYTACCTTGTTACGACTT', # Standard full-length reverse
-    # ITS
-    'ITS1': 'TCCGTAGGTGAACCTGCGG', # Universal (White et al., 1990)
-    'ITS1F': 'CTTGGTCATTTAGAGGAAGTAA', # Fungal-specific forward
-    'ITS2': 'GCTGCGTTCTTCATCGATGC', # Pairs with ITS1
-    'ITS3': 'GCATCGATGAAGAACGCAGC', # Targets the ITS2 region
-    'ITS4': 'TCCTCCGCTTATTGATATGC', # Universal reverse
-    # 18S
-    'NS1': 'GTAGTCATATGCTTGTCTC', # Full 18S gene (White et al., 1990)
-    'NS8': 'TCCGCAGGTTCACCTACGGA', # Full 18S gene (White et al., 1990)
-    '1391F': 'GTACACACCGCCCGTC', # V9 region (Earth Microbiome Project)
-    'EukBr': 'TGATCCTTCTGCAGGTTCACCTAC', # V9 region (Earth Microbiome Project)
-    # 28S
-    'LR0R': 'ACCCGCTGAACTTAAGC', # Universal (Vilgalys Lab)
-    'LR3': 'CCGTGTTTCAAGACGGG', # Often paired with LR0R
-    'LR5': 'TCCTGAGGGAAACTTCG', # Yields a larger ~900 bp fragment
-    'NL1': 'GCATATCAATAAGCGGAGGAAAAG', # D1/D2 domain forward
-    'NL4': 'GGTCCGTGTTTCAAGACGG', # D1/D2 domain reverse
+    # 16S rRNA
+    '8F': 'AGAGTTTGATCCTGGCTCAG',          # Near full-length forward, non-degenerate variant of 27F
+    '27F': 'AGAGTTTGATCMTGGCTCAG',          # Standard near full-length forward
+    '63F': 'CAGGCCTAACACATGCAAGTC',          # Universal forward
+    '338F': 'ACTCCTACGGGAGGCAGCAG',          # V3 forward (Muyzer et al. 1993)
+    '341F': 'CCTACGGGNGGCWGCAG',             # V3-V4 forward
+    '357F': 'CTCCTACGGGAGGCAGCAG',           # V3 forward variant
+    '515F': 'GTGYCAGCMGCCGCGGTAA',           # V4 forward (Earth Microbiome Project)
+    '519F': 'CAGCMGCCGCGGTAANWC',            # V4 forward alternative
+    '785F': 'GGATTAGATACCCBDGTAGTC',         # V5 forward
+    '1055F': 'ATGGCTGTCGTCAGCT',             # V6 forward
+    '534R': 'ATTACCGCGGCTGCTGG',             # V1-V3 reverse
+    '806R': 'GGACTACNVGGGTWTCTAAT',          # V4 reverse (Earth Microbiome Project)
+    '907R': 'CCGTCAATTCMTTTRAGTTT',          # V5 reverse
+    '926R': 'CCGYCAATTYMTTTRAGTTT',          # V4-V5 reverse
+    '1100R': 'GGGTTGCGCTCGTTG',              # V6 reverse
+    '1392R': 'ACGGGCGGTGTGTRC',              # Near full-length reverse
+    '1406R': 'ACGGGCGGTGTGTRCAA',            # Extended near full-length reverse
+    '1492R': 'TACGGYTACCTTGTTACGACTT',       # Standard full-length reverse
+    '1525R': 'AAGGAGGTGWTCCARCC',            # Full-length reverse
+    # ITS (Internal Transcribed Spacer)
+    'ITS1': 'TCCGTAGGTGAACCTGCGG',           # Universal ITS1 forward (White et al. 1990)
+    'ITS1F': 'CTTGGTCATTTAGAGGAAGTAA',       # Fungal-specific ITS1 forward (Gardes & Bruns 1993)
+    'ITS2': 'GCTGCGTTCTTCATCGATGC',          # ITS1/5.8S boundary reverse (White et al. 1990)
+    'ITS3': 'GCATCGATGAAGAACGCAGC',          # 5.8S/ITS2 boundary forward (White et al. 1990)
+    'ITS4': 'TCCTCCGCTTATTGATATGC',          # Universal ITS2 reverse (White et al. 1990)
+    'ITS4B': 'CAGGAGACTTGTACACGGTCCAG',      # Basidiomycete-specific ITS2 reverse (Gardes & Bruns 1993)
+    'ITS5': 'GGAAGTAAAAGTCGTAACAAGG',        # Upstream of ITS1 forward (White et al. 1990)
+    # 18S rRNA
+    'NS1': 'GTAGTCATATGCTTGTCTC',            # Full 18S forward (White et al. 1990)
+    'NS2': 'GGCTGCTGGCACCAGACTTGC',          # Full 18S reverse (White et al. 1990)
+    'NS3': 'GCAAGTCTGGTGCCAGCAGCC',          # Full 18S forward (White et al. 1990)
+    'NS4': 'CTTCCGTCAATTCCTTTAAG',           # Full 18S reverse (White et al. 1990)
+    'NS5': 'AACTTAAAGGAATTGACGGAAG',         # Full 18S forward (White et al. 1990)
+    'NS6': 'GCATCACAGACCTGTTATTGCCTC',       # Full 18S reverse (White et al. 1990)
+    'NS7': 'GAGGCAATAACAGGTCTGTGATGC',       # Full 18S forward (White et al. 1990)
+    'NS8': 'TCCGCAGGTTCACCTACGGA',           # Full 18S reverse (White et al. 1990)
+    '528F': 'GCGGTAATTCCAGCTCCAA',           # V4 region forward (Stoeck et al. 2010)
+    '1391F': 'GTACACACCGCCCGTC',             # V9 region forward (Earth Microbiome Project)
+    'EukBr': 'TGATCCTTCTGCAGGTTCACCTAC',     # V9 region reverse (Earth Microbiome Project)
+    # 28S / LSU rRNA
+    'LR0R': 'ACCCGCTGAACTTAAGC',             # Universal; primes into LSU from 18S (Vilgalys & Hester 1990)
+    'LR3': 'CCGTGTTTCAAGACGGG',              # D1 domain reverse (Vilgalys & Hester 1990)
+    'LR5': 'TCCTGAGGGAAACTTCG',              # D2 domain reverse (Vilgalys & Hester 1990)
+    'LR6': 'CGCCAGTTCTGCTTACC',              # D3 domain reverse (Vilgalys & Hester 1990)
+    'NL1': 'GCATATCAATAAGCGGAGGAAAAG',       # D1/D2 domain forward (O'Donnell 1993)
+    'NL4': 'GGTCCGTGTTTCAAGACGG',            # D1/D2 domain reverse (O'Donnell 1993)
 }
 
 IUPAC_BASES = {

@@ -388,7 +388,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.out, 'paper_trail_out')
         self.assertEqual(args.min_quality, 25)
         self.assertEqual(args.min_overlap, 30)
-        self.assertEqual(args.min_length, 800)
+        self.assertEqual(args.min_length, 700)
         self.assertIsNone(args.min_read_length)
         self.assertEqual(args.primers, ['27F', '907R'])
         self.assertEqual(args.sample_map, 'reads.tsv')
@@ -1905,7 +1905,7 @@ class OutputHelperTests(unittest.TestCase):
 
             def fake_run_cmd(cmd):
                 parts = cmd.split()
-                density = Path(parts[parts.index('--blast6out') + 1])
+                density = Path(parts[parts.index('--userout') + 1])
                 density.write_text('Q1\tR1\t99.2\nQ1\tR2\t97.4\nQ1\tR3\t95.1\n')
 
             with mock.patch('branchmanager.pipeline.novelty.run_cmd', side_effect=fake_run_cmd):
@@ -1935,7 +1935,7 @@ class OutputHelperTests(unittest.TestCase):
 
             def fake_run_cmd(cmd):
                 parts = cmd.split()
-                out = Path(parts[parts.index('--blast6out') + 1])
+                out = Path(parts[parts.index('--userout') + 1])
                 if 'baseline_nearest' in out.name:
                     out.write_text('Q1\tHungateHit\t96.2\n')
                 elif 'baseline_density' in out.name:
@@ -1998,7 +1998,7 @@ class OutputHelperTests(unittest.TestCase):
 
             def fake_run_cmd(cmd):
                 parts = cmd.split()
-                out = Path(parts[parts.index('--blast6out') + 1])
+                out = Path(parts[parts.index('--userout') + 1])
                 if 'selected_for_wgs' in out.name:
                     out.write_text('Q1\tSelectedPrev\t99.5\n')
                 elif 'project_density' in out.name:

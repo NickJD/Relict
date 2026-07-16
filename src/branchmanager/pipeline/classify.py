@@ -61,9 +61,9 @@ def _parse_vsearch_match(parts: list[str]) -> Optional[dict]:
                 'query_length': int(float(parts[10])),
                 'target_length': int(float(parts[11])),
             })
-            if result['query_length']:
+            if result['query_length'] > 0:
                 result['query_coverage'] = 100.0 * result['alignment_length'] / result['query_length']
-            if result['target_length']:
+            if result['target_length'] > 0:
                 result['target_coverage'] = 100.0 * result['alignment_length'] / result['target_length']
         except (TypeError, ValueError, ZeroDivisionError):
             pass
@@ -460,7 +460,7 @@ def run_classification(
         f" --db {shlex.quote(str(ref_to_use))}"
         f" --id 0.8"
         f" --strand both"
-        f" --blast6out {shlex.quote(str(matches_path))}"
+        f" --userout {shlex.quote(str(matches_path))}"
         f" --userfields {VSEARCH_USERFIELDS}"
         f" --maxaccepts 1 --maxhits 1"
         f" --query_cov 0.7"   # require 70% query coverage
@@ -614,7 +614,7 @@ def run_classification_single(
         f" --db {shlex.quote(str(ref_to_use))}"
         f" --id 0.8"
         f" --strand both"
-        f" --blast6out {shlex.quote(str(matches_path))}"
+        f" --userout {shlex.quote(str(matches_path))}"
         f" --userfields {VSEARCH_USERFIELDS}"
         f" --maxaccepts 1 --maxhits 1"
         f" --query_cov 0.7"

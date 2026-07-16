@@ -1,0 +1,16 @@
+Field	Value
+schema_version	1.0
+workflow	performance_review
+stage_label	Performance Review
+status	FAILED
+started_at	2026-07-15T18:45:59Z
+completed_at	2026-07-15T18:45:59Z
+branchmanager_version	0.1
+git_revision	0d4943b3fc5f3d3b9b39b31ef6f53aded39465fa
+error	[PERFORMANCE REVIEW] No cultured baseline is registered. Supply --baseline-fasta for this run or establish it first with `branchmanager filing-cabinet`.
+command	cli.py performance-review --input .../02_paper_trail_merge_meeting/assembled.fasta --partner-metadata .../Sequence_Metadata.csv --db .../project.db --dataset UoG_1 --ref .../gtdb_r232_bac_arch_ssu_reps.fna.gz --marker-review .../review.tsv -o .../UoG_01/03_performance_review_v3
+stage:performance_review	RUNNING | taxonomy, novelty, MSA/tree, and assessment
+input:marker_fasta	/home/nickd/Git/BranchManager/src/branchmanager/.../02_paper_trail_merge_meeting/assembled.fasta | sha256=NA
+input:partner_metadata	/home/nickd/Git/BranchManager/src/branchmanager/.../Sequence_Metadata.csv | sha256=NA
+input:primary_reference	/home/nickd/Git/BranchManager/src/branchmanager/.../gtdb_r232_bac_arch_ssu_reps.fna.gz | sha256=NA
+input:marker_review	/home/nickd/Git/BranchManager/src/branchmanager/.../review.tsv | sha256=NA
