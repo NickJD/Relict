@@ -15,7 +15,7 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from branchmanager.cli import _find_preferred_id_map, _load_partner_metadata_for_run, _load_performance_review_baseline, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_filing_cabinet, cmd_performance_review
+from branchmanager.cli import _find_preferred_id_map, _load_partner_metadata_for_run, _load_performance_review_baseline, _resolve_mailroom_interview_input, _resolve_reference_inputs, _write_output_explanations, build_parser, cmd_filing_cabinet, cmd_interview, cmd_performance_review
 from branchmanager.db.interface import Database
 from branchmanager import mailroom as mailroom_module
 from branchmanager.pipeline import classify as classify_pipeline
@@ -388,10 +388,84 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.out, 'paper_trail_out')
         self.assertEqual(args.min_quality, 25)
         self.assertEqual(args.min_overlap, 30)
-        self.assertEqual(args.min_length, 700)
-        self.assertIsNone(args.min_read_length)
+        self.assertEqual(args.min_length, 800)
+        self.assertEqual(args.min_read_length, 300)
         self.assertEqual(args.primers, ['27F', '907R'])
         self.assertEqual(args.sample_map, 'reads.tsv')
+
+    def test_build_parser_accepts_standalone_interview(self):
+        args = build_parser().parse_args([
+            'interview', '--mailroom', 'QUB_01_mailroom',
+            '--screen-ref', 'gtdb.fna.gz', '--threads', '8', '-o', 'qc_out',
+        ])
+
+        self.assertEqual(args.command, 'interview')
+        self.assertEqual(args.mailroom, 'QUB_01_mailroom')
+        self.assertEqual(args.screen_ref, 'gtdb.fna.gz')
+        self.assertEqual(args.threads, 8)
+        self.assertEqual(args.out, 'qc_out')
+        self.assertFalse(hasattr(args, 'db'))
+
+    def test_interview_resolves_mailroom_output_and_delegates_to_shared_qc(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mailroom = Path(tmpdir) / 'mailroom'
+            mailroom.mkdir()
+            (mailroom / 'ab1_map.tsv').write_text(
+                'sequence_id\tdataset\tread_file\tprimer\tdirection\tprocessing_mode\tprimer_assignment\n'
+                'ISO1\tQUB_01\tread.ab1\t27F\tforward\tbest_read\tsupplied\n'
+            )
+            (mailroom / 'mailroom_summary.json').write_text('{"status": "PASS"}\n')
+            args = build_parser().parse_args([
+                'interview', '--mailroom', str(mailroom), '-o', str(Path(tmpdir) / 'qc'),
+            ])
+
+            with mock.patch('branchmanager.cli.cmd_paper_trail') as qc:
+                cmd_interview(args)
+
+            qc.assert_called_once_with(args)
+            self.assertEqual(args.sample_map, str((mailroom / 'ab1_map.tsv').resolve()))
+            self.assertEqual(args.mailroom_summary, str((mailroom / 'mailroom_summary.json').resolve()))
+            self.assertEqual(args.mailroom_status, 'PASS')
+            self.assertEqual(args.input, [])
+
+    def test_interview_requires_explicit_acceptance_of_mailroom_review(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mailroom = Path(tmpdir)
+            (mailroom / 'ab1_map.tsv').write_text(
+                'sequence_id\tdataset\tread_file\tprimer\tdirection\tprocessing_mode\tprimer_assignment\n'
+                'ISO1\tQUB_01\tread.ab1\tunknown\tforward\tbest_read\tunresolved\n'
+            )
+            (mailroom / 'mailroom_summary.json').write_text(
+                '{"status": "REVIEW_REQUIRED"}\n'
+            )
+
+            with self.assertRaises(SystemExit):
+                _resolve_mailroom_interview_input(mailroom)
+            _, _, status = _resolve_mailroom_interview_input(mailroom, allow_review=True)
+            self.assertEqual(status, 'REVIEW_REQUIRED')
+
+    def test_paper_trail_and_assistant_share_qc_defaults(self):
+        parser = build_parser()
+        paper_trail = parser.parse_args([
+            'paper-trail', '--input', 'reads', '-o', 'out',
+        ])
+        assistant = parser.parse_args([
+            'assistant', '--sample-map', 'map.tsv', '--partner-metadata', 'meta.tsv',
+            '--db', 'project.db', '--dataset', 'Batch1', '--ref', 'gtdb.fasta',
+            '-o', 'out',
+        ])
+        for field in (
+            'min_quality', 'min_length', 'min_read_length', 'min_mean_quality',
+            'mask_quality', 'max_read_expected_errors', 'max_output_expected_errors',
+            'warn_n_percent', 'max_n_percent', 'warn_internal_low_quality_run',
+            'max_internal_low_quality_run', 'secondary_peak_ratio',
+            'max_mixed_peak_percent', 'mixed_peak_min_quality',
+            'max_conflict_density', 'quality_difference', 'min_overlap',
+            'min_overlap_identity',
+        ):
+            self.assertEqual(getattr(paper_trail, field), getattr(assistant, field), field)
+        self.assertEqual(assistant.baseline_extension_min_identity, 98.65)
+        self.assertEqual(assistant.baseline_extension_min_query_coverage, 95.0)
 
     def test_build_parser_accepts_performance_review_mwl_flags(self):
         parser = build_parser()
@@ -427,8 +501,12 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertFalse(args.baseline_shorten_ids)
         self.assertEqual(args.sequence_domain, 'archaea')
         self.assertEqual(args.neighbourhood_format, 'png')
-        self.assertEqual(args.pangenome_target, 3)
-        self.assertEqual(args.candidate_set_size, 4)
+        self.assertEqual(args.pangenome_target, 9)
+        self.assertEqual(args.candidate_set_size, 9)
+        self.assertEqual(args.baseline_redundancy_identity, 99.8)
+        self.assertEqual(args.baseline_redundancy_min_query_coverage, 95.0)
+        self.assertEqual(args.baseline_extension_min_identity, 98.65)
+        self.assertEqual(args.baseline_extension_min_query_coverage, 95.0)
 
         with self.assertRaises(SystemExit):
             parser.parse_args([
@@ -447,7 +525,10 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.command, 'quarterly-review')
         self.assertEqual(args.genome_budget, 24)
         self.assertEqual(args.backups_per_primary, 2)
-        self.assertEqual(args.pangenome_target, 3)
+        self.assertEqual(args.pangenome_target, 9)
+        self.assertEqual(args.baseline_redundancy_identity, 99.8)
+        self.assertEqual(args.baseline_extension_min_identity, 98.65)
+        self.assertEqual(args.baseline_extension_min_query_coverage, 95.0)
         self.assertEqual(args.alignment, 'current_alignment.fasta')
         self.assertEqual(args.assessment, ['sequence_assessment.tsv'])
 
@@ -1203,7 +1284,6 @@ class OutputHelperTests(unittest.TestCase):
                 [str(reads)],
                 tmp / 'out',
                 min_quality=20,
-                window=4,
                 min_length=8,
                 min_overlap=8,
                 min_overlap_identity=0.90,
@@ -1237,7 +1317,6 @@ class OutputHelperTests(unittest.TestCase):
                 [str(reads)],
                 tmp / 'out',
                 min_quality=20,
-                window=4,
                 min_length=8,
                 min_overlap=18,
                 min_overlap_identity=0.85,
@@ -1294,7 +1373,6 @@ class OutputHelperTests(unittest.TestCase):
                 tmp / 'out',
                 sample_map=str(sample_map),
                 min_quality=20,
-                window=4,
                 min_length=8,
                 min_overlap=8,
                 min_overlap_identity=0.90,
@@ -1384,7 +1462,6 @@ class OutputHelperTests(unittest.TestCase):
                 tmp / 'out',
                 sample_map=str(sample_map),
                 min_quality=10,
-                window=4,
                 min_length=8,
                 min_overlap=8,
                 min_overlap_identity=0.90,
@@ -1406,7 +1483,6 @@ class OutputHelperTests(unittest.TestCase):
                 [str(read)],
                 tmp / 'out',
                 min_quality=20,
-                window=4,
                 min_length=20,
                 min_read_length=8,
             )
@@ -1414,11 +1490,18 @@ class OutputHelperTests(unittest.TestCase):
             self.assertEqual(dict(read_fasta(out['assembled_fasta'])), {})
             self.assertEqual(dict(read_fasta(out['failed_final_fasta'])), {'IsoShort': 'ACGTACGTACGT'})
             self.assertEqual(dict(read_fasta(out['failed_read_fasta'])), {})
-            failed_manifest = Path(out['failed_manifest_tsv']).read_text()
-            self.assertIn('final\tIsoShort\tIsoShort\t\tFAIL_QC\tRESEQUENCE\tfiltered_output_length_lt_20', failed_manifest)
-            report = Path(out['assembly_tsv']).read_text()
-            self.assertIn('IsoShort\tfiltered_output_length_lt_20\t1\t1\t12', report)
-            self.assertIn('\tno\toutput_length_lt_20;read_level_warnings\t', report)
+            with open(out['failed_manifest_tsv']) as handle:
+                failed_rows = list(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(len(failed_rows), 1)
+            self.assertEqual(failed_rows[0]['SequenceID'], 'IsoShort')
+            self.assertEqual(failed_rows[0]['QCClass'], 'FAIL_QC')
+            self.assertEqual(failed_rows[0]['Status'], 'filtered_output_length_lt_20')
+            with open(out['assembly_tsv']) as handle:
+                report_row = next(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(report_row['Status'], 'filtered_output_length_lt_20')
+            self.assertEqual(report_row['OutputLength'], '12')
+            self.assertEqual(report_row['PassLengthQC'], 'no')
+            self.assertIn('output_length_lt_20', report_row['Reasons'])
 
     def test_paper_trail_masks_internal_low_quality_and_recommends_resequence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1440,15 +1523,73 @@ class OutputHelperTests(unittest.TestCase):
 
             self.assertEqual(dict(read_fasta(out['assembled_fasta'])), {})
             self.assertIn('IsoBad|read=IsoBad_27F', '\n'.join(dict(read_fasta(out['failed_read_fasta'])).keys()))
-            failed_manifest = Path(out['failed_manifest_tsv']).read_text()
-            self.assertIn('read\tIsoBad\tIsoBad_27F', failed_manifest)
-            self.assertIn('internal_low_quality_run_gt_5', failed_manifest)
+            with open(out['failed_manifest_tsv']) as handle:
+                failed_isolates = list(csv.DictReader(handle, delimiter='\t'))
+            with open(out['failed_read_manifest_tsv']) as handle:
+                failed_reads = list(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual([row['SequenceID'] for row in failed_isolates], ['IsoBad'])
+            self.assertEqual([row['ReadID'] for row in failed_reads], ['IsoBad_27F'])
+            self.assertIn('internal_low_quality_run_gt_5', failed_reads[0]['Reasons'])
+            guide = Path(out['failed_qc_guide']).read_text()
+            self.assertIn('exactly one row per failed isolate', guide)
+            self.assertIn('failed_no_reads', guide)
             read_qc = Path(out['read_qc_tsv']).read_text()
             self.assertIn('internal_low_quality_run_gt_5', read_qc)
             self.assertIn('MaskedBases', read_qc)
             recommendations = Path(out['recommendations_tsv']).read_text()
             self.assertIn('IsoBad\tRESEQUENCE\tFAIL_QC', recommendations)
             self.assertIn('failed_no_reads', recommendations)
+
+    def test_paper_trail_uses_tiered_ambiguity_policy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fastq = tmp / 'tiered.fastq'
+
+            def record(sequence_id, low_quality_bases):
+                sequence = 'A' * 50 + 'C' * low_quality_bases + 'G' * (50 - low_quality_bases)
+                qualities = [35] * 50 + [10] * low_quality_bases + [35] * (50 - low_quality_bases)
+                quality_text = ''.join(chr(value + 33) for value in qualities)
+                return f'@{sequence_id}_27F\n{sequence}\n+\n{quality_text}\n'
+
+            fastq.write_text(
+                record('IsoHigh', 1)
+                + record('IsoReview', 4)
+                + record('IsoFail', 6)
+            )
+            out = paper_trail_pipeline.run_paper_trail(
+                [fastq],
+                tmp / 'out',
+                min_length=80,
+                min_read_length=80,
+            )
+
+            with open(out['assembly_tsv']) as handle:
+                rows = {
+                    row['SequenceID']: row
+                    for row in csv.DictReader(handle, delimiter='\t')
+                }
+            self.assertEqual(rows['IsoHigh']['QCClass'], 'PASS_HIGH_CONFIDENCE')
+            self.assertEqual(rows['IsoHigh']['Recommendation'], 'ACCEPT')
+            self.assertEqual(rows['IsoReview']['QCClass'], 'PASS_WITH_WARNINGS')
+            self.assertEqual(rows['IsoReview']['Recommendation'], 'MANUAL_REVIEW')
+            self.assertIn('output_n_percent_gt_3', rows['IsoReview']['Reasons'])
+            self.assertEqual(rows['IsoFail']['QCClass'], 'FAIL_QC')
+            self.assertEqual(rows['IsoFail']['Recommendation'], 'RESEQUENCE')
+            with open(out['marker_review_template_tsv']) as handle:
+                review_rows = list(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual([row['sequence_id'] for row in review_rows], ['IsoReview'])
+            self.assertEqual(review_rows[0]['decision'], '')
+
+    def test_overlap_quality_difference_controls_conflict_resolution(self):
+        resolved = paper_trail_pipeline._posterior_consensus(
+            'A', 40, 'C', 20, quality_difference=10,
+        )
+        unresolved = paper_trail_pipeline._posterior_consensus(
+            'A', 40, 'C', 20, quality_difference=30,
+        )
+        self.assertEqual(resolved[0], 'A')
+        self.assertEqual(unresolved[0], 'N')
+        self.assertTrue(unresolved[2])
 
     def test_paper_trail_accepts_sequencing_id_mapping_with_prefixed_ab1_names(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2023,7 +2164,7 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('GenomeAlreadySequenced', text)
             self.assertIn('RelatedGenomeCladeGE97', text)
             self.assertIn('PartnerQ1\tFalse\tFalse\tSelectedPrev\t99.50\t1\t1\t1\tTrue', text)
-            self.assertIn('\t3\t3\tbaseline_genomes_and_project_ledger', text)
+            self.assertIn('\t9\t9\tbaseline_genomes_and_project_ledger', text)
 
     def test_build_sequence_assessment_rows_combines_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2179,7 +2320,10 @@ class OutputHelperTests(unittest.TestCase):
                 'GenomeAlreadySequenced\tRecommendation\tSequencingSetID',
                 text,
             )
-            self.assertIn('Iso001\tQUB\tFalse\tNA\tPRIORITISE - SET PRIMARY\tSET_A\tPRIMARY\t1\tHIGH', text)
+            self.assertIn(
+                'Iso001\tQUB\tFalse\tNA\tPRIORITISE - SET PRIMARY\tSET_A\tPRIMARY\t1\tNA\tNA\tHIGH',
+                text,
+            )
             self.assertIn('MWL target match (g__Novel)', text)
             self.assertIn('neighbourhoods/clade_001.png', text)
             self.assertIn('Iso002\tUoG\tFalse\tNA\tLOWER PRIORITY - TARGET MET\tSET_B\tTARGET_MET', text)
@@ -2271,7 +2415,9 @@ class OutputHelperTests(unittest.TestCase):
             rows = [{
                 'id': 'Q1', 'partner_id': 'QUB', 'taxonomy': taxonomy,
                 'classification_identity': '99.0', 'selected_for_genome_sequencing': 'False',
-                'nearest_identity': '99.0', 'density_source': 'baseline:Hungate',
+                'nearest_identity': '99.0', 'nearest_query_coverage': '100.0',
+                'nearest_hit': 'H1', 'nearest_hit_taxonomy': taxonomy,
+                'density_source': 'baseline:Hungate',
                 'project_density_source': 'project_collection', 'reference_density_source': 'reference_fasta',
                 'genome_available_count_same_species': '2',
                 'genome_selected_count_same_species': '1',
@@ -2281,13 +2427,147 @@ class OutputHelperTests(unittest.TestCase):
             }]
 
             output = selection_sets_pipeline.build_sequencing_sets(
-                rows, tmp / 'sequencing_sets.tsv', db=db,
+                rows, tmp / 'sequencing_sets.tsv', db=db, pangenome_target=3,
             )
 
-            self.assertEqual(rows[0]['sequencing_set_role'], 'TARGET_MET')
+            self.assertEqual(rows[0]['sequencing_set_role'], 'DIVERSITY_CANDIDATE')
+            self.assertEqual(rows[0]['sequencing_set_rank'], '1')
             text = Path(output).read_text()
             self.assertIn('H1;H2;P1', text)
             self.assertIn('\t2\t1\t0\t3\t', text)
+
+    def test_lone_baseline_genome_anchors_a_same_species_pangenome_extension(self):
+        taxonomy = 'd__Bacteria; g__Anchor; s__Anchor species'
+        common = {
+            'partner_id': 'QUB', 'taxonomy': taxonomy,
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'nearest_hit': 'BASELINE_1', 'nearest_hit_taxonomy': taxonomy,
+            'nearest_query_coverage': '100.0', 'project_nearest_identity': '98.0',
+            'reference_nearest_identity': '99.0', 'selected_for_genome_sequencing': 'False',
+            'already_sequenced': 'False', 'genome_available_count_same_species': '1',
+            'genome_selected_count_same_species': '0', 'genome_pending_count_same_species': '0',
+            'placement_flags': '',
+        }
+        rows = [
+            {**common, 'id': 'EXTENSION', 'nearest_identity': '99.10'},
+            {**common, 'id': 'REDUNDANT', 'nearest_identity': '99.90'},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = selection_sets_pipeline.build_sequencing_sets(
+                rows, Path(tmpdir) / 'sequencing_sets.tsv',
+            )
+            written = list(csv.DictReader(open(output), delimiter='\t'))
+
+        extension = next(row for row in rows if row['id'] == 'EXTENSION')
+        redundant = next(row for row in rows if row['id'] == 'REDUNDANT')
+        self.assertTrue(extension['sequencing_set_id'].startswith('BMEXT_'))
+        self.assertEqual(extension['selection_group_type'], 'BASELINE_PANGENOME_EXTENSION')
+        self.assertEqual(extension['sequencing_set_role'], 'PRIMARY')
+        self.assertEqual(extension['sequencing_set_rank'], '1')
+        self.assertEqual(extension['baseline_extension_status'], 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION')
+        self.assertEqual(redundant['sequencing_set_role'], 'BASELINE_REDUNDANT')
+        self.assertEqual(written[0]['PangenomeGap'], '8')
+        self.assertEqual(written[0]['BaselineAnchorIDs'], 'BASELINE_1')
+
+    def test_baseline_extension_requires_exact_species_and_close_full_length_marker(self):
+        candidate_taxonomy = 'd__Bacteria; g__Anchor; s__Anchor species'
+        baseline_taxonomy = 'd__Bacteria; g__Anchor; s__Different species'
+        common = {
+            'partner_id': 'QUB', 'taxonomy': candidate_taxonomy,
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'nearest_hit': 'BASELINE_1', 'nearest_query_coverage': '100.0',
+            'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+            'genome_available_count_same_species': '1', 'placement_flags': '',
+        }
+        rows = [
+            {**common, 'id': 'MISMATCH', 'nearest_hit_taxonomy': baseline_taxonomy,
+             'nearest_identity': '99.10'},
+            {**common, 'id': 'TOO_DISTANT', 'nearest_hit_taxonomy': candidate_taxonomy,
+             'nearest_identity': '98.00'},
+            {**common, 'id': 'SHORT_OVERLAP', 'nearest_hit_taxonomy': candidate_taxonomy,
+             'nearest_identity': '99.10', 'nearest_query_coverage': '80.0'},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_sets_pipeline.build_sequencing_sets(rows, Path(tmpdir) / 'sets.tsv')
+
+        self.assertTrue(all(row['sequencing_set_role'] == 'PANGENOME_BOUNDARY_REVIEW' for row in rows))
+        self.assertEqual(rows[0]['baseline_extension_status'], 'BASELINE_SPECIES_MISMATCH')
+        self.assertEqual(rows[1]['baseline_extension_status'], 'BASELINE_IDENTITY_BELOW_EXTENSION_THRESHOLD')
+        self.assertEqual(rows[2]['baseline_extension_status'], 'BASELINE_COVERAGE_BELOW_EXTENSION_THRESHOLD')
+        self.assertTrue(all(row['sequencing_set_rank'] == 'NA' for row in rows))
+
+    def test_sequencing_sets_rank_nine_diverse_candidates_and_exclude_baseline_duplicate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rows = []
+            for index in range(1, 11):
+                rows.append({
+                    'id': f'Q{index:02d}', 'partner_id': 'QUB',
+                    'taxonomy': 'd__Bacteria; g__Panel; s__Panel species',
+                    'classification_identity': '99.0', 'classification_confidence': '0.99',
+                    'nearest_identity': f'{99.7 - index * 0.2:.2f}',
+                    'nearest_query_coverage': '100.0',
+                    'project_nearest_identity': '98.0', 'reference_nearest_identity': '98.0',
+                    'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+                    'genome_committed_count_same_species': '0', 'placement_flags': '',
+                })
+            rows.append({
+                'id': 'REDUNDANT_MWL', 'partner_id': 'UoG',
+                'taxonomy': 'd__Bacteria; g__Panel; s__Panel species',
+                'classification_identity': '99.0', 'classification_confidence': '0.99',
+                'nearest_identity': '99.90', 'nearest_query_coverage': '100.0',
+                'project_nearest_identity': '95.0', 'reference_nearest_identity': '95.0',
+                'mwl_matched_rank': 'species', 'mwl_score': '100.0',
+                'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+                'genome_committed_count_same_species': '0', 'placement_flags': '',
+            })
+
+            output = selection_sets_pipeline.build_sequencing_sets(
+                rows, Path(tmpdir) / 'sequencing_sets.tsv',
+            )
+
+            roles = [row['sequencing_set_role'] for row in rows]
+            self.assertEqual(roles.count('PRIMARY'), 9)
+            self.assertEqual(roles.count('ALTERNATE'), 1)
+            self.assertEqual(roles.count('BASELINE_REDUNDANT'), 1)
+            ranked = sorted(
+                int(row['sequencing_set_rank']) for row in rows
+                if row['sequencing_set_rank'] != 'NA'
+            )
+            self.assertEqual(ranked, list(range(1, 10)))
+            redundant = next(row for row in rows if row['id'] == 'REDUNDANT_MWL')
+            self.assertEqual(redundant['baseline_redundancy_status'], 'EXCLUDED_NEAR_IDENTICAL_BASELINE')
+            self.assertIn('MWL evidence does not override redundancy', redundant['sequencing_set_reason'])
+            text = Path(output).read_text()
+            self.assertIn('DiversityPanelSize\tEligibleCandidateCount\tRankedCandidateCount', text)
+            self.assertIn('BaselineRedundancyIdentityThreshold', text)
+
+    def test_selection_fallback_ranks_diversity_before_mwl_and_uses_mwl_as_tiebreak(self):
+        common = {
+            'partner_id': 'QUB',
+            'taxonomy': 'd__Bacteria; g__Panel; s__Panel species',
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'nearest_query_coverage': '100.0', 'project_nearest_identity': '98.0',
+            'reference_nearest_identity': '98.0', 'selected_for_genome_sequencing': 'False',
+            'already_sequenced': 'False', 'genome_committed_count_same_species': '0',
+            'placement_flags': '',
+        }
+        rows = [
+            {**common, 'id': 'DIVERSE', 'nearest_identity': '95.0'},
+            {**common, 'id': 'MWL', 'nearest_identity': '97.0', 'mwl_matched_rank': 'species', 'mwl_score': '100'},
+            {**common, 'id': 'PLAIN', 'nearest_identity': '97.0'},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_sets_pipeline.build_sequencing_sets(rows, Path(tmpdir) / 'sets.tsv')
+
+        ranks = {row['id']: int(row['sequencing_set_rank']) for row in rows}
+        self.assertEqual(ranks['DIVERSE'], 1)
+        self.assertLess(ranks['MWL'], ranks['PLAIN'])
+
+    def test_mwl_priority_does_not_by_itself_label_a_clade_novel(self):
+        self.assertFalse(selection_sets_pipeline._novel_looking([{
+            'nearest_identity': '99.9', 'reference_nearest_identity': '99.9',
+            'mwl_matched_rank': 'species', 'mwl_score': '100',
+        }]))
 
     def test_already_sequenced_is_a_state_not_a_new_recommendation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2420,6 +2700,62 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('BetaA', Path(outputs['selected']).read_text())
             self.assertIn('GammaGenome', Path(outputs['summary']).read_text())
             self.assertIn('ScientificScope', Path(outputs['manifest']).read_text())
+
+    def test_quarterly_review_preserves_baseline_extension_boundary(self):
+        candidate_taxonomy = 'd__Bacteria; g__Anchor; s__Anchor species'
+        common = {
+            'partner_id': 'QUB', 'taxonomy': candidate_taxonomy,
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'nearest_hit': 'BASELINE_1', 'nearest_query_coverage': '100.0',
+            'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+            'genome_available_count_same_species': '1',
+            'genome_committed_count_same_species': '1', 'placement_flags': '',
+        }
+        rows = [
+            {**common, 'id': 'EXTENSION', 'nearest_hit_taxonomy': candidate_taxonomy,
+             'nearest_identity': '99.10'},
+            {**common, 'id': 'BOUNDARY',
+             'nearest_hit_taxonomy': 'd__Bacteria; g__Anchor; s__Different species',
+             'nearest_identity': '99.10'},
+        ]
+        recommendations = quarterly_review_pipeline.build_quarterly_review(
+            rows, genome_budget=1,
+        )
+        by_id = {item['sequence_id']: item for item in recommendations}
+
+        self.assertEqual(by_id['EXTENSION']['role'], 'PRIMARY')
+        self.assertEqual(by_id['EXTENSION']['selection_group_type'], 'BASELINE_PANGENOME_EXTENSION')
+        self.assertEqual(by_id['BOUNDARY']['role'], 'PANGENOME_BOUNDARY_REVIEW')
+        self.assertEqual(by_id['BOUNDARY']['baseline_extension_status'], 'BASELINE_SPECIES_MISMATCH')
+
+    def test_quarterly_review_excludes_near_identical_baseline_even_with_mwl(self):
+        common = {
+            'partner_id': 'QUB',
+            'taxonomy': 'd__Bacteria; g__Panel; s__Panel species',
+            'classification_identity': '99.5', 'classification_confidence': '0.99',
+            'project_nearest_identity': '98.0', 'reference_nearest_identity': '98.0',
+            'nearest_genome_identity': '98.0', 'selected_for_genome_sequencing': 'False',
+            'already_sequenced': 'False', 'genome_committed_count_same_species': '0',
+            'placement_flags': '',
+        }
+        rows = [
+            {
+                **common, 'id': 'REDUNDANT', 'nearest_identity': '99.9',
+                'nearest_query_coverage': '100.0', 'mwl_matched_rank': 'species',
+            },
+            {
+                **common, 'id': 'DIVERSE', 'nearest_identity': '97.0',
+                'nearest_query_coverage': '100.0',
+            },
+        ]
+
+        recommendations = quarterly_review_pipeline.build_quarterly_review(
+            rows, genome_budget=1, backups_per_primary=0,
+        )
+        by_id = {row['sequence_id']: row for row in recommendations}
+        self.assertEqual(by_id['DIVERSE']['role'], 'PRIMARY')
+        self.assertEqual(by_id['REDUNDANT']['role'], 'BASELINE_REDUNDANT')
+        self.assertIn('MWL evidence does not override redundancy', by_id['REDUNDANT']['recommendation_reason'])
 
     def test_quarterly_review_refreshes_available_genome_identity_from_current_alignment(self):
         with tempfile.TemporaryDirectory() as tmpdir:

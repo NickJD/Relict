@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 
 from branchmanager.pipeline import tree as tree_pipeline
+from branchmanager.pipeline.selection_sets import DEFAULT_PANGENOME_TARGET
 from branchmanager.taxonomy import parse_taxon_string
 from branchmanager.utils.fasta import read_fasta, write_fasta
 from branchmanager.utils.subprocess import run_cmd
@@ -798,8 +799,8 @@ def _empty_pool_metrics(qids, *, source: str = 'none'):
     }
 
 
-def _empty_sequencing_context(qids, pangenome_target: int = 3):
-    target_count = max(1, int(pangenome_target or 3))
+def _empty_sequencing_context(qids, pangenome_target: int = DEFAULT_PANGENOME_TARGET):
+    target_count = max(1, int(pangenome_target or DEFAULT_PANGENOME_TARGET))
     return {
         qid: {
             'partner_id': 'NA',
@@ -833,7 +834,7 @@ def _compute_sequencing_context(
     qids,
     primary_metrics,
     threads: Optional[int] = None,
-    pangenome_target: int = 3,
+    pangenome_target: int = DEFAULT_PANGENOME_TARGET,
 ):
     if db is None:
         return _empty_sequencing_context(qids, pangenome_target)
@@ -958,7 +959,7 @@ def _compute_sequencing_context(
             1 for sid in same_species_ids if collection_metadata[sid].get('selected_pending')
         )
         same_species_committed = same_species_baseline + same_species_partner_available + same_species_pending
-        target_count = max(1, int(pangenome_target or 3))
+        target_count = max(1, int(pangenome_target or DEFAULT_PANGENOME_TARGET))
         pangenome_gap = max(0, target_count - same_species_committed)
         base = primary_metrics.get(qid, {})
         try:
@@ -1095,7 +1096,7 @@ def build_reference_novelty_metrics(
     run_dataset: Optional[str] = None,
     target_fasta: Optional[str] = None,
     baseline_datasets=None,
-    pangenome_target: int = 3,
+    pangenome_target: int = DEFAULT_PANGENOME_TARGET,
 ):
     """Write per-sequence novelty metrics comparing against user-submitted sequences.
 

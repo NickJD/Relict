@@ -1,11 +1,17 @@
 import sqlite3
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / 'src'
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 from branchmanager.cli import _resolve_novelty_baseline_datasets, build_parser, cmd_filing_cabinet
 from branchmanager.db.interface import Database
@@ -464,6 +470,7 @@ class OperationalWorkflowTests(unittest.TestCase):
         parser = build_parser()
         cases = (
             (['mailroom', '--read-dir', 'reads', '--metadata', 'supplier.csv', '--dataset', 'QUB_01', '-o', 'out'], 'mailroom'),
+            (['interview', '--mailroom', 'mailroom_out', '-o', 'out'], 'interview'),
             (['filing-cabinet', '--fasta', 'b.fa', '--db', 'p.db', '--dataset', 'Hungate'], 'filing-cabinet'),
             (['performance-review', '--input', 'q.fa', '--db', 'p.db', '--dataset', 'QUB', '-o', 'out'], 'performance-review'),
             (['quarterly-review', '--db', 'p.db', '--genome-budget', '3', '-o', 'out'], 'quarterly-review'),

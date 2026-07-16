@@ -3,13 +3,15 @@
 Implements the BranchManager office workflow and technical reporting utilities.
 """
 import argparse
+import csv
+import json
 import logging
 import os
 import shutil
 import sys
 from pathlib import Path
 
-# When invoked directly (python src/branchmanager/PhenGO-Predict.py) the package root (src)
+# When this file is invoked directly, the package root (src)
 # may not be on sys.path. Ensure the parent of this `branchmanager` package is
 # available so absolute imports like `branchmanager.db.interface` work.
 try:
@@ -21,7 +23,17 @@ except Exception:
     pass
 
 from branchmanager.db.interface import Database
-from branchmanager.pipeline import classify, tree, itol, qc, derep, novelty, neighbourhood, quarterly_review
+from branchmanager.pipeline import (
+    classify,
+    derep,
+    itol,
+    neighbourhood,
+    novelty,
+    paper_trail as _paper_trail_module,
+    qc,
+    quarterly_review,
+    tree,
+)
 from branchmanager.pipeline import cluster_report as _cluster_report
 from branchmanager.pipeline import mwl as _mwl
 from branchmanager.pipeline import selection_sets as _selection_sets
@@ -403,7 +415,8 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "`assessment/selection_summary.tsv` is the decision-facing table. It separates scientific value from redundancy and marker-evidence quality:",
         "",
         "- `Recommendation`: primary, backup, secondary, review, target-met, or already-sequenced action; the reason is explicit in `RecommendationReason`.",
-        "- `SequencingSetID`, `SequencingSetRole`, `SequencingSetRank`: connect each isolate to its clade-level working set. `PRIMARY` rows fill the three-genome target; `BACKUP` rows protect against DNA-extraction failure and improve strain-level spread.",
+        "- `SequencingSetID`, `SelectionGroupType`, `SequencingSetRole`, `SequencingSetRank`: connect each isolate to its nine-member diversity panel. `BMEXT_*` identifies a baseline-pangenome extension; `BMSET_*` identifies a candidate-only group. `PRIMARY` rows fill the target, `BACKUP` rows protect against DNA-extraction failure, and redundancy/boundary rows are retained without a rank.",
+        "- `BaselineExtensionStatus`: explains whether exact GTDB species agreement, >=98.65% cultured-baseline identity, and >=95% query coverage support membership in a baseline-pangenome extension.",
         "- `EvidenceQuality`: whether the marker classification and placement warnings are strong enough to support selection.",
         "- `MarkerQC`, `MarkerReview`: Paper Trail/Merge Meeting evidence and any explicit manual decision. Unreviewed warning/unverified markers cannot become PRIMARY/BACKUP.",
         "- `CulturedGap`: distance from the cultured baseline: large below 97 percent, moderate from 97 to below 98.65 percent, small at or above 98.65 percent.",
@@ -434,7 +447,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "- `Baseline*` columns compare only against explicit baseline datasets such as Hungate or datasets supplied with `--novelty-baseline-dataset`.",
         "- `Project*` columns compare against all partner candidate datasets, including the current rolling collection and excluding each query's self-hit. Baseline datasets are not mixed into this pool.",
         "- `Reference*` columns compare against the chosen external reference FASTA supplied with `--ref`, usually GTDB. These are separate from the baseline/project novelty scores.",
-        "- `GenomeCollection*` columns compare against every baseline genome and every partner isolate with a genome already available. Exact same-GTDB-species counts drive the three-genome target; nearest-hit identity is supporting context only.",
+        "- `GenomeCollection*` columns compare against every baseline genome and every partner isolate with a genome already available. Exact same-GTDB-species counts drive the nine-genome target, while baseline identity and query coverage prevent near-identical cultured isolates from consuming diversity-panel ranks.",
         "- `NearestIdentity`: vsearch global-alignment percent identity to the nearest sequence in that pool.",
         "- `NearestQueryCoverage`, `NearestAlignmentLength`: how much marker evidence supports that identity; low-coverage identity must not be treated as a full-length equivalent.",
         "- `Novel`: `True` when nearest identity is below 97 percent.",
@@ -562,11 +575,14 @@ def _write_output_explanations(outdir: str):
             'Use sequence_assessment.tsv for the full audit trail.'
         )),
         ('sequencing_sets.tsv', (
-            'Rolling clade-level genome-sequencing plan. Every candidate is assigned PRIMARY, BACKUP, '
-            'ALTERNATE, SEQUENCED, REVIEW_EVIDENCE, or TARGET_MET within an exact GTDB-species group '
-            'or an unresolved local-tree clade. PRIMARY rows fill the pangenome target; BACKUP rows '
-            'provide extraction-failure resilience and additional strain-level diversity. One '
-            'DIVERSITY_CANDIDATE may be retained after target completion when exceptional evidence remains.'
+            'Rolling clade-level nine-member genome-sequencing diversity panel. Every candidate is '
+            'placed in a BMEXT baseline-pangenome extension or a BMSET candidate-only group. A baseline '
+            'extension requires exact GTDB species agreement, close marker identity, and adequate query '
+            'coverage. PRIMARY rows '
+            'fill the pangenome target; BACKUP and DIVERSITY_CANDIDATE rows preserve extraction-failure '
+            'resilience and additional within-group spread. BASELINE_REDUNDANT rows remain auditable but '
+            'are excluded using the reported identity and query-coverage thresholds; '
+            'PANGENOME_BOUNDARY_REVIEW rows require lineage review before grouping.'
         )),
         ('neighbourhood_manifest.tsv', 'Maps each assessed sequence to its grouped local-clade image and pairwise-pident table, including the P1 identity anchor, forced nearest-baseline hits, displayed leaf count, assessed peers, baseline leaves, and already-sequenced leaves.'),
         ('visual_report_manifest.tsv', 'Page index for Paper Trail PNG reports. Records each page file, read/isolate range, dimensions, configured height ceiling, and any split-isolate continuation.'),
@@ -2001,7 +2017,9 @@ def _cmd_performance_review_impl(args):
             run_dataset=run_dataset,
             target_fasta=target_fasta,
             baseline_datasets=novelty_baseline_datasets,
-            pangenome_target=getattr(args, 'pangenome_target', 3),
+            pangenome_target=getattr(
+                args, 'pangenome_target', _selection_sets.DEFAULT_PANGENOME_TARGET,
+            ),
         )
         logging.getLogger(__name__).info("[NOVELTY] Wrote novelty metrics to %s", novelty_metrics_out)
     except Exception as e:
@@ -2491,8 +2509,28 @@ def _cmd_performance_review_impl(args):
                         Path(outdir) / 'sequencing_sets.tsv',
                         tree_path=_tree_nwk if Path(_tree_nwk).exists() else None,
                         db=db,
-                        pangenome_target=getattr(args, 'pangenome_target', 3),
-                        candidate_set_size=getattr(args, 'candidate_set_size', 4),
+                        pangenome_target=getattr(
+                            args, 'pangenome_target', _selection_sets.DEFAULT_PANGENOME_TARGET,
+                        ),
+                        candidate_set_size=getattr(
+                            args, 'candidate_set_size', _selection_sets.DEFAULT_CANDIDATE_SET_SIZE,
+                        ),
+                        baseline_redundancy_identity=getattr(
+                            args, 'baseline_redundancy_identity',
+                            _selection_sets.DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
+                        ),
+                        baseline_redundancy_min_query_coverage=getattr(
+                            args, 'baseline_redundancy_min_query_coverage',
+                            _selection_sets.DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
+                        ),
+                        baseline_extension_min_identity=getattr(
+                            args, 'baseline_extension_min_identity',
+                            _selection_sets.DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
+                        ),
+                        baseline_extension_min_query_coverage=getattr(
+                            args, 'baseline_extension_min_query_coverage',
+                            _selection_sets.DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
+                        ),
                     )
                     logging.getLogger(__name__).info(
                         "[SELECTION SETS] Wrote rolling clade candidate sets to %s",
@@ -2569,12 +2607,14 @@ def _cmd_performance_review_impl(args):
                     decisions = [build_selection_decision(row)['decision'] for row in assessment_rows]
                     logging.getLogger(__name__).info(
                         "[ASSESSMENT SUMMARY] %d assessed: %d PRIMARY, %d BACKUP, "
-                        "%d SECONDARY/STRONG, %d REVIEW, %d TARGET MET, %d ALREADY SEQUENCED. "
+                        "%d DIVERSITY/SECONDARY, %d BASELINE REDUNDANT, %d REVIEW, "
+                        "%d TARGET MET, %d ALREADY SEQUENCED. "
                         "See assessment/selection_summary.tsv for the decision table.",
                         len(assessment_rows),
                         sum(d == 'PRIORITISE - SET PRIMARY' for d in decisions),
                         sum(d == 'RESERVE - SET BACKUP' for d in decisions),
                         sum(d in ('STRONG CANDIDATE', 'SECONDARY CANDIDATE', 'SECONDARY - STRAIN DIVERSITY') for d in decisions),
+                        sum(d == 'EXCLUDE - BASELINE REDUNDANT' for d in decisions),
                         sum(d.startswith('REVIEW') for d in decisions),
                         sum(d == 'LOWER PRIORITY - TARGET MET' for d in decisions),
                         sum(d == 'ALREADY SEQUENCED' for d in decisions),
@@ -3165,12 +3205,20 @@ def build_parser():
         argparse.ArgumentDefaultsHelpFormatter,
         argparse.RawDescriptionHelpFormatter,
     ), {'max_help_position': 40, 'width': 120})
+    paper_trail_policy = _paper_trail_module.DEFAULT_QC_POLICY
+    selection_target = _selection_sets.DEFAULT_PANGENOME_TARGET
+    selection_panel_size = _selection_sets.DEFAULT_CANDIDATE_SET_SIZE
+    baseline_redundancy_identity = _selection_sets.DEFAULT_BASELINE_REDUNDANCY_IDENTITY
+    baseline_redundancy_coverage = _selection_sets.DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE
+    baseline_extension_identity = _selection_sets.DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY
+    baseline_extension_coverage = _selection_sets.DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE
     parser = argparse.ArgumentParser(
         prog='branchmanager',
         description=(
             'BranchManager — marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation toolkit.\n\n'
             'Subcommands:\n'
             '  mailroom           Inventory AB1 deliveries and build a batch map.\n'
+            '  interview          Run standalone AB1 QC from a Mailroom batch.\n'
             '  background-check   Pre-classify reference collections once and reuse the evidence.\n'
             '  filing-cabinet     Register the cultured baseline and backbone tree.\n'
             '  onboarding         Validate a partner submission before project state changes.\n'
@@ -3187,6 +3235,7 @@ def build_parser():
             '  label-maker        Regenerate iTOL annotation files from stored taxonomy.\n\n'
             'Typical workflow:\n'
             '  P. branchmanager mailroom --read-dir All_AB1 --metadata supplier.csv --dataset QUB_01 --forward-primer 63F -o QUB_01\n'
+            '  Q. branchmanager interview --mailroom QUB_01 -o QUB_01_interview\n'
             '  0. branchmanager background-check --dataset hungate16s=hungate.fasta --ref gtdb.fna --taxa gtdb_tax.tsv -o background_check_out\n'
             '  1. branchmanager filing-cabinet --fasta baseline.fasta --db project.db --dataset Hungate --taxa-assignments background_check_out/pipeline_taxonomy.tsv --build-tree -o filing_cabinet_out\n'
             '  2. branchmanager performance-review --input new_seqs.fasta --partner-metadata new_seqs_metadata.tsv --db project.db --dataset Batch1 --ref gtdb.fna --mwl MWL.xlsx -o review_out\n'
@@ -3425,12 +3474,28 @@ def build_parser():
         help='Image format for local phylogenetic-neighbourhood figures (PNG only).',
     )
     performance_review_parser.add_argument(
-        '--pangenome-target', dest='pangenome_target', type=int, default=3,
-        help='Target number of available genomes per GTDB species (default: 3). Baseline isolates always count because their genomes are available.',
+        '--pangenome-target', dest='pangenome_target', type=int, default=selection_target,
+        help='Target number of committed genomes per GTDB species/local pangenome group (default: 9). Baseline isolates count because their genomes are available.',
     )
     performance_review_parser.add_argument(
-        '--candidate-set-size', dest='candidate_set_size', type=int, default=4,
-        help='Maximum proposed primary-plus-backup isolates per GTDB species/local novel clade (default: 4).',
+        '--candidate-set-size', dest='candidate_set_size', type=int, default=selection_panel_size,
+        help='Maximum ranked diversity-panel candidates per GTDB species/local clade (default: 9).',
+    )
+    performance_review_parser.add_argument(
+        '--baseline-redundancy-identity', type=float, default=baseline_redundancy_identity,
+        help='Exclude uncommitted candidates at or above this nearest cultured-baseline marker identity when coverage also passes its threshold (default: 99.8).',
+    )
+    performance_review_parser.add_argument(
+        '--baseline-redundancy-min-query-coverage', type=float, default=baseline_redundancy_coverage,
+        help='Minimum query coverage required before baseline near-identity exclusion is applied (default: 95).',
+    )
+    performance_review_parser.add_argument(
+        '--baseline-extension-min-identity', type=float, default=baseline_extension_identity,
+        help='Minimum cultured-baseline 16S identity for a same-species candidate to enter a baseline-pangenome extension (default: 98.65).',
+    )
+    performance_review_parser.add_argument(
+        '--baseline-extension-min-query-coverage', type=float, default=baseline_extension_coverage,
+        help='Minimum query coverage for admission to a baseline-pangenome extension (default: 95).',
     )
     performance_review_parser.add_argument('--user-colours', dest='user_colours', required=False,
         help='CSV file mapping sequence IDs to custom hex colours for iTOL (columns: id, colour).')
@@ -3462,7 +3527,7 @@ def build_parser():
         help='Select the next project-wide genome tranche after rolling Performance Reviews.',
         description=(
             'Reconsider every accumulated partner isolate in one auditable selection round.\n\n'
-            'Residual three-genome coverage gaps are filled first. Remaining budget is allocated\n'
+            'Residual nine-genome coverage gaps are filled first. Remaining budget is allocated\n'
             'across species using marginal tree/marker diversity, existing genome representation,\n'
             'cultured-baseline novelty, GTDB-reference context, and MWL evidence. Recommendations\n'
             'never change already_sequenced status. Use genome ANI/phylogenomics to validate\n'
@@ -3478,8 +3543,16 @@ def build_parser():
         help='Number of new PRIMARY genomes to nominate in this round. This is intentionally explicit.')
     quarterly_review_parser.add_argument('--backups-per-primary', type=int, default=1,
         help='Number of extraction-failure/diversity backups to nominate per primary (default: 1).')
-    quarterly_review_parser.add_argument('--pangenome-target', type=int, default=3,
-        help='Initial exact-GTDB-species coverage target that must be satisfied before expansion (default: 3).')
+    quarterly_review_parser.add_argument('--pangenome-target', type=int, default=selection_target,
+        help='Initial exact-GTDB-species/local-group coverage target before expansion (default: 9).')
+    quarterly_review_parser.add_argument('--baseline-redundancy-identity', type=float, default=baseline_redundancy_identity,
+        help='Exclude uncommitted candidates at or above this cultured-baseline marker identity (default: 99.8).')
+    quarterly_review_parser.add_argument('--baseline-redundancy-min-query-coverage', type=float, default=baseline_redundancy_coverage,
+        help='Minimum query coverage required for baseline redundancy exclusion (default: 95).')
+    quarterly_review_parser.add_argument('--baseline-extension-min-identity', type=float, default=baseline_extension_identity,
+        help='Minimum same-species cultured-baseline marker identity for baseline-pangenome extension membership (default: 98.65).')
+    quarterly_review_parser.add_argument('--baseline-extension-min-query-coverage', type=float, default=baseline_extension_coverage,
+        help='Minimum query coverage for baseline-pangenome extension membership (default: 95).')
     quarterly_review_parser.add_argument('--assessment', action='append', default=None, metavar='TSV',
         help='Import a full sequence_assessment.tsv before selection (repeatable; later files supersede earlier rows). Future Performance Reviews store snapshots automatically.')
     quarterly_review_parser.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', default=None,
@@ -3638,11 +3711,11 @@ def build_parser():
     paper_trail_parser.add_argument('--trim-primers', dest='trim_primers',
         action=argparse.BooleanOptionalAction, default=True,
         help='Remove confidently matched primer sequence from the retained read (default: enabled).')
-    paper_trail_parser.add_argument('--secondary-peak-ratio', dest='secondary_peak_ratio', type=float, default=0.33,
+    paper_trail_parser.add_argument('--secondary-peak-ratio', dest='secondary_peak_ratio', type=float, default=paper_trail_policy.secondary_peak_ratio,
         help='Secondary/called chromatogram peak ratio considered mixed (default: 0.33).')
-    paper_trail_parser.add_argument('--max-mixed-peak-percent', dest='max_mixed_peak_percent', type=float, default=15.0,
+    paper_trail_parser.add_argument('--max-mixed-peak-percent', dest='max_mixed_peak_percent', type=float, default=paper_trail_policy.max_mixed_peak_percent,
         help='Maximum percent retained high-quality positions with mixed peaks before read QC failure (default: 15).')
-    paper_trail_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=20,
+    paper_trail_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=paper_trail_policy.mixed_peak_min_quality,
         help='Minimum Phred score for a mixed-peak position to count (default: 20).')
     paper_trail_parser.add_argument('--screen-ref', dest='screen_ref', default=None,
         help='Optional marker reference FASTA for independent per-primer taxonomy concordance screening.')
@@ -3650,36 +3723,38 @@ def build_parser():
         help='Optional taxonomy table corresponding to --screen-ref; FASTA header taxonomy is used when omitted.')
     paper_trail_parser.add_argument('--threads', type=int, default=4,
         help='CPU threads for optional primer-read taxonomy screening (default: 4).')
-    paper_trail_parser.add_argument('--min-quality', dest='min_quality', type=int, default=20,
+    paper_trail_parser.add_argument('--min-quality', dest='min_quality', type=int, default=paper_trail_policy.min_quality,
         help='Phred cutoff for Mott-style end trimming (default: 20).')
-    paper_trail_parser.add_argument('--window', type=int, default=10,
-        help='Window size retained in reports for trimming context; rigorous trimming uses the Phred cutoff directly.')
-    paper_trail_parser.add_argument('--min-length', dest='min_length', type=int, default=800,
+    paper_trail_parser.add_argument('--min-length', dest='min_length', type=int, default=paper_trail_policy.min_final_length,
         help='Minimum final sequence length to write to assembled.fasta (default: 800 bp).')
-    paper_trail_parser.add_argument('--min-read-length', dest='min_read_length', type=int, default=None,
-        help='Minimum trimmed read length to retain before assembly/best-read selection. Defaults to --min-length.')
-    paper_trail_parser.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=20.0,
+    paper_trail_parser.add_argument('--min-read-length', dest='min_read_length', type=int, default=paper_trail_policy.min_read_length,
+        help='Minimum trimmed read length allowed to contribute to an assembly or best-read decision (default: 300 bp).')
+    paper_trail_parser.add_argument('--min-mean-quality', dest='min_mean_quality', type=float, default=paper_trail_policy.min_mean_quality,
         help='Minimum mean Phred score after trimming/masking for read and final QC (default: 20).')
-    paper_trail_parser.add_argument('--mask-quality', dest='mask_quality', type=int, default=20,
+    paper_trail_parser.add_argument('--mask-quality', dest='mask_quality', type=int, default=paper_trail_policy.mask_quality,
         help='Mask internal bases below this Phred score to N before assembly (default: 20).')
-    paper_trail_parser.add_argument('--max-read-expected-errors', dest='max_read_expected_errors', type=float, default=8.0,
+    paper_trail_parser.add_argument('--max-read-expected-errors', dest='max_read_expected_errors', type=float, default=paper_trail_policy.max_read_expected_errors,
         help='Maximum expected base-call errors allowed per retained read (default: 8).')
-    paper_trail_parser.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=10.0,
-        help='Maximum expected base-call errors allowed in the final isolate sequence (default: 10).')
-    paper_trail_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=2.0,
-        help='Maximum percent N allowed after masking for reads and final output (default: 2.0).')
-    paper_trail_parser.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=20,
+    paper_trail_parser.add_argument('--max-output-expected-errors', dest='max_output_expected_errors', type=float, default=paper_trail_policy.max_output_expected_errors,
+        help='Maximum expected base-call errors allowed in the final isolate sequence (default: 5).')
+    paper_trail_parser.add_argument('--warn-n-percent', dest='warn_n_percent', type=float, default=paper_trail_policy.warn_n_percent,
+        help='Percent N above which a passing sequence requires manual review (default: 3.0).')
+    paper_trail_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=paper_trail_policy.max_n_percent,
+        help='Maximum percent N allowed after masking before QC failure (default: 5.0).')
+    paper_trail_parser.add_argument('--warn-internal-lowq-run', dest='warn_internal_low_quality_run', type=int, default=paper_trail_policy.warn_internal_low_quality_run,
+        help='Internal low-quality run length above which manual review is required (default: 5 bp).')
+    paper_trail_parser.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=paper_trail_policy.max_internal_low_quality_run,
         help='Maximum internal low-quality/ambiguous run length before read failure (default: 20 bp).')
-    paper_trail_parser.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=1.0,
+    paper_trail_parser.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=paper_trail_policy.max_conflict_density,
         help='Maximum overlap conflicts per 100 final bases before final QC failure (default: 1.0).')
-    paper_trail_parser.add_argument('--quality-difference', dest='quality_difference', type=int, default=10,
-        help='Minimum Phred difference required to choose one conflicting overlap base over another (default: 10).')
+    paper_trail_parser.add_argument('--quality-difference', dest='quality_difference', type=int, default=paper_trail_policy.quality_difference,
+        help='Minimum Phred-scaled posterior odds required to resolve a conflicting overlap base (default: 10).')
     paper_trail_parser.add_argument('--allow-missing-quality', dest='allow_missing_quality',
         action='store_true', default=False,
         help='Allow AB1 reads missing PCON quality scores to pass with warnings. By default they fail QC.')
-    paper_trail_parser.add_argument('--min-overlap', dest='min_overlap', type=int, default=40,
+    paper_trail_parser.add_argument('--min-overlap', dest='min_overlap', type=int, default=paper_trail_policy.min_overlap,
         help='Minimum overlap length for assembling multiple primer reads (default: 40 bp).')
-    paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=0.95,
+    paper_trail_parser.add_argument('--min-overlap-identity', dest='min_overlap_identity', type=float, default=paper_trail_policy.min_overlap_identity,
         help='Minimum overlap identity for assembly, 0-1 (default: 0.95).')
     paper_trail_parser.add_argument('--assemble', dest='assemble',
         action=argparse.BooleanOptionalAction, default=True,
@@ -3718,6 +3793,59 @@ def build_parser():
         help='Search the AB1 directory recursively (default: enabled).')
     mailroom_parser.add_argument('-o', '--out', required=True,
         help='Output directory for ab1_map.tsv, AB1 inventory, discrepancy report, and summary.')
+
+    interview_parser = sub.add_parser(
+        'interview',
+        help='Interview: run standalone AB1 conversion, assembly, and QC from Mailroom output.',
+        description=(
+            'Run the same versioned AB1 QC policy used by Assistant, starting from a completed '
+            'Mailroom output directory or its ab1_map.tsv. Interview writes converted and assembled '
+            'FASTA files, QC tables, chromatogram and assembly PNGs, manual-review records, and '
+            'resequencing recommendations. It does not read or modify a BranchManager project database.'
+        ),
+        formatter_class=_Fmt,
+    )
+    interview_parser.add_argument(
+        '--mailroom', required=True,
+        help='Mailroom output directory, or its ab1_map.tsv file.',
+    )
+    interview_parser.add_argument(
+        '--primer-sequence', dest='primer_sequences', action='append', default=None,
+        metavar='NAME=SEQUENCE',
+        help='Confirmed primer oligonucleotide for leading-primer removal (repeatable).',
+    )
+    interview_parser.add_argument(
+        '--trim-primers', dest='trim_primers', action=argparse.BooleanOptionalAction,
+        default=True, help='Remove confidently matched leading primer sequences (default: enabled).',
+    )
+    interview_parser.add_argument(
+        '--screen-ref', dest='screen_ref', default=None,
+        help='Optional marker reference FASTA for independent per-read taxonomy concordance screening.',
+    )
+    interview_parser.add_argument(
+        '--screen-taxa', dest='screen_taxa', default=None,
+        help='Optional taxonomy table corresponding to --screen-ref.',
+    )
+    interview_parser.add_argument(
+        '--threads', type=int, default=4,
+        help='CPU threads for optional taxonomy screening (default: 4).',
+    )
+    interview_parser.add_argument(
+        '--allow-missing-quality', action='store_true', default=False,
+        help='Allow traces missing PCON quality scores to pass with warnings.',
+    )
+    interview_parser.add_argument(
+        '--allow-mailroom-review', action='store_true', default=False,
+        help='Process a REVIEW_REQUIRED Mailroom batch after an explicit review; FAIL batches are always rejected.',
+    )
+    interview_parser.add_argument(
+        '--max-report-image-height', type=int, default=2400,
+        help='Maximum PNG height before automatic pagination (minimum: 600, default: 2400).',
+    )
+    interview_parser.add_argument(
+        '-o', '--out', required=True,
+        help='Output directory for standalone AB1 QC, converted FASTA files, and visual reports.',
+    )
 
     onboarding_parser = sub.add_parser(
         'onboarding',
@@ -3843,43 +3971,63 @@ def build_parser():
     assistant_parser.add_argument('--threads', type=int, default=4,
         help='CPU threads for vsearch and MAFFT (default: 4).')
     assistant_parser.add_argument('--tree-method', choices=['fasttree', 'iqtree', 'iqtree-fast'], default='fasttree')
-    assistant_parser.add_argument('--pangenome-target', type=int, default=3)
-    assistant_parser.add_argument('--candidate-set-size', type=int, default=4)
+    assistant_parser.add_argument('--pangenome-target', type=int, default=selection_target)
+    assistant_parser.add_argument('--candidate-set-size', type=int, default=selection_panel_size)
+    assistant_parser.add_argument('--baseline-redundancy-identity', type=float, default=baseline_redundancy_identity)
+    assistant_parser.add_argument('--baseline-redundancy-min-query-coverage', type=float, default=baseline_redundancy_coverage)
+    assistant_parser.add_argument('--baseline-extension-min-identity', type=float, default=baseline_extension_identity)
+    assistant_parser.add_argument('--baseline-extension-min-query-coverage', type=float, default=baseline_extension_coverage)
     assistant_parser.add_argument('--primer', dest='primers', action='append', default=None)
     assistant_parser.add_argument('--primer-sequence', dest='primer_sequences', action='append', default=None,
         metavar='NAME=SEQUENCE', help='Primer sequence used for IUPAC-aware trimming; repeatable.')
     assistant_parser.add_argument('--trim-primers', dest='trim_primers',
         action=argparse.BooleanOptionalAction, default=True)
-    assistant_parser.add_argument('--min-quality', type=int, default=15,
-        help='Phred cutoff for Mott-style end trimming (default: 15).')
-    assistant_parser.add_argument('--quality-window', dest='window', type=int, default=10,
-        help='Window size for trimming context reports (default: 10).')
-    assistant_parser.add_argument('--min-marker-length', dest='min_length', type=int, default=800,
+    assistant_parser.add_argument('--min-quality', type=int, default=paper_trail_policy.min_quality,
+        help='Phred cutoff for Mott-style end trimming (default: 20).')
+    assistant_parser.add_argument('--min-marker-length', dest='min_length', type=int, default=paper_trail_policy.min_final_length,
         help='Minimum final assembled sequence length in bp (default: 800).')
-    assistant_parser.add_argument('--min-mean-quality', type=float, default=20.0,
+    assistant_parser.add_argument('--min-read-length', type=int, default=paper_trail_policy.min_read_length,
+        help='Minimum trimmed primer-read length allowed to contribute to an assembly (default: 300 bp).')
+    assistant_parser.add_argument('--min-mean-quality', type=float, default=paper_trail_policy.min_mean_quality,
         help='Minimum mean Phred quality after trimming (default: 20.0).')
-    assistant_parser.add_argument('--max-read-expected-errors', type=float, default=8.0,
+    assistant_parser.add_argument('--mask-quality', type=int, default=paper_trail_policy.mask_quality,
+        help='Mask internal bases below this Phred score to N (default: 20).')
+    assistant_parser.add_argument('--max-read-expected-errors', type=float, default=paper_trail_policy.max_read_expected_errors,
         help='Maximum expected errors per retained read (default: 8.0).')
-    assistant_parser.add_argument('--max-output-expected-errors', type=float, default=5.0,
+    assistant_parser.add_argument('--max-output-expected-errors', type=float, default=paper_trail_policy.max_output_expected_errors,
         help='Maximum expected errors in the final assembled sequence (default: 5.0).')
-    assistant_parser.add_argument('--max-n-percent', type=float, default=3.0,
-        help='Maximum percent N bases allowed after masking (default: 3.0).')
-    assistant_parser.add_argument('--secondary-peak-ratio', type=float, default=0.33,
+    assistant_parser.add_argument('--warn-n-percent', type=float, default=paper_trail_policy.warn_n_percent,
+        help='Percent N above which a passing sequence requires manual review (default: 3.0).')
+    assistant_parser.add_argument('--max-n-percent', type=float, default=paper_trail_policy.max_n_percent,
+        help='Maximum percent N bases allowed after masking before QC failure (default: 5.0).')
+    assistant_parser.add_argument('--warn-internal-lowq-run', dest='warn_internal_low_quality_run', type=int, default=paper_trail_policy.warn_internal_low_quality_run,
+        help='Internal low-quality run length above which manual review is required (default: 5 bp).')
+    assistant_parser.add_argument('--max-internal-lowq-run', dest='max_internal_low_quality_run', type=int, default=paper_trail_policy.max_internal_low_quality_run,
+        help='Maximum internal low-quality/ambiguous run before QC failure (default: 20 bp).')
+    assistant_parser.add_argument('--secondary-peak-ratio', type=float, default=paper_trail_policy.secondary_peak_ratio,
         help='Secondary/called peak ratio threshold for mixed-base detection (default: 0.33).')
-    assistant_parser.add_argument('--max-mixed-peak-percent', type=float, default=15.0,
+    assistant_parser.add_argument('--max-mixed-peak-percent', type=float, default=paper_trail_policy.max_mixed_peak_percent,
         help='Maximum percent mixed-peak positions before read QC failure (default: 15.0).')
-    assistant_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=20,
+    assistant_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=paper_trail_policy.mixed_peak_min_quality,
         help='Minimum Phred score for a mixed-peak position to count (default: 20).')
+    assistant_parser.add_argument('--max-conflict-density', type=float, default=paper_trail_policy.max_conflict_density,
+        help='Maximum overlap conflicts per 100 final bases before QC failure (default: 1.0).')
+    assistant_parser.add_argument('--quality-difference', type=int, default=paper_trail_policy.quality_difference,
+        help='Phred-scaled posterior odds required to resolve an overlap conflict (default: 10).')
+    assistant_parser.add_argument('--allow-missing-quality', action='store_true', default=False,
+        help='Allow traces missing PCON quality scores to pass with warnings.')
     assistant_parser.add_argument('--max-report-image-height', type=int, default=2400,
         help='Maximum Paper Trail visual-report PNG height before automatic pagination (minimum: 600, default: 2400).')
-    assistant_parser.add_argument('--min-overlap', type=int, default=40)
-    assistant_parser.add_argument('--min-overlap-identity', type=float, default=0.85)
+    assistant_parser.add_argument('--min-overlap', type=int, default=paper_trail_policy.min_overlap)
+    assistant_parser.add_argument('--min-overlap-identity', type=float, default=paper_trail_policy.min_overlap_identity)
     assistant_parser.add_argument('--chimera-ref', default=None,
         help='Curated reference FASTA for UCHIME; defaults to the primary reference.')
     assistant_parser.add_argument('--skip-chimera-check', action='store_true', default=False,
         help='Audited override: continue with all markers marked for review.')
     assistant_parser.add_argument('--marker-qc', default=None,
         help='Marker-QC sidecar for --fasta submissions, such as a reviewed assembly_report.tsv.')
+    assistant_parser.add_argument('--marker-review', default=None,
+        help='CSV/TSV decisions for PASS_WITH_WARNINGS markers, with sequence_id, decision, reviewer, and optional notes.')
     assistant_parser.add_argument('--accept-unverified-marker-qc', action='store_true', default=False,
         help='Audited acceptance of a partner FASTA without BranchManager marker-QC provenance.')
     assistant_parser.add_argument('-o', '--out', required=True)
@@ -4064,10 +4212,87 @@ def cmd_background_check(args):
     )
 
 
-def cmd_paper_trail(args):
-    """Handler for the Paper Trail + Merge Meeting chromatogram workflow."""
-    from branchmanager.pipeline import paper_trail as _paper_trail_module
+def _resolve_mailroom_interview_input(
+    source: str | os.PathLike,
+    *,
+    allow_review: bool = False,
+) -> tuple[str, str, str]:
+    """Resolve and validate the immutable Mailroom hand-off used by Interview."""
+    supplied = Path(source).expanduser().resolve()
+    if supplied.is_dir():
+        map_path = supplied / 'ab1_map.tsv'
+        summary_path = supplied / 'mailroom_summary.json'
+    elif supplied.is_file():
+        map_path = supplied
+        summary_path = supplied.parent / 'mailroom_summary.json'
+    else:
+        raise SystemExit(f'[interview] Mailroom input does not exist: {supplied}')
 
+    if map_path.name != 'ab1_map.tsv' or not map_path.is_file():
+        raise SystemExit(
+            f'[interview] Expected a Mailroom ab1_map.tsv, but it was not found at {map_path}'
+        )
+    if not summary_path.is_file():
+        raise SystemExit(
+            f'[interview] Expected the accompanying Mailroom summary at {summary_path}'
+        )
+
+    try:
+        summary = json.loads(summary_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f'[interview] Could not read {summary_path}: {exc}') from exc
+    status = str(summary.get('status', '')).strip().upper()
+    if status not in {'PASS', 'REVIEW_REQUIRED', 'FAIL'}:
+        raise SystemExit(
+            f'[interview] Mailroom summary has an invalid or missing status: {status or "<blank>"}'
+        )
+    if status == 'FAIL':
+        raise SystemExit(
+            '[interview] Mailroom status is FAIL. Correct the Mailroom report before AB1 QC.'
+        )
+    if status == 'REVIEW_REQUIRED' and not allow_review:
+        raise SystemExit(
+            '[interview] Mailroom status is REVIEW_REQUIRED. Resolve its findings or repeat with '
+            '--allow-mailroom-review after documenting the review.'
+        )
+
+    with open(map_path, newline='') as handle:
+        reader = csv.DictReader(handle, delimiter='\t')
+        fields = {str(field).strip() for field in (reader.fieldnames or [])}
+        required = {
+            'sequence_id', 'dataset', 'read_file', 'primer', 'direction',
+            'processing_mode', 'primer_assignment',
+        }
+        missing = sorted(required - fields)
+        if missing:
+            raise SystemExit(
+                '[interview] Mailroom ab1_map.tsv is missing required column(s): '
+                + ', '.join(missing)
+            )
+        if next(reader, None) is None:
+            raise SystemExit('[interview] Mailroom ab1_map.tsv contains no reads.')
+
+    return str(map_path), str(summary_path), status
+
+
+def cmd_interview(args):
+    """Run standalone AB1 QC from a validated Mailroom batch."""
+    sample_map, summary, status = _resolve_mailroom_interview_input(
+        args.mailroom,
+        allow_review=bool(getattr(args, 'allow_mailroom_review', False)),
+    )
+    args.sample_map = sample_map
+    args.mailroom_summary = summary
+    args.mailroom_status = status
+    args.input = []
+    cmd_paper_trail(args)
+
+
+def cmd_paper_trail(args):
+    """Handler for standalone or Assistant Paper Trail chromatogram QC."""
+    is_interview = getattr(args, 'command', None) == 'interview'
+    command_name = 'interview' if is_interview else 'paper-trail'
+    workflow_name = 'interview' if is_interview else 'paper_trail'
     outdir = args.out
     os.makedirs(outdir, exist_ok=True)
     _configure_logging(outdir)
@@ -4075,26 +4300,43 @@ def cmd_paper_trail(args):
     inputs = getattr(args, 'input', None) or []
     sample_map = getattr(args, 'sample_map', None)
     if not inputs and not sample_map:
-        raise SystemExit('[paper-trail] Provide --input and/or --sample-map.')
+        raise SystemExit(f'[{command_name}] Provide --input and/or --sample-map.')
     primer_sequences = dict(_paper_trail_module.DEFAULT_PRIMER_SEQUENCES)
     for specification in getattr(args, 'primer_sequences', None) or []:
         if '=' not in str(specification):
-            raise SystemExit('[PAPER TRAIL] --primer-sequence must use NAME=SEQUENCE.')
+            raise SystemExit(f'[{command_name}] --primer-sequence must use NAME=SEQUENCE.')
         name, sequence = str(specification).split('=', 1)
         sequence = ''.join(sequence.split()).upper()
         if not name.strip() or len(sequence) < 12:
-            raise SystemExit('[PAPER TRAIL] --primer-sequence requires a name and at least 12 bases.')
+            raise SystemExit(
+                f'[{command_name}] --primer-sequence requires a name and at least 12 bases.'
+            )
         primer_sequences[name.strip().upper()] = sequence
-    manifest = RunManifest(outdir, 'paper_trail')
-    for source in [sample_map, getattr(args, 'screen_ref', None), getattr(args, 'screen_taxa', None)]:
+    manifest = RunManifest(outdir, workflow_name)
+    for source, role in (
+        (sample_map, 'sample_map'),
+        (getattr(args, 'mailroom_summary', None), 'mailroom_summary'),
+        (getattr(args, 'screen_ref', None), 'screen_reference'),
+        (getattr(args, 'screen_taxa', None), 'screen_taxonomy'),
+    ):
         if source:
-            manifest.add_input(source)
+            manifest.add_input(source, role=role)
+    if getattr(args, 'mailroom_status', 'PASS') != 'PASS':
+        manifest.warn(
+            'Interview proceeded after explicit acceptance of a REVIEW_REQUIRED Mailroom batch.'
+        )
     for source in inputs:
         manifest.add_input(
             source,
             role='raw_read' if Path(source).is_file() else 'raw_read_directory',
         )
     manifest.add_stage('paper_trail', 'RUNNING', detail='base calls, chromatogram evidence, and trimming')
+    policy = _paper_trail_module.DEFAULT_QC_POLICY
+
+    def setting(name, default):
+        value = getattr(args, name, None)
+        return default if value is None else value
+
     try:
         outputs = _paper_trail_module.run_paper_trail(
             inputs,
@@ -4103,27 +4345,28 @@ def cmd_paper_trail(args):
             primers=primers,
             primer_sequences=primer_sequences,
             trim_primers=bool(getattr(args, 'trim_primers', True)),
-            secondary_peak_ratio=float(getattr(args, 'secondary_peak_ratio', 0.33)),
-            max_mixed_peak_percent=float(getattr(args, 'max_mixed_peak_percent', 15.0)),
-            mixed_peak_min_quality=int(getattr(args, 'mixed_peak_min_quality', 20)),
+            secondary_peak_ratio=float(setting('secondary_peak_ratio', policy.secondary_peak_ratio)),
+            max_mixed_peak_percent=float(setting('max_mixed_peak_percent', policy.max_mixed_peak_percent)),
+            mixed_peak_min_quality=int(setting('mixed_peak_min_quality', policy.mixed_peak_min_quality)),
             screen_ref=getattr(args, 'screen_ref', None),
             screen_taxa=getattr(args, 'screen_taxa', None),
-            threads=int(getattr(args, 'threads', 4) or 4),
-            min_quality=int(getattr(args, 'min_quality', 15) or 15),
-            window=int(getattr(args, 'window', 10) or 10),
-            min_length=int(getattr(args, 'min_length', 700) or 700),
-            min_read_length=getattr(args, 'min_read_length', None),
-            min_mean_quality=float(getattr(args, 'min_mean_quality', 20.0) or 20.0),
-            mask_quality=int(getattr(args, 'mask_quality', 20) or 20),
-            max_read_expected_errors=float(getattr(args, 'max_read_expected_errors', 20.0) or 20.0),
-            max_output_expected_errors=float(getattr(args, 'max_output_expected_errors', 10.0) or 10.0),
-            max_n_percent=float(getattr(args, 'max_n_percent', 3.0) or 3.0),
-            max_internal_low_quality_run=int(getattr(args, 'max_internal_low_quality_run', 20) or 20),
-            max_conflict_density=float(getattr(args, 'max_conflict_density', 1.0) or 1.0),
-            quality_difference=int(getattr(args, 'quality_difference', 10) or 10),
+            threads=int(setting('threads', 4)),
+            min_quality=int(setting('min_quality', policy.min_quality)),
+            min_length=int(setting('min_length', policy.min_final_length)),
+            min_read_length=int(setting('min_read_length', policy.min_read_length)),
+            min_mean_quality=float(setting('min_mean_quality', policy.min_mean_quality)),
+            mask_quality=int(setting('mask_quality', policy.mask_quality)),
+            max_read_expected_errors=float(setting('max_read_expected_errors', policy.max_read_expected_errors)),
+            max_output_expected_errors=float(setting('max_output_expected_errors', policy.max_output_expected_errors)),
+            warn_n_percent=float(setting('warn_n_percent', policy.warn_n_percent)),
+            max_n_percent=float(setting('max_n_percent', policy.max_n_percent)),
+            warn_internal_low_quality_run=int(setting('warn_internal_low_quality_run', policy.warn_internal_low_quality_run)),
+            max_internal_low_quality_run=int(setting('max_internal_low_quality_run', policy.max_internal_low_quality_run)),
+            max_conflict_density=float(setting('max_conflict_density', policy.max_conflict_density)),
+            quality_difference=int(setting('quality_difference', policy.quality_difference)),
             allow_missing_quality=bool(getattr(args, 'allow_missing_quality', False)),
-            min_overlap=int(getattr(args, 'min_overlap', 40) or 40),
-            min_overlap_identity=float(getattr(args, 'min_overlap_identity', 0.85) or 0.85),
+            min_overlap=int(setting('min_overlap', policy.min_overlap)),
+            min_overlap_identity=float(setting('min_overlap_identity', policy.min_overlap_identity)),
             assemble=bool(getattr(args, 'assemble', True)),
             recursive=bool(getattr(args, 'recursive', True)),
             max_report_image_height=int(getattr(args, 'max_report_image_height', 2400) or 2400),
@@ -4131,9 +4374,12 @@ def cmd_paper_trail(args):
         manifest.add_stage('paper_trail', 'COMPLETE')
         manifest.add_stage('merge_meeting', 'COMPLETE', detail='per-isolate assembly or best-read selection')
         for key in (
-            'assembled_fasta', 'read_qc_tsv', 'assembly_tsv', 'assembly_placements_tsv',
-            'recommendations_tsv',
-            'visual_manifest_tsv',
+            'raw_fasta', 'trimmed_fasta', 'assembled_fasta', 'read_qc_tsv',
+            'per_base_error_tsv', 'assembly_tsv', 'assembly_placements_tsv',
+            'recommendations_tsv', 'marker_review_template_tsv', 'qc_policy_tsv',
+            'failed_final_fasta',
+            'failed_read_fasta', 'failed_manifest_tsv', 'failed_read_manifest_tsv',
+            'failed_qc_guide', 'visual_manifest_tsv', 'summary',
         ):
             manifest.add_output(outputs[key], role=key)
         for key in ('read_error_pngs', 'chromatogram_pngs', 'assembly_pngs'):
@@ -4143,9 +4389,22 @@ def cmd_paper_trail(args):
     except Exception as exc:
         manifest.finish('FAILED', error=exc)
         raise
-    logging.getLogger(__name__).info("[PAPER TRAIL] Final assembled FASTA: %s", outputs['assembled_fasta'])
+    logging.getLogger(__name__).info(
+        "[%s] Final assembled FASTA: %s", command_name.upper(), outputs['assembled_fasta'],
+    )
+    completion = (
+        'Standalone AB1 QC complete.' if is_interview
+        else 'Paper Trail + Merge Meeting complete.'
+    )
+    next_step = (
+        'No project database was read or changed. After resolving manual-review decisions, '
+        'provide assembled.fasta and assembly_report.tsv to Assistant as a reviewed FASTA submission.'
+        if is_interview else
+        'Use in Performance Review:\n'
+        f"  branchmanager performance-review --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
+    )
     print(
-        "[paper-trail] Paper Trail + Merge Meeting complete.\n"
+        f"[{command_name}] {completion}\n"
         f"  Assembled FASTA : {outputs['assembled_fasta']}\n"
         f"  Trimmed reads   : {outputs['trimmed_fasta']}\n"
         f"  Read QC         : {outputs['read_qc_tsv']}\n"
@@ -4153,14 +4412,17 @@ def cmd_paper_trail(args):
         f"  Assembly report : {outputs['assembly_tsv']}\n"
         f"  Read placements : {outputs['assembly_placements_tsv']}\n\n"
         f"  Resequence list : {outputs['recommendations_tsv']}\n"
+        f"  Review template : {outputs['marker_review_template_tsv']}\n"
         f"  QC policy       : {outputs['qc_policy_tsv']}\n"
         f"  Failed QC seqs  : {outputs['failed_qc_dir']}\n\n"
+        f"  Failed isolates : {outputs['failed_manifest_tsv']}\n"
+        f"  Failed reads    : {outputs['failed_read_manifest_tsv']}\n\n"
+        f"  Failure guide   : {outputs['failed_qc_guide']}\n\n"
         f"  Read visuals    : {len(outputs['read_error_pngs'])} page(s)\n"
         f"  Chromatograms   : {len(outputs['chromatogram_pngs'])} page(s)\n"
         f"  Assembly visuals: {len(outputs['assembly_pngs'])} page(s)\n"
         f"  Visual manifest : {outputs['visual_manifest_tsv']}\n\n"
-        "Use in Performance Review:\n"
-        f"  branchmanager performance-review --input {outputs['assembled_fasta']} --partner-metadata <metadata.tsv> ..."
+        f"{next_step}"
     )
 
 
@@ -4473,6 +4735,7 @@ def cmd_assistant(args):
     for role, source in (
         ('sample_map', args.sample_map), ('marker_fasta', args.fasta),
         ('partner_metadata', args.partner_metadata), ('marker_qc', args.marker_qc),
+        ('marker_review', args.marker_review),
         ('primary_reference', args.ref), ('reference_taxonomy', args.taxa),
         ('baseline_fasta', args.baseline_fasta), ('mwl', args.mwl),
         ('baseline_taxonomy', args.baseline_taxa_assignments),
@@ -4512,13 +4775,20 @@ def cmd_assistant(args):
                 command='paper-trail', input=[], out=str(paper_trail_dir),
                 sample_map=str(onboarding_dir / 'normalised_read_map.tsv'), primers=args.primers,
                 primer_sequences=args.primer_sequences, trim_primers=args.trim_primers,
-                min_quality=args.min_quality, window=args.window, min_length=args.min_length,
-                min_mean_quality=args.min_mean_quality,
+                min_quality=args.min_quality, min_length=args.min_length,
+                min_read_length=args.min_read_length, min_mean_quality=args.min_mean_quality,
+                mask_quality=args.mask_quality,
                 max_read_expected_errors=args.max_read_expected_errors,
                 max_output_expected_errors=args.max_output_expected_errors,
-                max_n_percent=args.max_n_percent,
+                warn_n_percent=args.warn_n_percent, max_n_percent=args.max_n_percent,
+                warn_internal_low_quality_run=args.warn_internal_low_quality_run,
+                max_internal_low_quality_run=args.max_internal_low_quality_run,
                 secondary_peak_ratio=args.secondary_peak_ratio,
                 max_mixed_peak_percent=args.max_mixed_peak_percent,
+                mixed_peak_min_quality=args.mixed_peak_min_quality,
+                max_conflict_density=args.max_conflict_density,
+                quality_difference=args.quality_difference,
+                allow_missing_quality=args.allow_missing_quality,
                 min_overlap=args.min_overlap, min_overlap_identity=args.min_overlap_identity,
                 screen_ref=args.ref, screen_taxa=args.taxa,
                 threads=args.threads,
@@ -4557,8 +4827,13 @@ def cmd_assistant(args):
             threads=args.threads, tree_method=args.tree_method,
             neighbourhood_format='png', pangenome_target=args.pangenome_target,
             candidate_set_size=args.candidate_set_size, user_colours=None,
+            baseline_redundancy_identity=args.baseline_redundancy_identity,
+            baseline_redundancy_min_query_coverage=args.baseline_redundancy_min_query_coverage,
+            baseline_extension_min_identity=args.baseline_extension_min_identity,
+            baseline_extension_min_query_coverage=args.baseline_extension_min_query_coverage,
             group_phyla=None, functional=None, draft_rumen_functions=False,
-            marker_qc=str(marker_qc) if marker_qc else None, marker_review=None,
+            marker_qc=str(marker_qc) if marker_qc else None,
+            marker_review=args.marker_review,
             accept_unverified_marker_qc=bool(args.accept_unverified_marker_qc),
             chimera_ref=args.chimera_ref or args.ref,
             skip_chimera_check=args.skip_chimera_check, collapse=False,
@@ -4670,6 +4945,10 @@ def _cmd_quarterly_review_impl(args):
         'GenomeBudget': int(args.genome_budget),
         'BackupsPerPrimary': int(args.backups_per_primary),
         'PangenomeTarget': int(args.pangenome_target),
+        'BaselineRedundancyIdentity': float(args.baseline_redundancy_identity),
+        'BaselineRedundancyMinQueryCoverage': float(args.baseline_redundancy_min_query_coverage),
+        'BaselineExtensionMinIdentity': float(args.baseline_extension_min_identity),
+        'BaselineExtensionMinQueryCoverage': float(args.baseline_extension_min_query_coverage),
         'IncludeModerateEvidence': bool(args.include_moderate_evidence),
         'Tree': str(Path(tree_path).resolve()) if tree_path else 'None',
         'Alignment': str(Path(alignment_path).resolve()) if alignment_path else 'None',
@@ -4683,6 +4962,10 @@ def _cmd_quarterly_review_impl(args):
         genome_budget=args.genome_budget,
         backups_per_primary=args.backups_per_primary,
         pangenome_target=args.pangenome_target,
+        baseline_redundancy_identity=args.baseline_redundancy_identity,
+        baseline_redundancy_min_query_coverage=args.baseline_redundancy_min_query_coverage,
+        baseline_extension_min_identity=args.baseline_extension_min_identity,
+        baseline_extension_min_query_coverage=args.baseline_extension_min_query_coverage,
         include_moderate=args.include_moderate_evidence,
     )
 
@@ -4829,6 +5112,8 @@ def main(argv=None):
         cmd_paper_trail(args)
     elif args.command == 'mailroom':
         cmd_mailroom(args)
+    elif args.command == 'interview':
+        cmd_interview(args)
     elif args.command == 'onboarding':
         cmd_onboarding(args)
     elif args.command == 'status-meeting':

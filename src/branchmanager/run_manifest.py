@@ -18,6 +18,7 @@ from branchmanager import __version__
 
 STAGE_LABELS = {
     'mailroom': 'Mailroom',
+    'interview': 'Interview',
     'onboarding': 'Onboarding',
     'paper_trail': 'Paper Trail',
     'merge_meeting': 'Merge Meeting',

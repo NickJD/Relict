@@ -26,6 +26,7 @@ It combines Sanger/AB1 quality control, marker-gene taxonomic classification, ne
 | Stage | Purpose |
 |---|---|
 | **Mailroom** | Inventory an AB1 delivery, reconcile supplier read IDs, and prepare the per-batch map |
+| **Interview** | Run standalone AB1 conversion, assembly, QC, and resequencing triage before project evaluation |
 | **Onboarding** | Validate partner IDs, metadata, and raw-file ownership before analysis |
 | **Paper Trail** | Read AB1 base calls, Phred scores, peak positions, dye channels, and mixed-peak evidence |
 | **Merge Meeting** | Trim primers and assemble multiple primer reads, or choose the best independent read |
@@ -199,6 +200,38 @@ Mailroom returns `REVIEW_REQUIRED` when files reconcile but primer names remain 
 
 ---
 
+### `branchmanager interview`
+
+Run AB1 conversion and QC without Onboarding, taxonomy, tree building, candidate selection, or any project-database access. Interview consumes the complete Mailroom output directory and uses the same versioned QC policy as `assistant`.
+
+```bash
+branchmanager interview \
+  --mailroom UoG/UoG_01 \
+  --screen-ref gtdb_r232_bac_arch_ssu_reps.fna.gz \
+  --threads 10 \
+  -o UoG/UoG_01_interview
+```
+
+`--screen-ref` is optional and only checks whether separate primer reads from the same isolate have discordant taxonomic hits. Without it, all chromatogram, trimming, assembly, quality, ambiguity, mixed-peak, and resequencing outputs are still produced.
+
+Interview accepts either the Mailroom directory or its `ab1_map.tsv`. It requires the accompanying `mailroom_summary.json`, rejects a Mailroom `FAIL`, and stops on `REVIEW_REQUIRED` unless the batch has been reviewed and `--allow-mailroom-review` is supplied explicitly.
+
+The principal hand-off files are `assembled.fasta`, `assembly_report.tsv`, `marker_review_template.tsv`, and `resequence_recommendations.tsv`. Once any manual-review decisions are completed, these can enter the full workflow without repeating chromatogram processing:
+
+```bash
+branchmanager assistant \
+  --fasta UoG/UoG_01_interview/assembled.fasta \
+  --marker-qc UoG/UoG_01_interview/assembly_report.tsv \
+  --marker-review UoG/UoG_01_interview/marker_review_template.tsv \
+  --partner-metadata Sequence_Metadata.csv \
+  --db project.sqlite --dataset UoG_01 --ref gtdb_ssu_reps.fna.gz \
+  -o runs/UoG_01
+```
+
+Do not supply the blank review template to Assistant. Add decisions only for the listed `PASS_WITH_WARNINGS` markers first; omit `--marker-review` when the template contains no rows.
+
+---
+
 ### `branchmanager onboarding`
 
 Every partner dataset is onboarded from exactly one marker source. AB1 submissions use a sample map; FASTA-only submissions use the FASTA directly. Both paths validate sequence IDs against the same cumulative project metadata ledger.
@@ -239,7 +272,7 @@ branchmanager paper-trail \
   --input ab1_reads/ \
   -o paper_trail_out \
   --min-quality 20 \
-  --min-mean-quality 25 \
+  --min-mean-quality 20 \
   --min-length 800 \
   --min-overlap 40
 
@@ -279,21 +312,23 @@ Onboarding writes `normalised_read_map.tsv` as the validated hand-off to Paper T
 
 `assemble`/`merge`/`consensus` orients the primer reads and tries to build one longer sequence. `best_read`/`highest_quality`/`select_best`/`independent` converts each read independently and writes only the highest-quality passing read for that isolate.
 
-BranchManager treats Sanger QC conservatively:
+BranchManager applies the same versioned Sanger QC policy in `interview`, `paper-trail`, and `assistant`:
 
 - `--min-quality` is a Phred cutoff used for Mott-style end trimming.
-- `--mask-quality` masks internal bases below the Phred cutoff to `N` before assembly.
+- `--mask-quality` masks internal bases below Q20 to `N` before assembly; masking is reported but does not by itself force manual review.
 - Primer sequences are removed only after a confident IUPAC-aware leading match; customise them with repeatable `--primer-sequence NAME=SEQUENCE`.
 - Mixed chromatogram peaks are measured from `PLOC` and four `DATA9`-`DATA12` dye channels. `--secondary-peak-ratio` and `--max-mixed-peak-percent` control the retained-region gate.
 - Overlap consensus bases use posterior base probabilities from both Phred observations; qualities are not added as if they were independent certainty scores.
 - `--screen-ref` optionally classifies each primer read independently and rejects family/genus discordance before consensus use.
-- `--min-mean-quality`, expected-error limits, `--max-n-percent`, and overlap conflict density determine `PASS_HIGH_CONFIDENCE`, `PASS_WITH_WARNINGS`, or `FAIL_QC`.
+- Final sequences must be at least 800 bp. Individual primer reads may be at least 300 bp so complementary reads can assemble into a valid final marker.
+- Ambiguous bases use a tiered rule: more than 3% requires manual review and more than 5% fails QC by default.
+- `--min-mean-quality`, expected-error limits, ambiguity, internal low-quality runs, mixed peaks, and overlap conflict density determine `PASS_HIGH_CONFIDENCE`, `PASS_WITH_WARNINGS`, or `FAIL_QC`.
 - Final `FAIL_QC` sequences are withheld from `assembled.fasta` and listed as `RESEQUENCE`.
 - Final `FAIL_QC` sequences and failed reads are retained under `failed_qc_sequences/` for manual review.
 - `PASS_WITH_WARNINGS` sequences are included but listed as `MANUAL_REVIEW`.
 - Visual reports are automatically split into numbered PNG pages before they exceed 2400 pixels high. Adjust the ceiling with `--max-report-image-height` (minimum 600 pixels).
 
-By default, reads and final outputs must be at least 800 bp. If shorter reads should be allowed into a multi-primer assembly while the final consensus still has to be 800 bp, use `--min-read-length`, for example `--min-read-length 100 --min-length 800`.
+The defaults follow Phred error probabilities and published Sanger guidance that Q20 is a reliable base call and that, as a general rule, trimmed sequence should contain less than 5% ambiguous bases. The 3% review boundary is deliberately more conservative for phylogenetic candidate selection. See [Ewing and Green 1998](https://doi.org/10.1101/gr.8.3.186) and [Crossley et al. 2020](https://doi.org/10.1177/1040638720905833).
 
 Outputs:
 
@@ -302,7 +337,9 @@ Outputs:
 | `assembled.fasta` | One trimmed/assembled sequence per isolate, suitable for `branchmanager performance-review --input` |
 | `failed_qc_sequences/failed_final_sequences.fasta` | Final isolate consensus/best-read sequences that failed final QC |
 | `failed_qc_sequences/failed_read_sequences.fasta` | Individual read sequences that failed read-level QC, oriented when direction is known |
-| `failed_qc_sequences/failed_qc_manifest.tsv` | Manifest linking each retained failed sequence to QC class, reasons, source reads, and recommendations |
+| `failed_qc_sequences/failed_qc_manifest.tsv` | One row per failed isolate, combining the final outcome with read IDs, source files, read-failure evidence, and the best recoverable read |
+| `failed_qc_sequences/failed_read_manifest.tsv` | One row per failed physical read with trimming and QC evidence; kept separate to avoid duplicate isolate rows |
+| `failed_qc_sequences/failed_qc_guide.txt` | Plain-language explanation of failure reason codes and the distinction between isolate- and read-level records |
 | `trimmed_oriented_reads.fasta` | Individual reads after quality trimming and primer-direction orientation |
 | `raw_reads.fasta` | Raw base calls extracted from AB1 or input sequence files |
 | `read_qc.tsv` | Per-read trimming, quality, expected error, length, and filter status |
@@ -313,7 +350,8 @@ Outputs:
 | `assembly_report.tsv` | Per-isolate assembly status, overlap identity, conflicts, unmerged reads, and contributing read IDs |
 | `assembly_read_placements.tsv` | Per-read consensus coordinates, aligned blocks, and whether the read contributed to the selected consensus |
 | `resequence_recommendations.tsv` | Per-isolate `ACCEPT`, `MANUAL_REVIEW`, or `RESEQUENCE` decision with reason codes and suggested action |
-| `paper_trail_qc_policy.tsv` | Thresholds used for the run, for reproducibility |
+| `marker_review_template.tsv` | Pre-filled rows for manual-review markers; complete `decision`, `reviewer`, and `notes`, then provide it as `--marker-review` |
+| `paper_trail_qc_policy.tsv` | Versioned thresholds actually used for the run, for reproducibility |
 | `visual_reports/assembly_overviews/assembly_overview_page_*.png` | Paginated per-isolate overviews with reads placed on consensus coordinates, contribution status, and assembly diagnostics |
 | `visual_reports/visual_report_manifest.tsv` | Page index with report type, record range, dimensions, and continuation notes |
 | `paper_trail_summary.txt` | Short run summary |
@@ -556,7 +594,13 @@ This table keeps the novelty lenses separate:
 - `Baseline*`: nearest hit and density against explicit cultured/baseline datasets such as Hungate.
 - `Project*`: nearest hit and density against all partner candidates accumulated across runs, including the current collection but excluding each query's self-hit.
 - `Reference*`: nearest hit and density against the selected external reference FASTA supplied with `--ref`, usually GTDB.
-- `GenomeCollection*` / `Pangenome*`: rolling genome coverage. Every baseline isolate counts because its genome is available; partner isolates count once marked selected. Exact GTDB-species counts drive the target, while nearest-genome identity remains supporting context.
+- `GenomeCollection*` / `Pangenome*`: rolling genome coverage. Every baseline isolate counts because its genome is available; partner isolates count once selected. The default target is nine committed genomes per exact GTDB species or unresolved local clade.
+- `SelectionGroupType`: `BASELINE_PANGENOME_EXTENSION` (`BMEXT_*`) means at least one baseline genome anchors the exact GTDB species; `CANDIDATE_PANGENOME_GROUP` (`BMSET_*`) has no baseline-genome anchor.
+- `BaselineExtension*`: membership gate for a baseline-pangenome extension. The candidate and nearest baseline must have the same exact GTDB species, with >=98.65% 16S identity across >=95% of the query by default. A failed gate is `PANGENOME_BOUNDARY_REVIEW`, not an automatic rejection: it may represent a separate candidate lineage.
+- `BaselineRedundancy*`: hard eligibility gate for uncommitted candidates. By default, a nearest cultured-baseline hit at >=99.8% identity across >=95% of the query is reported as `BASELINE_REDUNDANT` and receives no panel rank.
+- `SelectionDiversityDistance`: marginal patristic distance from baseline and already committed genome markers when tree distances are available. This drives farthest-first diversity capture; cultured-baseline, project, and GTDB-reference divergence provide the fallback, with MWL evidence used as an additional tie-break signal.
+
+A species represented by one baseline genome therefore starts at `1/9`, leaving eight primary genome slots. Eligible partner isolates are ranked to extend that baseline pangenome; additional ranked isolates can be retained as extraction-failure/diversity backups. MWL evidence can order eligible isolates but cannot override the species/coverage boundary or the near-identical baseline exclusion.
 
 ---
 
@@ -588,7 +632,7 @@ This table keeps the novelty lenses separate:
 | `performance_review_dashboard.html` | Compact linked view of the current Hiring Panel recommendations |
 | `assessment/sequence_assessment.tsv` | **Full audit table.** Per-sequence novelty, taxonomy, crowding, priority, clustering, MWL matches, and placement flags |
 | `assessment/selection_summary.tsv` | **SAB decision table.** Recommendation, evidence quality, component novelty evidence, same-species genome coverage, candidate-set role, rationale, and local-tree link |
-| `assessment/sequencing_sets.tsv` | **Rolling selection plan.** One row per candidate grouped by exact GTDB species or unresolved local clade, with `PRIMARY`, `BACKUP`, `DIVERSITY_CANDIDATE`, `ALTERNATE`, `SEQUENCED`, `REVIEW_EVIDENCE`, or `TARGET_MET` role |
+| `assessment/sequencing_sets.tsv` | **Rolling nine-member diversity plan.** One row per candidate in a `BMEXT_*` baseline-pangenome extension or `BMSET_*` candidate-only group, with rank, marginal diversity, MWL context, panel completeness, and `PRIMARY`, `BACKUP`, `DIVERSITY_CANDIDATE`, `ALTERNATE`, `PANGENOME_BOUNDARY_REVIEW`, `BASELINE_REDUNDANT`, `SEQUENCED`, or `REVIEW_EVIDENCE` role |
 | `assessment/novelty_metrics.tsv` | Per-sequence novelty and crowding summary for candidate ranking |
 | `assessment/neighbourhoods/clade_*.png` | Labelled local phylogenetic neighbourhoods (default). Nearby assessed isolates are grouped into one figure rather than duplicated across figures |
 | `assessment/neighbourhoods/clade_*_pairwise_pident.tsv` | Complete long-form MSA percent-identity table for every pair of displayed tree leaves, including compared-column counts and the identity definition |
@@ -629,7 +673,9 @@ The decision labels are:
 | `PRIORITISE - SET PRIMARY` | Fills one of the missing genomes needed to reach the per-species pangenome target |
 | `RESERVE - SET BACKUP` | Additional phylogenetically spread isolate retained for extraction failure and strain-diversity capture |
 | `STRONG CANDIDATE` / `SECONDARY CANDIDATE` | Useful evidence, but not currently assigned a primary/backup place in the working set |
-| `SECONDARY - STRAIN DIVERSITY` | Minimum genome count is met, but one unusually divergent or specific MWL candidate is retained for review |
+| `SECONDARY - STRAIN DIVERSITY` | The numerical target is met, but the isolate adds a ranked diversity direction not represented by baseline/committed markers |
+| `REVIEW - PANGENOME BOUNDARY` | The species, identity, or coverage evidence does not justify placing the isolate in the baseline-pangenome extension; review it as a possible separate lineage |
+| `EXCLUDE - BASELINE REDUNDANT` | >=99.8% identity to a cultured baseline marker across >=95% query coverage; retained in reports but excluded from ranking |
 | `LOWER PRIORITY - TARGET MET` | Available genomes plus committed pending selections meet the requested exact-GTDB-species target |
 | `REVIEW BEFORE SELECTION` | Marker classification, QC, disagreement, or required comparison evidence needs review |
 | `ALREADY SELECTED - GENOME PENDING` | The isolate is already committed to sequencing but no usable genome is available yet |
@@ -637,7 +683,11 @@ The decision labels are:
 
 ### Project-wide expansion rounds
 
-The default Performance Review targets three available genomes per exact GTDB species. After all partner submissions have been accumulated and the first sequencing round has been completed, run a Quarterly Review to choose the next tranche across the whole project:
+The default Performance Review targets nine committed genomes per exact GTDB species, or per local phylogenetic clade when species assignment is unresolved. It writes up to nine ranked eligible partner candidates per group. Baseline and completed/pending partner genomes determine the remaining target gap, while candidates outside that gap remain ranked as backups or post-target diversity options.
+
+Near-identical cultured-baseline matches are excluded only when both identity and alignment extent support the claim: >=99.8% marker identity and >=95% query coverage by default. This prevents a short high-identity fragment from being treated as redundant. Diversity is ranked first using marginal tree distance from baseline and committed genomes where available, then baseline/project/reference divergence and phylogenetic isolation. MWL rank and score add priority among otherwise comparable diversity choices but never override the baseline-redundancy gate.
+
+After partner submissions have accumulated and sequencing statuses have been updated, run a Quarterly Review to choose the next tranche across the whole project:
 
 ```bash
 branchmanager quarterly-review \
@@ -650,7 +700,7 @@ branchmanager quarterly-review \
   -o quarterly_review_01
 ```
 
-`--genome-budget` is the number of new primary nominations, not including backups. Quarterly Review fills any remaining three-genome coverage gaps first, then prioritises candidates without close available-genome representation, and finally balances post-target diversity across species. Within those tiers it uses marginal tree distance where available, nearest-genome marker identity, cultured-baseline novelty, GTDB-reference context, MWL rank, and phylogenetic isolation. When `--alignment` is supplied, nearest available-genome identity is recomputed against the current genome collection, so newly completed genomes affect the next round immediately. It does not change `already_sequenced`; recommendations become available genomes only after the metadata is updated in a later round.
+`--genome-budget` is the number of new primary nominations, not including backups. Quarterly Review fills remaining nine-genome coverage gaps first, filters baseline-redundant candidates, then balances diversity across species. Within those tiers it uses marginal tree distance where available, nearest-genome marker identity, cultured-baseline novelty, GTDB-reference context, phylogenetic isolation, and MWL evidence. When `--alignment` is supplied, nearest available-genome identity is recomputed against the current genome collection, so newly completed genomes affect the next round immediately. It does not change `already_sequenced`; recommendations become available genomes only after metadata is updated in a later round.
 
 Every current Performance Review stores its normalised assessment rows in the project database. For an older review made before assessment snapshots were introduced, import its full audit table once:
 
@@ -870,7 +920,7 @@ branchmanager status-meeting --db project.sqlite --input isolate_status.tsv -o u
 # Completed assemblies, with automatic 90% completeness / 5% contamination defaults
 branchmanager records-update --db project.sqlite --input genome_results.tsv -o updates/genomes_01
 
-# Re-open the complete collection after the initial target-three selection phase
+# Re-open the complete collection after the initial target-nine selection phase
 branchmanager quarterly-review --db project.sqlite --genome-budget 24 \
   --from-dir runs/latest/03_performance_review_hiring_panel -o quarterly_reviews/round_02
 

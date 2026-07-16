@@ -17,6 +17,34 @@ from branchmanager.utils.fasta import read_fasta, reverse_complement, write_fast
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class PaperTrailQCPolicy:
+    """Single source of truth for scientifically conservative Sanger QC defaults."""
+
+    min_quality: int = 20
+    min_read_length: int = 300
+    min_final_length: int = 800
+    min_mean_quality: float = 20.0
+    mask_quality: int = 20
+    max_read_expected_errors: float = 8.0
+    max_output_expected_errors: float = 5.0
+    warn_n_percent: float = 3.0
+    max_n_percent: float = 5.0
+    warn_internal_low_quality_run: int = 5
+    max_internal_low_quality_run: int = 20
+    max_conflict_density: float = 1.0
+    secondary_peak_ratio: float = 0.33
+    max_mixed_peak_percent: float = 15.0
+    mixed_peak_min_quality: int = 20
+    quality_difference: int = 10
+    min_overlap: int = 40
+    min_overlap_identity: float = 0.95
+
+
+PAPER_TRAIL_QC_POLICY_VERSION = '2.0'
+DEFAULT_QC_POLICY = PaperTrailQCPolicy()
+
+
 DEFAULT_PRIMERS = (
     # 16S rRNA
     '8F', '27F', '63F', '338F', '341F', '357F', '515F', '519F', '785F', '1055F',
@@ -396,7 +424,6 @@ def trim_by_quality(
     qualities: list[int],
     *,
     min_quality: int = 20,
-    window: int = 20,
 ) -> tuple[str, list[int], int, int]:
     """Return the highest-scoring Phred/Mott trim interval.
 
@@ -755,7 +782,14 @@ def _phred_from_error(error_probability: float, *, maximum: int = 60) -> int:
     return min(maximum, max(0, int(round(-10.0 * math.log10(error)))))
 
 
-def _posterior_consensus(base_a: str, q_a: int, base_b: str, q_b: int) -> tuple[str, int, bool]:
+def _posterior_consensus(
+    base_a: str,
+    q_a: int,
+    base_b: str,
+    q_b: int,
+    *,
+    quality_difference: int = DEFAULT_QC_POLICY.quality_difference,
+) -> tuple[str, int, bool]:
     """Infer one consensus base under an independent Phred observation model."""
     a = str(base_a).upper()
     b = str(base_b).upper()
@@ -781,7 +815,9 @@ def _posterior_consensus(base_a: str, q_a: int, base_b: str, q_b: int) -> tuple[
     winner, winner_likelihood = max(likelihoods.items(), key=lambda item: (item[1], item[0]))
     posterior = winner_likelihood / total
     quality = _phred_from_error(1.0 - posterior)
-    if posterior < 0.99:
+    odds = 10 ** (max(0, int(quality_difference)) / 10.0)
+    minimum_posterior = odds / (1.0 + odds)
+    if posterior < minimum_posterior:
         return 'N', min(int(q_a), int(q_b), quality), True
     return winner, quality, False
 
@@ -874,7 +910,13 @@ def _build_read_placements(
     return placements
 
 
-def find_best_overlap(seq_a: str, seq_b: str, *, min_overlap: int = 40, min_identity: float = 0.85):
+def find_best_overlap(
+    seq_a: str,
+    seq_b: str,
+    *,
+    min_overlap: int = DEFAULT_QC_POLICY.min_overlap,
+    min_identity: float = DEFAULT_QC_POLICY.min_overlap_identity,
+):
     columns = _pairwise_alignment_columns(seq_a, [30] * len(seq_a), seq_b, [30] * len(seq_b))
     paired = [idx for idx, (a, _qa, b, _qb) in enumerate(columns) if a != '-' and b != '-']
     if not paired:
@@ -912,9 +954,9 @@ def merge_pair(
     seq_b: str,
     qual_b: list[int],
     *,
-    min_overlap: int = 40,
-    min_identity: float = 0.85,
-    quality_difference: int = 10,
+    min_overlap: int = DEFAULT_QC_POLICY.min_overlap,
+    min_identity: float = DEFAULT_QC_POLICY.min_overlap_identity,
+    quality_difference: int = DEFAULT_QC_POLICY.quality_difference,
 ):
     overlap = find_best_overlap(seq_a, seq_b, min_overlap=min_overlap, min_identity=min_identity)
     if overlap is None:
@@ -927,7 +969,13 @@ def merge_pair(
     last = int(overlap['overlap_end'])
     for idx, (base_a, q_a, base_b, q_b) in enumerate(overlap['columns']):
         if base_a != '-' and base_b != '-':
-            base, quality, ambiguous = _posterior_consensus(base_a, int(q_a or 0), base_b, int(q_b or 0))
+            base, quality, ambiguous = _posterior_consensus(
+                base_a,
+                int(q_a or 0),
+                base_b,
+                int(q_b or 0),
+                quality_difference=quality_difference,
+            )
             consensus.append(base)
             consensus_qual.append(quality)
             if base_a != base_b and base_a != 'N' and base_b != 'N':
@@ -969,11 +1017,17 @@ def _append_consensus_base(
     base_b: str,
     q_b: int,
     *,
-    quality_difference: int = 10,
+    quality_difference: int = DEFAULT_QC_POLICY.quality_difference,
 ) -> tuple[int, int]:
     conflicts = 0
     ambiguous_conflicts = 0
-    base, quality, ambiguous = _posterior_consensus(base_a, q_a, base_b, q_b)
+    base, quality, ambiguous = _posterior_consensus(
+        base_a,
+        q_a,
+        base_b,
+        q_b,
+        quality_difference=quality_difference,
+    )
     if base_a != base_b and base_a != 'N' and base_b != 'N':
         conflicts = 1
         ambiguous_conflicts = int(ambiguous)
@@ -990,9 +1044,9 @@ def merge_pair_gapped(*args, **kwargs):
 def assemble_read_group(
     reads: list[SangerRead],
     *,
-    min_overlap: int = 40,
-    min_identity: float = 0.85,
-    quality_difference: int = 10,
+    min_overlap: int = DEFAULT_QC_POLICY.min_overlap,
+    min_identity: float = DEFAULT_QC_POLICY.min_overlap_identity,
+    quality_difference: int = DEFAULT_QC_POLICY.quality_difference,
 ):
     usable = [
         read for read in reads
@@ -1006,7 +1060,7 @@ def assemble_read_group(
             'overlap_identity': 'NA',
             'overlap_length': 'NA',
             'conflicts': 'NA',
-            'unmerged_reads': len(reads),
+            'unmerged_reads': ';'.join(read.read_id for read in reads),
             'method': 'failed_no_reads',
             'qualities': [],
             'used_read_ids': [],
@@ -1161,7 +1215,7 @@ def select_best_read_group(reads: list[SangerRead]) -> tuple[str, dict[str, obje
             'overlap_length': 'NA',
             'conflicts': 'NA',
             'ambiguous_conflicts': 'NA',
-            'unmerged_reads': len(reads),
+            'unmerged_reads': ';'.join(read.read_id for read in reads),
             'mean_quality': 0.0,
             'selected_read_id': '',
             'method': 'best_read',
@@ -1194,7 +1248,9 @@ def _classify_read_qc(
     read_min_length: int,
     min_mean_quality: float,
     max_read_expected_errors: float,
+    warn_n_percent: float,
     max_n_percent: float,
+    warn_internal_low_quality_run: int,
     max_internal_low_quality_run: int,
     allow_missing_quality: bool,
     max_mixed_peak_percent: float,
@@ -1220,9 +1276,6 @@ def _classify_read_qc(
         fail_reasons.append(f'mixed_peak_percent_gt_{float(max_mixed_peak_percent):g}')
     elif read.mixed_peak_percent > max(1.0, float(max_mixed_peak_percent) / 2.0):
         warn_reasons.append(f'mixed_peak_percent_{read.mixed_peak_percent:.2f}')
-    if read.primer_trimmed_bases:
-        warn_reasons.append(f'primer_sequence_trimmed_{read.primer_trimmed_bases}')
-
     if len(sequence) < read_min_length:
         fail_reasons.append(f'trimmed_length_lt_{read_min_length}')
     if quality_verified and sequence and mean_q < min_mean_quality:
@@ -1231,12 +1284,14 @@ def _classify_read_qc(
         fail_reasons.append(f'expected_errors_gt_{max_read_expected_errors:g}')
     if n_pct > max_n_percent:
         fail_reasons.append(f'n_percent_gt_{max_n_percent:g}')
+    elif n_pct > warn_n_percent:
+        warn_reasons.append(f'n_percent_gt_{warn_n_percent:g}')
     if quality_verified and read.longest_low_quality_run > max_internal_low_quality_run:
         fail_reasons.append(f'internal_low_quality_run_gt_{max_internal_low_quality_run}')
-    elif read.longest_low_quality_run > 0:
-        warn_reasons.append(f'internal_low_quality_masked_run_{read.longest_low_quality_run}')
-    if read.masked_bases:
-        warn_reasons.append(f'masked_low_quality_bases_{read.masked_bases}')
+    elif read.longest_low_quality_run > warn_internal_low_quality_run:
+        warn_reasons.append(
+            f'internal_low_quality_run_gt_{warn_internal_low_quality_run}'
+        )
 
     read.qc_class = _qc_class_from_reasons(fail_reasons, warn_reasons)
     read.qc_reasons = fail_reasons + warn_reasons
@@ -1256,6 +1311,7 @@ def _classify_output_qc(
     final_min_length: int,
     min_mean_quality: float,
     max_output_expected_errors: float,
+    warn_n_percent: float,
     max_n_percent: float,
     max_conflict_density: float,
     processing_mode: str,
@@ -1290,6 +1346,8 @@ def _classify_output_qc(
         fail_reasons.append(f'output_expected_errors_gt_{max_output_expected_errors:g}')
     if n_pct > max_n_percent:
         fail_reasons.append(f'output_n_percent_gt_{max_n_percent:g}')
+    elif n_pct > warn_n_percent:
+        warn_reasons.append(f'output_n_percent_gt_{warn_n_percent:g}')
     if conflict_density > max_conflict_density:
         fail_reasons.append(f'overlap_conflict_density_gt_{max_conflict_density:g}')
 
@@ -1301,17 +1359,25 @@ def _classify_output_qc(
     if ambiguous:
         warn_reasons.append(f'ambiguous_overlap_conflicts_{ambiguous}')
     unmerged = str(stats.get('unmerged_reads') or '').strip()
-    if unmerged:
+    if unmerged and processing_mode == 'assemble':
         warn_reasons.append('unmerged_primer_reads_' + str(len([value for value in unmerged.split(';') if value])))
     if stats.get('taxonomy_conflict'):
         fail_reasons.append('primer_read_taxonomic_conflict')
     if mode_warning:
         warn_reasons.append(mode_warning)
     failed_reads = [read.read_id for read in group if read.qc_class == 'FAIL_QC']
-    if failed_reads:
+    if failed_reads and (processing_mode == 'assemble' or not consensus):
         warn_reasons.append('failed_reads_' + str(len(failed_reads)))
-    if any(read.qc_class == 'PASS_WITH_WARNINGS' for read in group):
-        warn_reasons.append('read_level_warnings')
+    used_read_ids = {str(value) for value in stats.get('used_read_ids', [])}
+    used_reads = [read for read in group if read.read_id in used_read_ids]
+    for reason in sorted({
+        reason
+        for read in used_reads
+        if read.qc_class == 'PASS_WITH_WARNINGS'
+        for reason in (read.qc_reasons or [])
+        if not str(reason).startswith('n_percent_gt_')
+    }):
+        warn_reasons.append(f'read_{reason}')
     if 'gapped_anchor' in str(stats.get('method', '')):
         warn_reasons.append('gapped_overlap_fallback_used')
 
@@ -2152,6 +2218,69 @@ def _screen_primer_read_taxonomy(
     return conflicts, str(report_path)
 
 
+def _validate_qc_policy(
+    *,
+    min_quality: int,
+    min_read_length: int,
+    min_final_length: int,
+    min_mean_quality: float,
+    mask_quality: int,
+    max_read_expected_errors: float,
+    max_output_expected_errors: float,
+    warn_n_percent: float,
+    max_n_percent: float,
+    warn_internal_low_quality_run: int,
+    max_internal_low_quality_run: int,
+    max_conflict_density: float,
+    secondary_peak_ratio: float,
+    max_mixed_peak_percent: float,
+    mixed_peak_min_quality: int,
+    quality_difference: int,
+    min_overlap: int,
+    min_overlap_identity: float,
+) -> None:
+    positive_lengths = {
+        'min_read_length': min_read_length,
+        'min_final_length': min_final_length,
+        'min_overlap': min_overlap,
+    }
+    for name, value in positive_lengths.items():
+        if int(value) < 1:
+            raise ValueError(f'{name} must be at least 1')
+    non_negative = {
+        'min_quality': min_quality,
+        'min_mean_quality': min_mean_quality,
+        'mask_quality': mask_quality,
+        'max_read_expected_errors': max_read_expected_errors,
+        'max_output_expected_errors': max_output_expected_errors,
+        'warn_internal_low_quality_run': warn_internal_low_quality_run,
+        'max_internal_low_quality_run': max_internal_low_quality_run,
+        'max_conflict_density': max_conflict_density,
+        'mixed_peak_min_quality': mixed_peak_min_quality,
+        'quality_difference': quality_difference,
+    }
+    for name, value in non_negative.items():
+        if float(value) < 0:
+            raise ValueError(f'{name} cannot be negative')
+    for name, value in {
+        'warn_n_percent': warn_n_percent,
+        'max_n_percent': max_n_percent,
+        'max_mixed_peak_percent': max_mixed_peak_percent,
+    }.items():
+        if not 0 <= float(value) <= 100:
+            raise ValueError(f'{name} must be between 0 and 100')
+    if float(warn_n_percent) > float(max_n_percent):
+        raise ValueError('warn_n_percent cannot exceed max_n_percent')
+    if int(warn_internal_low_quality_run) > int(max_internal_low_quality_run):
+        raise ValueError(
+            'warn_internal_low_quality_run cannot exceed max_internal_low_quality_run'
+        )
+    if float(secondary_peak_ratio) <= 0:
+        raise ValueError('secondary_peak_ratio must be greater than 0')
+    if not 0 <= float(min_overlap_identity) <= 1:
+        raise ValueError('min_overlap_identity must be between 0 and 1')
+
+
 def run_paper_trail(
     inputs: Iterable[str | Path],
     outdir: str | Path,
@@ -2160,24 +2289,25 @@ def run_paper_trail(
     primers: Iterable[str] = DEFAULT_PRIMERS,
     primer_sequences: Optional[dict[str, str]] = None,
     trim_primers: bool = True,
-    min_quality: int = 20,
-    window: int = 20,
-    min_length: int = 800,
+    min_quality: int = DEFAULT_QC_POLICY.min_quality,
+    min_length: int = DEFAULT_QC_POLICY.min_final_length,
     min_read_length: Optional[int] = None,
-    min_mean_quality: float = 25.0,
-    mask_quality: int = 20,
-    max_read_expected_errors: float = 8.0,
-    max_output_expected_errors: float = 5.0,
-    max_n_percent: float = 1.0,
-    max_internal_low_quality_run: int = 20,
-    max_conflict_density: float = 1.0,
-    secondary_peak_ratio: float = 0.33,
-    max_mixed_peak_percent: float = 5.0,
-    mixed_peak_min_quality: int = 20,
-    quality_difference: int = 10,
+    min_mean_quality: float = DEFAULT_QC_POLICY.min_mean_quality,
+    mask_quality: int = DEFAULT_QC_POLICY.mask_quality,
+    max_read_expected_errors: float = DEFAULT_QC_POLICY.max_read_expected_errors,
+    max_output_expected_errors: float = DEFAULT_QC_POLICY.max_output_expected_errors,
+    warn_n_percent: float = DEFAULT_QC_POLICY.warn_n_percent,
+    max_n_percent: float = DEFAULT_QC_POLICY.max_n_percent,
+    warn_internal_low_quality_run: int = DEFAULT_QC_POLICY.warn_internal_low_quality_run,
+    max_internal_low_quality_run: int = DEFAULT_QC_POLICY.max_internal_low_quality_run,
+    max_conflict_density: float = DEFAULT_QC_POLICY.max_conflict_density,
+    secondary_peak_ratio: float = DEFAULT_QC_POLICY.secondary_peak_ratio,
+    max_mixed_peak_percent: float = DEFAULT_QC_POLICY.max_mixed_peak_percent,
+    mixed_peak_min_quality: int = DEFAULT_QC_POLICY.mixed_peak_min_quality,
+    quality_difference: int = DEFAULT_QC_POLICY.quality_difference,
     allow_missing_quality: bool = False,
-    min_overlap: int = 40,
-    min_overlap_identity: float = 0.85,
+    min_overlap: int = DEFAULT_QC_POLICY.min_overlap,
+    min_overlap_identity: float = DEFAULT_QC_POLICY.min_overlap_identity,
     screen_ref: Optional[str | Path] = None,
     screen_taxa: Optional[str | Path] = None,
     threads: int = 4,
@@ -2187,8 +2317,32 @@ def run_paper_trail(
 ) -> dict[str, object]:
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
-    final_min_length = int(min_length or 800)
-    read_min_length = int(min_read_length if min_read_length is not None else final_min_length)
+    final_min_length = int(min_length)
+    read_min_length = int(
+        min_read_length
+        if min_read_length is not None
+        else min(DEFAULT_QC_POLICY.min_read_length, final_min_length)
+    )
+    _validate_qc_policy(
+        min_quality=min_quality,
+        min_read_length=read_min_length,
+        min_final_length=final_min_length,
+        min_mean_quality=min_mean_quality,
+        mask_quality=mask_quality,
+        max_read_expected_errors=max_read_expected_errors,
+        max_output_expected_errors=max_output_expected_errors,
+        warn_n_percent=warn_n_percent,
+        max_n_percent=max_n_percent,
+        warn_internal_low_quality_run=warn_internal_low_quality_run,
+        max_internal_low_quality_run=max_internal_low_quality_run,
+        max_conflict_density=max_conflict_density,
+        secondary_peak_ratio=secondary_peak_ratio,
+        max_mixed_peak_percent=max_mixed_peak_percent,
+        mixed_peak_min_quality=mixed_peak_min_quality,
+        quality_difference=quality_difference,
+        min_overlap=min_overlap,
+        min_overlap_identity=min_overlap_identity,
+    )
     max_report_image_height = int(max_report_image_height)
     if max_report_image_height < MIN_REPORT_IMAGE_HEIGHT:
         raise ValueError(
@@ -2255,7 +2409,6 @@ def run_paper_trail(
                     sequence,
                     qualities,
                     min_quality=min_quality,
-                    window=window,
                 )
             else:
                 start = 0
@@ -2311,7 +2464,9 @@ def run_paper_trail(
                 read_min_length=read_min_length,
                 min_mean_quality=float(min_mean_quality),
                 max_read_expected_errors=float(max_read_expected_errors),
+                warn_n_percent=float(warn_n_percent),
                 max_n_percent=float(max_n_percent),
+                warn_internal_low_quality_run=int(warn_internal_low_quality_run),
                 max_internal_low_quality_run=int(max_internal_low_quality_run),
                 allow_missing_quality=bool(allow_missing_quality),
                 max_mixed_peak_percent=float(max_mixed_peak_percent),
@@ -2334,6 +2489,7 @@ def run_paper_trail(
     assembly_tsv = out / 'assembly_report.tsv'
     assembly_placements_tsv = out / 'assembly_read_placements.tsv'
     recommendations_tsv = out / 'resequence_recommendations.tsv'
+    marker_review_template_tsv = out / 'marker_review_template.tsv'
     qc_policy_tsv = out / 'paper_trail_qc_policy.tsv'
     visual_root = out / 'visual_reports'
     visual_manifest_tsv = visual_root / 'visual_report_manifest.tsv'
@@ -2348,6 +2504,8 @@ def run_paper_trail(
     failed_final_fasta = failed_qc_dir / 'failed_final_sequences.fasta'
     failed_read_fasta = failed_qc_dir / 'failed_read_sequences.fasta'
     failed_manifest_tsv = failed_qc_dir / 'failed_qc_manifest.tsv'
+    failed_read_manifest_tsv = failed_qc_dir / 'failed_read_manifest.tsv'
+    failed_qc_guide = failed_qc_dir / 'failed_qc_guide.txt'
 
     write_fasta(raw_records, str(raw_fasta))
     write_fasta(trimmed_records, str(trimmed_fasta))
@@ -2413,7 +2571,8 @@ def run_paper_trail(
     assembled_records = []
     failed_final_records = []
     failed_read_records = []
-    failed_manifest_rows: list[dict[str, object]] = []
+    failed_read_manifest_rows: list[dict[str, object]] = []
+    failed_isolate_manifest_rows: list[dict[str, object]] = []
     for read in reads:
         if read.qc_class != 'FAIL_QC':
             continue
@@ -2426,10 +2585,9 @@ def run_paper_trail(
                 f'|status={_clean_fasta_token(read.status)}'
             )
             failed_read_records.append((failed_header, failed_seq))
-        failed_manifest_rows.append({
-            'RecordType': 'read',
+        failed_read_manifest_rows.append({
             'SequenceID': read.sequence_id,
-            'RecordID': read.read_id,
+            'ReadID': read.read_id,
             'SourceFile': read.source_file,
             'QCClass': read.qc_class,
             'Recommendation': 'RESEQUENCE',
@@ -2440,11 +2598,6 @@ def run_paper_trail(
             'OutputExpectedErrors': _expected_errors(read.masked_qualities or read.trimmed_qualities or read.raw_qualities, failed_seq),
             'OutputNPercent': _n_percent(failed_seq),
             'ProcessingMode': read.processing_mode,
-            'ReadIDs': read.read_id,
-            'KeptReadIDs': '',
-            'FailedReadIDs': read.read_id,
-            'SelectedReadID': '',
-            'MergeMethod': 'read_qc',
         })
     assembly_rows: list[dict[str, object]] = []
     recommendation_rows: list[dict[str, object]] = []
@@ -2477,6 +2630,7 @@ def run_paper_trail(
                 final_min_length=final_min_length,
                 min_mean_quality=float(min_mean_quality),
                 max_output_expected_errors=float(max_output_expected_errors),
+                warn_n_percent=float(warn_n_percent),
                 max_n_percent=float(max_n_percent),
                 max_conflict_density=float(max_conflict_density),
                 processing_mode=processing_mode,
@@ -2534,25 +2688,44 @@ def run_paper_trail(
             assembly_rows.append(row)
             recommendation_rows.append(row)
             if row['QCClass'] == 'FAIL_QC':
-                failed_manifest_rows.append({
-                    'RecordType': 'final',
+                failed_group_reads = [read for read in group if read.qc_class == 'FAIL_QC']
+                recoverable_reads = [
+                    read for read in group if _review_sequence_for_failed_read(read)
+                ]
+                best_recoverable = (
+                    max(recoverable_reads, key=_read_quality_key)
+                    if recoverable_reads else None
+                )
+                best_recoverable_sequence = (
+                    _review_sequence_for_failed_read(best_recoverable)
+                    if best_recoverable else ''
+                )
+                failed_isolate_manifest_rows.append({
                     'SequenceID': sequence_id,
-                    'RecordID': sequence_id,
-                    'SourceFile': '',
                     'QCClass': row['QCClass'],
                     'Recommendation': row['Recommendation'],
                     'Status': row['Status'],
                     'Reasons': row['Reasons'],
+                    'ReadCount': row['ReadCount'],
+                    'KeptReadCount': len([read for read in group if read.status == 'kept']),
+                    'FailedReadCount': len(failed_group_reads),
+                    'ReadIDs': row['ReadIDs'],
+                    'KeptReadIDs': row['KeptReadIDs'],
+                    'FailedReadIDs': row['FailedReadIDs'],
+                    'SourceFiles': ';'.join(sorted({read.source_file for read in group})),
+                    'ReadFailureReasons': ' | '.join(
+                        f'{read.read_id}[{read.warning}]' for read in failed_group_reads
+                    ),
                     'OutputLength': row['OutputLength'],
                     'MeanQuality': row['MeanQuality'],
                     'OutputExpectedErrors': row['OutputExpectedErrors'],
                     'OutputNPercent': row['OutputNPercent'],
                     'ProcessingMode': row['ProcessingMode'],
-                    'ReadIDs': row['ReadIDs'],
-                    'KeptReadIDs': row['KeptReadIDs'],
-                    'FailedReadIDs': row['FailedReadIDs'],
                     'SelectedReadID': row['SelectedReadID'],
                     'MergeMethod': row['MergeMethod'],
+                    'BestRecoverableReadID': best_recoverable.read_id if best_recoverable else '',
+                    'BestRecoverableLength': len(best_recoverable_sequence),
+                    'BestRecoverableNPercent': _n_percent(best_recoverable_sequence),
                 })
             handle.write(
                 f'{_clean_field(sequence_id)}\t{stats["status"]}\t{stats["read_count"]}\t{stats["used_reads"]}\t'
@@ -2603,23 +2776,69 @@ def run_paper_trail(
     write_fasta(failed_read_records, str(failed_read_fasta))
     with open(failed_manifest_tsv, 'w') as handle:
         handle.write(
-            'RecordType\tSequenceID\tRecordID\tSourceFile\tQCClass\tRecommendation\t'
-            'Status\tReasons\tOutputLength\tMeanQuality\tOutputExpectedErrors\t'
-            'OutputNPercent\tProcessingMode\tReadIDs\tKeptReadIDs\tFailedReadIDs\t'
-            'SelectedReadID\tMergeMethod\n'
+            'SequenceID\tQCClass\tRecommendation\tStatus\tReasons\tReadCount\t'
+            'KeptReadCount\tFailedReadCount\tReadIDs\tKeptReadIDs\tFailedReadIDs\t'
+            'SourceFiles\tReadFailureReasons\tOutputLength\tMeanQuality\t'
+            'OutputExpectedErrors\tOutputNPercent\tProcessingMode\tSelectedReadID\t'
+            'MergeMethod\tBestRecoverableReadID\tBestRecoverableLength\t'
+            'BestRecoverableNPercent\n'
         )
-        for row in failed_manifest_rows:
+        for row in failed_isolate_manifest_rows:
             handle.write(
-                f'{_clean_field(row.get("RecordType", ""))}\t{_clean_field(row.get("SequenceID", ""))}\t'
-                f'{_clean_field(row.get("RecordID", ""))}\t{_clean_field(row.get("SourceFile", ""))}\t'
-                f'{_clean_field(row.get("QCClass", ""))}\t{_clean_field(row.get("Recommendation", ""))}\t'
+                f'{_clean_field(row.get("SequenceID", ""))}\t{_clean_field(row.get("QCClass", ""))}\t'
+                f'{_clean_field(row.get("Recommendation", ""))}\t'
                 f'{_clean_field(row.get("Status", ""))}\t{_clean_field(row.get("Reasons", ""))}\t'
+                f'{row.get("ReadCount", 0)}\t{row.get("KeptReadCount", 0)}\t'
+                f'{row.get("FailedReadCount", 0)}\t{_clean_field(row.get("ReadIDs", ""))}\t'
+                f'{_clean_field(row.get("KeptReadIDs", ""))}\t'
+                f'{_clean_field(row.get("FailedReadIDs", ""))}\t'
+                f'{_clean_field(row.get("SourceFiles", ""))}\t'
+                f'{_clean_field(row.get("ReadFailureReasons", ""))}\t'
                 f'{row.get("OutputLength", 0)}\t{row.get("MeanQuality", 0.0)}\t'
                 f'{row.get("OutputExpectedErrors", 0.0)}\t{row.get("OutputNPercent", 0.0)}\t'
-                f'{_clean_field(row.get("ProcessingMode", ""))}\t{_clean_field(row.get("ReadIDs", ""))}\t'
-                f'{_clean_field(row.get("KeptReadIDs", ""))}\t{_clean_field(row.get("FailedReadIDs", ""))}\t'
-                f'{_clean_field(row.get("SelectedReadID", ""))}\t{_clean_field(row.get("MergeMethod", ""))}\n'
+                f'{_clean_field(row.get("ProcessingMode", ""))}\t'
+                f'{_clean_field(row.get("SelectedReadID", ""))}\t{_clean_field(row.get("MergeMethod", ""))}\t'
+                f'{_clean_field(row.get("BestRecoverableReadID", ""))}\t'
+                f'{row.get("BestRecoverableLength", 0)}\t'
+                f'{row.get("BestRecoverableNPercent", 0.0):.3f}\n'
             )
+    with open(failed_read_manifest_tsv, 'w') as handle:
+        handle.write(
+            'SequenceID\tReadID\tSourceFile\tQCClass\tRecommendation\tStatus\tReasons\t'
+            'RecoverySequenceLength\tMeanQuality\tExpectedErrors\tNPercent\tProcessingMode\n'
+        )
+        for row in failed_read_manifest_rows:
+            handle.write(
+                f'{_clean_field(row.get("SequenceID", ""))}\t{_clean_field(row.get("ReadID", ""))}\t'
+                f'{_clean_field(row.get("SourceFile", ""))}\t{_clean_field(row.get("QCClass", ""))}\t'
+                f'{_clean_field(row.get("Recommendation", ""))}\t{_clean_field(row.get("Status", ""))}\t'
+                f'{_clean_field(row.get("Reasons", ""))}\t{row.get("OutputLength", 0)}\t'
+                f'{float(row.get("MeanQuality", 0.0)):.2f}\t'
+                f'{float(row.get("OutputExpectedErrors", 0.0)):.4f}\t'
+                f'{float(row.get("OutputNPercent", 0.0)):.3f}\t'
+                f'{_clean_field(row.get("ProcessingMode", ""))}\n'
+            )
+    failed_qc_guide.write_text(
+        '\n'.join([
+            'BranchManager failed-QC guide',
+            '',
+            'failed_qc_manifest.tsv has exactly one row per failed isolate/final marker.',
+            'failed_read_manifest.tsv has one row per failed physical read and supplies the read-level evidence.',
+            'failed_final_sequences.fasta and failed_read_sequences.fasta are recovery/review files; their records did not pass downstream QC.',
+            '',
+            'Common reason codes:',
+            f'- trimmed_length_lt_{read_min_length}: fewer than {read_min_length} usable bases remained after Q{min_quality} Mott trimming.',
+            f'- output_length_lt_{final_min_length}: a readable primer trace remained, but the final marker was shorter than {final_min_length} bp.',
+            f'- n_percent_gt_{float(max_n_percent):g}: more than {float(max_n_percent):g}% of retained positions were ambiguous after Q{mask_quality} masking.',
+            f'- mixed_peak_percent_gt_{float(max_mixed_peak_percent):g}: the chromatogram showed excessive secondary-peak evidence consistent with a mixed template or unresolved trace.',
+            f'- mean_q_lt_{float(min_mean_quality):g}: retained base calls had mean Phred quality below {float(min_mean_quality):g}.',
+            f'- expected_errors_gt_{float(max_read_expected_errors):g}: summed Phred error probabilities exceeded the read-level limit.',
+            f'- internal_low_quality_run_gt_{int(max_internal_low_quality_run)}: a retained ambiguous/low-quality run exceeded {int(max_internal_low_quality_run)} bases.',
+            '- failed_no_reads: no physical read passed read-level QC for final-marker construction.',
+            '- primer_read_taxonomic_conflict: separate primer reads classified to different genus/family contexts.',
+            '',
+        ])
+    )
     assembly_pngs, assembly_visual_rows = _write_paginated_assembly_visuals(
         visual_root,
         groups,
@@ -2648,25 +2867,46 @@ def run_paper_trail(
                 f'{_clean_field(row.get("FailedReadIDs", ""))}\t{_clean_field(row.get("SelectedReadID", ""))}\t'
                 f'{_clean_field(row.get("MergeMethod", ""))}\n'
             )
+    with open(marker_review_template_tsv, 'w') as handle:
+        handle.write(
+            'sequence_id\tdecision\treviewer\tnotes\tqc_reasons\toutput_length\tn_percent\n'
+        )
+        for row in recommendation_rows:
+            if row.get('Recommendation') != 'MANUAL_REVIEW':
+                continue
+            handle.write(
+                f'{_clean_field(row.get("SequenceID", ""))}\t\t\t\t'
+                f'{_clean_field(row.get("Reasons", ""))}\t{row.get("OutputLength", 0)}\t'
+                f'{row.get("OutputNPercent", 0.0)}\n'
+            )
     qc_policy_tsv.write_text(
         '\n'.join([
-            'Metric\tDefault\tMeaning',
+            'Metric\tValue\tMeaning',
+            f'policy_version\t{PAPER_TRAIL_QC_POLICY_VERSION}\tVersioned BranchManager Paper Trail QC policy',
+            'trim_algorithm\tmodified_mott\tMaximum-scoring trim interval calculated from Phred error probabilities',
             f'min_quality\t{min_quality}\tPhred cutoff used for Mott-style end trimming',
             f'mask_quality\t{mask_quality}\tBases below this Phred score inside the retained read are masked to N',
             f'min_read_length\t{read_min_length}\tMinimum retained read length before assembly or best-read selection',
             f'min_final_length\t{final_min_length}\tMinimum final isolate sequence length written to assembled.fasta',
             f'min_mean_quality\t{float(min_mean_quality):g}\tMinimum mean Phred score after masking for read/final QC',
-            f'max_read_expected_errors\t{float(max_read_expected_errors):g}\tMaximum expected base-call errors allowed per retained read',
-            f'max_output_expected_errors\t{float(max_output_expected_errors):g}\tMaximum expected base-call errors allowed in the final isolate sequence',
-            f'max_n_percent\t{float(max_n_percent):g}\tMaximum percent N in read/final sequence after internal masking',
+            f'max_read_expected_errors\t{float(max_read_expected_errors):g}\tMaximum expected errors among called A/C/G/T bases per retained read',
+            f'max_output_expected_errors\t{float(max_output_expected_errors):g}\tMaximum expected errors among called A/C/G/T bases in the final isolate sequence',
+            f'warn_n_percent\t{float(warn_n_percent):g}\tPercent N above which a passing read/final sequence requires manual review',
+            f'max_n_percent\t{float(max_n_percent):g}\tMaximum percent N allowed before read/final QC failure',
+            f'warn_internal_low_quality_run\t{int(warn_internal_low_quality_run)}\tInternal low-quality/ambiguous run above which manual review is required',
             f'max_internal_low_quality_run\t{int(max_internal_low_quality_run)}\tLongest internal low-quality/ambiguous run allowed before read failure',
             f'max_conflict_density\t{float(max_conflict_density):g}\tMaximum overlap conflicts per 100 final bases before final failure',
             f'secondary_peak_ratio\t{float(secondary_peak_ratio):g}\tSecondary dye peak divided by called-base peak used to flag mixed-template evidence',
+            f'mixed_peak_review_percent\t{max(1.0, float(max_mixed_peak_percent) / 2.0):g}\tMixed-peak percent above which a passing read requires manual review',
             f'max_mixed_peak_percent\t{float(max_mixed_peak_percent):g}\tMaximum retained high-quality bases with secondary-peak evidence',
             f'mixed_peak_min_quality\t{int(mixed_peak_min_quality)}\tMinimum called-base Phred score considered for mixed-peak screening',
+            f'min_overlap\t{int(min_overlap)}\tMinimum compared bases required to assemble primer reads',
+            f'min_overlap_identity\t{float(min_overlap_identity):g}\tMinimum overlap identity required to assemble primer reads',
             f'trim_primers\t{bool(trim_primers)}\tRemove a confidently observed known primer sequence at the read start',
-            f'quality_difference\t{int(quality_difference)}\tMinimum Phred difference required to choose one conflicting base over another',
+            f'quality_difference\t{int(quality_difference)}\tMinimum Phred-scaled posterior odds required to resolve a conflicting overlap base',
             f'allow_missing_quality\t{bool(allow_missing_quality)}\tWhether AB1 reads missing PCON quality scores may pass QC',
+            f'default_processing_mode\t{default_mode}\tFallback handling when a sample-map row does not specify assemble or best_read',
+            f'max_report_image_height\t{max_report_image_height}\tMaximum PNG page height before visual reports are paginated',
             '',
         ])
     )
@@ -2691,7 +2931,7 @@ def run_paper_trail(
             f'Minimum trimmed read length: {read_min_length}',
             f'Minimum final sequence length: {final_min_length}',
             f'Reads kept after trimming: {kept_reads}',
-            f'Output assembled sequences: {assembled_count}',
+            f'Passing final sequences written: {assembled_count}',
             f'Failed final sequences retained: {len(failed_final_records)}',
             f'Failed read sequences retained: {len(failed_read_records)}',
             f'Final QC accept: {accept_count}',
@@ -2705,10 +2945,13 @@ def run_paper_trail(
             f'Assembly report: {assembly_tsv}',
             f'Assembly read placements: {assembly_placements_tsv}',
             f'Resequencing recommendations: {recommendations_tsv}',
+            f'Marker review template: {marker_review_template_tsv}',
             f'QC policy: {qc_policy_tsv}',
             f'Failed QC final FASTA: {failed_final_fasta}',
             f'Failed QC read FASTA: {failed_read_fasta}',
-            f'Failed QC manifest: {failed_manifest_tsv}',
+            f'Failed isolate manifest: {failed_manifest_tsv}',
+            f'Failed read manifest: {failed_read_manifest_tsv}',
+            f'Failed QC guide: {failed_qc_guide}',
             f'Visual report maximum height: {max_report_image_height} pixels',
             f'Read profile visual pages: {len(read_error_pngs)} in {visual_root / "read_error_profiles"}',
             f'Chromatogram visual pages: {len(chromatogram_pngs)} in {visual_root / "trace_chromatograms"}',
@@ -2727,11 +2970,14 @@ def run_paper_trail(
         'assembly_tsv': str(assembly_tsv),
         'assembly_placements_tsv': str(assembly_placements_tsv),
         'recommendations_tsv': str(recommendations_tsv),
+        'marker_review_template_tsv': str(marker_review_template_tsv),
         'qc_policy_tsv': str(qc_policy_tsv),
         'failed_qc_dir': str(failed_qc_dir),
         'failed_final_fasta': str(failed_final_fasta),
         'failed_read_fasta': str(failed_read_fasta),
         'failed_manifest_tsv': str(failed_manifest_tsv),
+        'failed_read_manifest_tsv': str(failed_read_manifest_tsv),
+        'failed_qc_guide': str(failed_qc_guide),
         'read_error_pngs': read_error_pngs,
         'chromatogram_pngs': chromatogram_pngs,
         'taxonomy_screen_tsv': str(taxonomy_screen_path or ''),

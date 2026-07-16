@@ -220,3 +220,15 @@ __marimo__/
 AGENTS.md
 
 .DS_Store
+
+# BranchManager runtime state and generated run directories
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.lock
+src/branchmanager/.../

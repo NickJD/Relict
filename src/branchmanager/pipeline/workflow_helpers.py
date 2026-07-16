@@ -543,7 +543,7 @@ def build_sequence_assessment_rows(
                     'genome_pending_count_same_species': val(
                         'SelectedPendingGenomeCountSameAssessmentSpecies',
                     ),
-                    'pangenome_target': val('PangenomeTarget', default='3'),
+                    'pangenome_target': val('PangenomeTarget', default='9'),
                     'pangenome_gap': val('PangenomeGap'),
                     'genome_sequencing_metadata_source': val('GenomeSequencingMetadataSource'),
                 }
@@ -723,7 +723,7 @@ def build_sequence_assessment_rows(
             'genome_available_count_same_species': n.get('genome_available_count_same_species', 'NA'),
             'genome_selected_count_same_species': n.get('genome_selected_count_same_species', 'NA'),
             'genome_pending_count_same_species': n.get('genome_pending_count_same_species', 'NA'),
-            'pangenome_target': n.get('pangenome_target', '3'),
+            'pangenome_target': n.get('pangenome_target', '9'),
             'pangenome_gap': n.get('pangenome_gap', 'NA'),
             'genome_sequencing_metadata_source': n.get('genome_sequencing_metadata_source', 'NA'),
             'placement_flags': w.get('flags', ''),
@@ -861,7 +861,16 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ])
     fields.extend([
         ('SequencingSetID', 'sequencing_set_id'), ('SequencingSetRole', 'sequencing_set_role'),
-        ('SequencingSetRank', 'sequencing_set_rank'), ('SequencingSetReason', 'sequencing_set_reason'),
+        ('SequencingSetRank', 'sequencing_set_rank'),
+        ('SelectionDiversityDistance', 'selection_diversity_distance'),
+        ('SelectionGroupType', 'selection_group_type'),
+        ('BaselineRedundancyStatus', 'baseline_redundancy_status'),
+        ('BaselineRedundancyIdentityThreshold', 'baseline_redundancy_identity_threshold'),
+        ('BaselineRedundancyMinQueryCoverage', 'baseline_redundancy_min_query_coverage'),
+        ('BaselineExtensionStatus', 'baseline_extension_status'),
+        ('BaselineExtensionMinIdentity', 'baseline_extension_min_identity'),
+        ('BaselineExtensionMinQueryCoverage', 'baseline_extension_min_query_coverage'),
+        ('SequencingSetReason', 'sequencing_set_reason'),
         ('SelectionGroupBasis', 'selection_group_basis'), ('SelectionGroupTaxon', 'selection_group_taxon'),
         ('NovelLookingClade', 'novel_looking_clade'),
         ('PhyloIsolation', 'phylo_isolation'), ('LocalNeighbourhoodFigure', 'local_neighbourhood_figure'),
@@ -952,7 +961,7 @@ def _genome_coverage(row: dict) -> str:
     if str(row.get('selected_for_genome_sequencing') or '').lower() == 'true':
         return 'CURRENT ISOLATE SELECTED - GENOME PENDING'
     committed = _as_int(row.get('genome_committed_count_same_species'))
-    target = _as_int(row.get('pangenome_target'), 3)
+    target = _as_int(row.get('pangenome_target'), 9)
     gap = _as_int(row.get('pangenome_gap'))
     if committed is not None and gap is not None:
         if gap <= 0:
@@ -1014,6 +1023,8 @@ def build_selection_decision(row: dict) -> dict:
     pangenome_gap = _as_int(row.get('pangenome_gap'))
     target_met = pangenome_gap == 0
     set_role = str(row.get('sequencing_set_role') or '').upper()
+    baseline_redundant = set_role == 'BASELINE_REDUNDANT'
+    boundary_review = set_role == 'PANGENOME_BOUNDARY_REVIEW'
     mwl_match = str(row.get('mwl_match') or '').lower() == 'yes'
     mwl_rank = str(row.get('mwl_matched_rank') or '').lower()
     strong_mwl = mwl_match and mwl_rank in ('species', 's', 'genus', 'g', 'family', 'f')
@@ -1041,6 +1052,11 @@ def build_selection_decision(row: dict) -> dict:
         positive.append(f'divergent from external reference ({reference_identity:.2f}%)')
     if evidence_quality != 'HIGH':
         caution.append(f'{evidence_quality.lower()} marker evidence')
+    if baseline_redundant:
+        caution.append('near-identical to a cultured baseline marker at high query coverage')
+    if boundary_review:
+        status = str(row.get('baseline_extension_status') or 'extension criteria not met')
+        caution.append(f'not admitted to the baseline-pangenome extension ({status})')
     if target_met:
         caution.append('assessment-species pangenome target already met')
     elif pangenome_gap is not None:
@@ -1058,6 +1074,10 @@ def build_selection_decision(row: dict) -> dict:
         decision = 'ALREADY SELECTED - GENOME PENDING'
     elif evidence_quality == 'LOW':
         decision = 'REVIEW BEFORE SELECTION'
+    elif baseline_redundant:
+        decision = 'EXCLUDE - BASELINE REDUNDANT'
+    elif boundary_review:
+        decision = 'REVIEW - PANGENOME BOUNDARY'
     elif set_role == 'PRIMARY':
         decision = 'PRIORITISE - SET PRIMARY'
     elif set_role == 'BACKUP':
@@ -1115,6 +1135,8 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'SequencingSetID',
         'SequencingSetRole',
         'SequencingSetRank',
+        'SelectionDiversityDistance',
+        'SelectionGroupType',
         'EvidenceQuality',
         'MarkerQC',
         'MarkerReview',
@@ -1125,6 +1147,8 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'BaselineNearestHit',
         'BaselineNearestIdentity',
         'BaselineNearestQueryCoverage',
+        'BaselineRedundancyStatus',
+        'BaselineExtensionStatus',
         'BaselineTaxonomyAgreementRank',
         'BaselineTaxonomyConflict',
         'BaselineNoveltyScore',
@@ -1159,10 +1183,12 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
             'SECONDARY - STRAIN DIVERSITY': 3,
             'SECONDARY CANDIDATE': 4,
             'REVIEW BEFORE SELECTION': 5,
-            'LOWER PRIORITY - LIMITED ADDED VALUE': 6,
-            'LOWER PRIORITY - TARGET MET': 7,
-            'ALREADY SELECTED - GENOME PENDING': 8,
-            'ALREADY SEQUENCED': 9,
+            'REVIEW - PANGENOME BOUNDARY': 6,
+            'EXCLUDE - BASELINE REDUNDANT': 7,
+            'LOWER PRIORITY - LIMITED ADDED VALUE': 8,
+            'LOWER PRIORITY - TARGET MET': 9,
+            'ALREADY SELECTED - GENOME PENDING': 10,
+            'ALREADY SEQUENCED': 11,
         }
         prepared.sort(key=lambda item: (
             decision_order.get(item[0]['decision'], 99),
@@ -1179,6 +1205,8 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('sequencing_set_id', 'NA'),
                 row.get('sequencing_set_role', 'NA'),
                 row.get('sequencing_set_rank', 'NA'),
+                row.get('selection_diversity_distance', 'NA'),
+                row.get('selection_group_type', 'NA'),
                 support['evidence_quality'],
                 row.get('marker_qc_class', 'QUALITY_UNVERIFIED'),
                 row.get('marker_manual_review_status', 'NOT_REVIEWED'),
@@ -1189,6 +1217,8 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('nearest_hit', 'NA'),
                 row.get('nearest_identity', 'NA'),
                 row.get('nearest_query_coverage', 'NA'),
+                row.get('baseline_redundancy_status', 'NA'),
+                row.get('baseline_extension_status', 'NA'),
                 row.get('baseline_taxonomy_agreement_rank', 'NA'),
                 row.get('baseline_taxonomy_conflict', 'NA'),
                 row.get('novelty_score', 'NA'),

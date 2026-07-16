@@ -20,14 +20,17 @@ def write_performance_review_dashboard(selection_summary: str | Path, outdir: st
         counts[decision] = counts.get(decision, 0) + 1
     order = {
         'PRIORITISE - SET PRIMARY': 0, 'RESERVE - SET BACKUP': 1,
-        'STRONG CANDIDATE': 2, 'SECONDARY CANDIDATE': 3,
-        'REVIEW BEFORE SELECTION': 4, 'ALREADY SEQUENCED': 9,
+        'SECONDARY - STRAIN DIVERSITY': 2, 'STRONG CANDIDATE': 3,
+        'SECONDARY CANDIDATE': 4, 'REVIEW BEFORE SELECTION': 5,
+        'REVIEW - PANGENOME BOUNDARY': 6,
+        'EXCLUDE - BASELINE REDUNDANT': 7, 'ALREADY SEQUENCED': 10,
     }
     rows.sort(key=lambda row: (order.get(row.get('Recommendation', ''), 8), row.get('SequenceID', '')))
     columns = [
         'SequenceID', 'PartnerID', 'Recommendation', 'SequencingSetRole',
-        'EvidenceQuality', 'MarkerQC', 'GTDBTaxonomy', 'CulturedGap',
-        'ProjectCoverage', 'GenomeCoverage', 'LocalTreeFigure', 'RecommendationReason',
+        'SequencingSetRank', 'SelectionGroupType', 'SelectionDiversityDistance', 'EvidenceQuality', 'MarkerQC',
+        'GTDBTaxonomy', 'CulturedGap', 'BaselineExtensionStatus', 'BaselineRedundancyStatus', 'ProjectCoverage',
+        'MWLMatchedRank', 'GenomeCoverage', 'LocalTreeFigure', 'RecommendationReason',
     ]
     available = list(rows[0]) if rows else []
     columns = [column for column in columns if column in available]

@@ -8,6 +8,15 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from branchmanager.pipeline.neighbourhood import _load_alignment_sequences, _msa_pident, pairwise_leaf_distances
+from branchmanager.pipeline.selection_sets import (
+    DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
+    DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
+    DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
+    DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
+    DEFAULT_PANGENOME_TARGET,
+    baseline_extension_evidence,
+    baseline_redundancy_evidence,
+)
 from branchmanager.taxonomy import normalise_taxon_name, parse_taxon_string
 
 
@@ -78,7 +87,13 @@ def normalise_assessment_row(row: dict, *, source_path: str = '') -> dict:
             row, 'classification_query_coverage', 'GTDBQueryCoverage', 'QueryCoverage',
         ),
         'nearest_hit': _value(row, 'nearest_hit', 'BaselineNearestHit'),
+        'nearest_hit_taxonomy': _value(
+            row, 'nearest_hit_taxonomy', 'BaselineNearestHitTaxonomy',
+        ),
         'nearest_identity': _value(row, 'nearest_identity', 'BaselineNearestIdentity'),
+        'nearest_query_coverage': _value(
+            row, 'nearest_query_coverage', 'BaselineNearestQueryCoverage',
+        ),
         'density_source': _value(row, 'density_source', 'BaselineSource', default=''),
         'project_nearest_identity': _value(row, 'project_nearest_identity', 'ProjectNearestIdentity'),
         'project_density_source': _value(row, 'project_density_source', 'ProjectSource', default=''),
@@ -114,10 +129,11 @@ def normalise_assessment_row(row: dict, *, source_path: str = '') -> dict:
             'AvailableGenomesSameAssessmentSpecies', 'CommittedGenomesSameSpecies', 'AvailableGenomesSameSpecies',
             default='0',
         ),
-        'pangenome_target': _value(row, 'pangenome_target', 'PangenomeTarget', default='3'),
+        'pangenome_target': _value(row, 'pangenome_target', 'PangenomeTarget', default='9'),
         'pangenome_gap': _value(row, 'pangenome_gap', 'PangenomeGap', default='0'),
         'mwl_matched_rank': _value(row, 'mwl_matched_rank', 'MWLMatchedRank'),
         'mwl_matched_taxon': _value(row, 'mwl_matched_taxon', 'MWLMatchedTaxon'),
+        'mwl_score': _value(row, 'mwl_score', 'MWLScore', default='0'),
         'phylo_isolation': _value(row, 'phylo_isolation', 'PhyloIsolation'),
         'local_neighbourhood_figure': _value(
             row, 'local_neighbourhood_figure', 'LocalNeighbourhoodFigure', 'LocalTreeFigure',
@@ -312,15 +328,17 @@ def _divergence(identity) -> float:
 def _candidate_key(row: dict, anchors: List[str], distances: Dict[tuple[str, str], float]) -> tuple:
     patristic = _marginal_distance(row, anchors, distances)
     mwl = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
+    mwl_score = _float(row.get('mwl_score'), 0.0) or 0.0
     return (
         0 if patristic is not None else 1,
         -(patristic or 0.0),
         -_divergence(row.get('nearest_genome_identity')),
-        -mwl,
         -_divergence(row.get('nearest_identity')),
         -_divergence(row.get('project_nearest_identity')),
         -_divergence(row.get('reference_nearest_identity')),
         -(_float(row.get('phylo_isolation'), 0.0) or 0.0),
+        -mwl,
+        -mwl_score,
         str(row.get('id') or ''),
     )
 
@@ -368,13 +386,29 @@ def build_quarterly_review(
     alignment_path: Optional[str | Path] = None,
     genome_budget: int,
     backups_per_primary: int = 1,
-    pangenome_target: int = 3,
+    pangenome_target: int = DEFAULT_PANGENOME_TARGET,
+    baseline_redundancy_identity: float = DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
+    baseline_redundancy_min_query_coverage: float = DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
+    baseline_extension_min_identity: float = DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
+    baseline_extension_min_query_coverage: float = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
     include_moderate: bool = False,
 ) -> List[dict]:
     """Select a globally balanced next sequencing tranche without changing status."""
     budget = max(1, int(genome_budget))
     backup_count = max(0, int(backups_per_primary))
     target = max(1, int(pangenome_target))
+    redundancy_identity = float(baseline_redundancy_identity)
+    redundancy_coverage = float(baseline_redundancy_min_query_coverage)
+    extension_identity = float(baseline_extension_min_identity)
+    extension_coverage = float(baseline_extension_min_query_coverage)
+    if not 0.0 <= redundancy_identity <= 100.0:
+        raise ValueError('baseline redundancy identity must be between 0 and 100')
+    if not 0.0 <= redundancy_coverage <= 100.0:
+        raise ValueError('baseline redundancy minimum query coverage must be between 0 and 100')
+    if not 0.0 <= extension_identity <= redundancy_identity:
+        raise ValueError('baseline extension minimum identity must be between 0 and the redundancy identity threshold')
+    if not 0.0 <= extension_coverage <= 100.0:
+        raise ValueError('baseline extension minimum query coverage must be between 0 and 100')
     rows = [normalise_assessment_row(row) for row in assessment_rows]
     rows = [row for row in rows if row['id']]
 
@@ -397,6 +431,7 @@ def build_quarterly_review(
     anchors_by_group = {}
     available_anchors_by_group = {}
     counts_by_group = {}
+    baseline_counts_by_group = {}
     for key, members in grouped.items():
         species = _species(members[0].get('taxonomy'))
         available_anchors = list(available_species.get(normalise_taxon_name(species), [])) if species else []
@@ -407,6 +442,10 @@ def build_quarterly_review(
         anchors_by_group[key] = sorted(set(committed_anchors))
         reported = max((_int(row.get('genome_committed_count_same_species')) for row in members), default=0)
         counts_by_group[key] = max(reported, len(anchors_by_group[key]))
+        baseline_counts_by_group[key] = max(
+            (_int(row.get('genome_available_count_same_species')) for row in members),
+            default=0,
+        )
 
     _refresh_nearest_available_from_alignment(grouped, available_anchors_by_group, alignment_path)
 
@@ -420,6 +459,10 @@ def build_quarterly_review(
     recommendations = {}
     candidates = defaultdict(list)
     for key, members in grouped.items():
+        is_baseline_extension = bool(_species(members[0].get('taxonomy')) and baseline_counts_by_group[key] > 0)
+        selection_group_type = (
+            'BASELINE_PANGENOME_EXTENSION' if is_baseline_extension else 'CANDIDATE_PANGENOME_GROUP'
+        )
         for row in members:
             evidence = _evidence_quality(row)
             base = {
@@ -427,6 +470,7 @@ def build_quarterly_review(
                 'partner_id': row.get('partner_id', 'NA'),
                 'assessment_species': group_names[key],
                 'quarterly_review_group': key,
+                'selection_group_type': selection_group_type,
                 'evidence_quality': evidence,
                 'available_genomes_before': counts_by_group[key],
                 'pangenome_target': target,
@@ -442,10 +486,18 @@ def build_quarterly_review(
                 'nearest_available_identity_source': row.get('nearest_genome_identity_source', 'assessment_snapshot'),
                 'baseline_nearest_hit': row.get('nearest_hit', 'NA'),
                 'baseline_nearest_identity': row.get('nearest_identity', 'NA'),
+                'baseline_nearest_query_coverage': row.get('nearest_query_coverage', 'NA'),
+                'baseline_redundancy_identity_threshold': f'{redundancy_identity:.2f}',
+                'baseline_redundancy_min_query_coverage': f'{redundancy_coverage:.2f}',
+                'baseline_redundancy_status': 'ELIGIBLE',
+                'baseline_extension_status': 'NOT_APPLICABLE_CANDIDATE_GROUP',
+                'baseline_extension_min_identity': f'{extension_identity:.2f}',
+                'baseline_extension_min_query_coverage': f'{extension_coverage:.2f}',
                 'project_nearest_identity': row.get('project_nearest_identity', 'NA'),
                 'gtdb_reference_nearest_identity': row.get('reference_nearest_identity', 'NA'),
                 'mwl_matched_rank': row.get('mwl_matched_rank', 'NA'),
                 'mwl_matched_taxon': row.get('mwl_matched_taxon', 'NA'),
+                'mwl_score': row.get('mwl_score', 'NA'),
                 'local_tree_figure': row.get('local_neighbourhood_figure', 'NA'),
                 'source_snapshot': row.get('_snapshot_id') or row.get('_snapshot_source_path') or 'NA',
                 'round_rank': 'NA',
@@ -456,24 +508,67 @@ def build_quarterly_review(
             if _true(row.get('already_sequenced')):
                 base.update({
                     'role': 'ALREADY_SEQUENCED', 'priority_tier': 'ALREADY_SEQUENCED',
+                    'baseline_redundancy_status': 'NOT_APPLICABLE_COMMITTED',
+                    'baseline_extension_status': 'NOT_APPLICABLE_COMMITTED',
                     'recommendation_reason': 'genome already available; excluded from new recommendations',
                 })
                 recommendations[row['id']] = base
             elif _true(row.get('selected_for_genome_sequencing')):
                 base.update({
                     'role': 'ALREADY_SELECTED', 'priority_tier': 'COMMITTED_PENDING',
+                    'baseline_redundancy_status': 'NOT_APPLICABLE_COMMITTED',
+                    'baseline_extension_status': 'NOT_APPLICABLE_COMMITTED',
                     'recommendation_reason': 'already selected for sequencing; genome is not yet available',
                 })
                 recommendations[row['id']] = base
             elif evidence == 'LOW' or (evidence == 'MODERATE' and not include_moderate):
                 base.update({
                     'role': 'REVIEW', 'priority_tier': 'EVIDENCE_REVIEW',
+                    'baseline_redundancy_status': 'NOT_EVALUATED_EVIDENCE',
+                    'baseline_extension_status': 'NOT_EVALUATED_EVIDENCE',
                     'recommendation_reason': f'{evidence.lower()} marker evidence; excluded pending review',
                 })
                 recommendations[row['id']] = base
             else:
-                row['_quarterly_review_base'] = base
-                candidates[key].append(row)
+                if is_baseline_extension:
+                    extension_eligible, extension_status, extension_reason = baseline_extension_evidence(
+                        row, extension_identity, extension_coverage,
+                    )
+                    base['baseline_extension_status'] = extension_status
+                    if not extension_eligible:
+                        base.update({
+                            'role': 'PANGENOME_BOUNDARY_REVIEW',
+                            'priority_tier': 'PANGENOME_BOUNDARY_REVIEW',
+                            'baseline_redundancy_status': 'NOT_EVALUATED_PANGENOME_BOUNDARY',
+                            'recommendation_reason': (
+                                f'not admitted to baseline-pangenome extension: {extension_reason}; '
+                                'review as a possible separate candidate lineage'
+                            ),
+                        })
+                        recommendations[row['id']] = base
+                        continue
+                redundant, identity, coverage = baseline_redundancy_evidence(
+                    row, redundancy_identity, redundancy_coverage,
+                )
+                if redundant:
+                    base.update({
+                        'role': 'BASELINE_REDUNDANT',
+                        'priority_tier': 'NEAR_IDENTICAL_CULTURED_BASELINE',
+                        'baseline_redundancy_status': 'EXCLUDED_NEAR_IDENTICAL_BASELINE',
+                        'baseline_extension_status': (
+                            'EXCLUDED_NEAR_IDENTICAL_BASELINE' if is_baseline_extension
+                            else base['baseline_extension_status']
+                        ),
+                        'recommendation_reason': (
+                            f'nearest cultured baseline {identity:.2f}% across {coverage:.2f}% of the query; '
+                            f'excluded at >={redundancy_identity:.2f}% identity and '
+                            f'>={redundancy_coverage:.2f}% query coverage; MWL evidence does not override redundancy'
+                        ),
+                    })
+                    recommendations[row['id']] = base
+                else:
+                    row['_quarterly_review_base'] = base
+                    candidates[key].append(row)
 
     primaries = []
     while len(primaries) < budget:
@@ -550,7 +645,11 @@ def build_quarterly_review(
             })
             recommendations[row['id']] = base
 
-    role_order = {'PRIMARY': 0, 'BACKUP': 1, 'REVIEW': 2, 'NOT_SELECTED': 3, 'ALREADY_SEQUENCED': 4}
+    role_order = {
+        'PRIMARY': 0, 'BACKUP': 1, 'REVIEW': 2, 'NOT_SELECTED': 3,
+        'PANGENOME_BOUNDARY_REVIEW': 4, 'BASELINE_REDUNDANT': 5,
+        'ALREADY_SELECTED': 6, 'ALREADY_SEQUENCED': 7,
+    }
     return sorted(
         recommendations.values(),
         key=lambda row: (
@@ -565,12 +664,17 @@ def build_quarterly_review(
 QUARTERLY_REVIEW_FIELDS = [
     'round_id', 'sequence_id', 'partner_id', 'role', 'round_rank', 'backup_rank', 'backup_for',
     'priority_tier', 'assessment_species', 'evidence_quality', 'available_genomes_before',
+    'selection_group_type',
     'qc_passed_genome_ids', 'available_ani_clusters',
     'pangenome_target', 'coverage_gap_before', 'nearest_available_genome',
     'nearest_available_identity', 'nearest_available_identity_source',
     'marginal_patristic_distance', 'baseline_nearest_hit',
-    'baseline_nearest_identity', 'project_nearest_identity', 'gtdb_reference_nearest_identity',
-    'mwl_matched_rank', 'mwl_matched_taxon', 'local_tree_figure', 'source_snapshot',
+    'baseline_nearest_identity', 'baseline_nearest_query_coverage',
+    'baseline_redundancy_identity_threshold', 'baseline_redundancy_min_query_coverage',
+    'baseline_redundancy_status', 'baseline_extension_status',
+    'baseline_extension_min_identity', 'baseline_extension_min_query_coverage',
+    'project_nearest_identity', 'gtdb_reference_nearest_identity',
+    'mwl_matched_rank', 'mwl_matched_taxon', 'mwl_score', 'local_tree_figure', 'source_snapshot',
     'recommendation_reason',
 ]
 
@@ -606,7 +710,10 @@ def write_quarterly_review_reports(outdir: str | Path, round_id: str, rows: List
         writer.writerow(['RoundID', round_id])
         for key in sorted(parameters):
             writer.writerow([key, parameters[key]])
-        for role in ('PRIMARY', 'BACKUP', 'REVIEW', 'NOT_SELECTED', 'ALREADY_SEQUENCED'):
+        for role in (
+            'PRIMARY', 'BACKUP', 'REVIEW', 'NOT_SELECTED', 'PANGENOME_BOUNDARY_REVIEW', 'BASELINE_REDUNDANT',
+            'ALREADY_SELECTED', 'ALREADY_SEQUENCED',
+        ):
             writer.writerow([f'{role}Count', counts[role]])
         writer.writerow(['ScientificScope', 'Marker-gene diversity expansion; confirm strain diversity with genome-derived ANI/phylogenomics'])
 

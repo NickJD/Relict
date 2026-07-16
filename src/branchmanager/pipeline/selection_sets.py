@@ -19,6 +19,12 @@ MWL_STRENGTH = {
     'order': 2, 'o': 2, 'class': 1, 'c': 1, 'phylum': 0, 'p': 0,
     'domain': 0, 'd': 0,
 }
+DEFAULT_PANGENOME_TARGET = 9
+DEFAULT_CANDIDATE_SET_SIZE = 9
+DEFAULT_BASELINE_REDUNDANCY_IDENTITY = 99.8
+DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE = 95.0
+DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY = 98.65
+DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE = 95.0
 
 
 def _float(value, default: Optional[float] = None) -> Optional[float]:
@@ -104,34 +110,80 @@ def _group_for_row(row: dict) -> tuple[str, str, str]:
     return f'local:{figure}|{rank_key}', f'local clade + {rank_name}', taxon
 
 
-def _stable_set_id(group_key: str) -> str:
+def _stable_set_id(group_key: str, prefix: str = 'BMSET') -> str:
     digest = hashlib.sha1(group_key.encode('utf-8')).hexdigest()[:8].upper()
-    return f'BMSET_{digest}'
+    return f'{prefix}_{digest}'
 
 
 def _novel_looking(rows: Iterable[dict]) -> bool:
     for row in rows:
         baseline = _float(row.get('nearest_identity'))
         reference = _float(row.get('reference_nearest_identity'))
-        mwl_strength = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
         if baseline is not None and baseline < 98.65:
             return True
         if reference is not None and reference < 98.65:
             return True
-        if mwl_strength >= 3:
-            return True
     return False
 
 
-def _exceptional_after_target(row: dict) -> bool:
-    """Flag unusually divergent or specific-priority evidence after target is met."""
-    baseline = _float(row.get('nearest_identity'))
-    reference = _float(row.get('reference_nearest_identity'))
-    mwl_strength = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
+def baseline_redundancy_evidence(
+    row: dict,
+    identity_threshold: float = DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
+    min_query_coverage: float = DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
+) -> tuple[bool, Optional[float], Optional[float]]:
+    """Return whether a candidate is near-identical to a cultured baseline marker."""
+    identity = _float(row.get('nearest_identity'))
+    coverage = _float(row.get('nearest_query_coverage'))
+    redundant = bool(
+        identity is not None
+        and coverage is not None
+        and identity >= float(identity_threshold)
+        and coverage >= float(min_query_coverage)
+    )
+    return redundant, identity, coverage
+
+
+def baseline_extension_evidence(
+    row: dict,
+    min_identity: float = DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
+    min_query_coverage: float = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
+) -> tuple[bool, str, str]:
+    """Test whether a candidate can extend the pangenome of its nearest baseline isolate."""
+    hit = str(row.get('nearest_hit') or '').strip()
+    if hit in {'', 'NA', 'None'}:
+        return False, 'BASELINE_HIT_UNAVAILABLE', 'no cultured-baseline hit is available'
+    candidate_species = _species(row.get('taxonomy'))
+    baseline_species = _species(row.get('nearest_hit_taxonomy'))
+    if not candidate_species:
+        return False, 'CANDIDATE_SPECIES_UNRESOLVED', 'candidate GTDB species is unresolved'
+    if not baseline_species:
+        return False, 'BASELINE_SPECIES_UNRESOLVED', 'nearest cultured-baseline species is unresolved'
+    if normalise_taxon_name(candidate_species) != normalise_taxon_name(baseline_species):
+        return (
+            False,
+            'BASELINE_SPECIES_MISMATCH',
+            f'candidate species {candidate_species} differs from baseline species {baseline_species}',
+        )
+    identity = _float(row.get('nearest_identity'))
+    if identity is None or identity < float(min_identity):
+        observed = 'unavailable' if identity is None else f'{identity:.2f}%'
+        return (
+            False,
+            'BASELINE_IDENTITY_BELOW_EXTENSION_THRESHOLD',
+            f'nearest cultured-baseline identity {observed} is below {float(min_identity):.2f}%',
+        )
+    coverage = _float(row.get('nearest_query_coverage'))
+    if coverage is None or coverage < float(min_query_coverage):
+        observed = 'unavailable' if coverage is None else f'{coverage:.2f}%'
+        return (
+            False,
+            'BASELINE_COVERAGE_BELOW_EXTENSION_THRESHOLD',
+            f'nearest cultured-baseline query coverage {observed} is below {float(min_query_coverage):.2f}%',
+        )
     return (
-        (baseline is not None and baseline < 97.0)
-        or (reference is not None and reference < 94.5)
-        or mwl_strength >= 3
+        True,
+        'ELIGIBLE_BASELINE_PANGENOME_EXTENSION',
+        f'exact species agreement with {hit}; {identity:.2f}% identity across {coverage:.2f}% of the query',
     )
 
 
@@ -142,15 +194,33 @@ def _evidence_tuple(row: dict) -> tuple:
     isolation = _float(row.get('phylo_isolation'), 0.0)
     confidence = _float(row.get('classification_confidence'), 0.0)
     mwl = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
+    mwl_score = _float(row.get('mwl_score'), 0.0)
     return (
-        mwl,
         100.0 - float(baseline),
         100.0 - float(project),
         100.0 - float(reference),
         float(isolation),
+        mwl,
+        float(mwl_score),
         float(confidence),
         str(row.get('id') or ''),
     )
+
+
+def _ranking_reason(row: dict, opening: str, spread: Optional[float]) -> str:
+    parts = [opening]
+    if spread is not None:
+        parts.append(f'marginal patristic distance {spread:.5f}')
+    baseline = _float(row.get('nearest_identity'))
+    if baseline is not None and baseline > 0:
+        parts.append(f'nearest cultured baseline {baseline:.2f}%')
+    project = _float(row.get('project_nearest_identity'))
+    if project is not None and project > 0:
+        parts.append(f'nearest project marker {project:.2f}%')
+    mwl_rank = str(row.get('mwl_matched_rank') or '').strip()
+    if mwl_rank not in {'', 'NA', 'None'}:
+        parts.append(f'MWL {mwl_rank}-level context')
+    return '; '.join(parts)
 
 
 def _tree_leaf(row: dict) -> str:
@@ -226,12 +296,28 @@ def build_sequencing_sets(
     *,
     tree_path: Optional[str | Path] = None,
     db=None,
-    pangenome_target: int = 3,
-    candidate_set_size: int = 4,
+    pangenome_target: int = DEFAULT_PANGENOME_TARGET,
+    candidate_set_size: int = DEFAULT_CANDIDATE_SET_SIZE,
+    baseline_redundancy_identity: float = DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
+    baseline_redundancy_min_query_coverage: float = DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
+    baseline_extension_min_identity: float = DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
+    baseline_extension_min_query_coverage: float = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
 ) -> str:
-    """Assign rolling primary/backup roles within assessment species or local clades."""
-    target = max(1, int(pangenome_target or 3))
-    set_size = max(target, int(candidate_set_size or 4))
+    """Assign rolling nine-member diversity panels within species or local clades."""
+    target = max(1, int(pangenome_target or DEFAULT_PANGENOME_TARGET))
+    set_size = max(target, int(candidate_set_size or DEFAULT_CANDIDATE_SET_SIZE))
+    redundancy_identity = float(baseline_redundancy_identity)
+    redundancy_coverage = float(baseline_redundancy_min_query_coverage)
+    extension_identity = float(baseline_extension_min_identity)
+    extension_coverage = float(baseline_extension_min_query_coverage)
+    if not 0.0 <= redundancy_identity <= 100.0:
+        raise ValueError('baseline redundancy identity must be between 0 and 100')
+    if not 0.0 <= redundancy_coverage <= 100.0:
+        raise ValueError('baseline redundancy minimum query coverage must be between 0 and 100')
+    if not 0.0 <= extension_identity <= redundancy_identity:
+        raise ValueError('baseline extension minimum identity must be between 0 and the redundancy identity threshold')
+    if not 0.0 <= extension_coverage <= 100.0:
+        raise ValueError('baseline extension minimum query coverage must be between 0 and 100')
     grouped: Dict[str, List[dict]] = defaultdict(list)
     group_metadata = {}
     for row in assessment_rows:
@@ -254,7 +340,6 @@ def build_sequencing_sets(
     for group_key in sorted(grouped):
         members = grouped[group_key]
         basis, taxon = group_metadata[group_key]
-        set_id = _stable_set_id(group_key)
         species = _species(members[0].get('taxonomy'))
         species_key = normalise_taxon_name(species) if species else ''
         committed_ids = committed_by_species.get(species_key, []) if species_key else [
@@ -266,6 +351,19 @@ def build_sequencing_sets(
         committed_count = max(baseline_count + selected_count + pending_count, len(committed_ids))
         gap = max(0, target - committed_count)
         novel_clade = _novel_looking(members)
+        is_baseline_extension = bool(species and baseline_count > 0)
+        group_type = 'BASELINE_PANGENOME_EXTENSION' if is_baseline_extension else 'CANDIDATE_PANGENOME_GROUP'
+        basis = (
+            'baseline-pangenome extension: exact species + close full-length marker'
+            if is_baseline_extension else basis
+        )
+        set_id = _stable_set_id(group_key, 'BMEXT' if is_baseline_extension else 'BMSET')
+        baseline_anchor_ids = sorted({
+            str(row.get('nearest_hit')) for row in members
+            if str(row.get('nearest_hit') or '') not in {'', 'NA', 'None'}
+            and _species(row.get('nearest_hit_taxonomy'))
+            and normalise_taxon_name(_species(row.get('nearest_hit_taxonomy'))) == species_key
+        })
 
         for row in members:
             row.update({
@@ -274,49 +372,92 @@ def build_sequencing_sets(
                 'sequencing_set_rank': 'NA',
                 'sequencing_set_reason': 'not selected into the proposed working set',
                 'selection_group_basis': basis,
+                'selection_group_type': group_type,
                 'selection_group_taxon': taxon,
                 'novel_looking_clade': 'Yes' if novel_clade else 'No',
+                'baseline_redundancy_status': 'ELIGIBLE',
+                'baseline_redundancy_identity_threshold': f'{redundancy_identity:.2f}',
+                'baseline_redundancy_min_query_coverage': f'{redundancy_coverage:.2f}',
+                'baseline_extension_status': 'NOT_APPLICABLE_CANDIDATE_GROUP',
+                'baseline_extension_min_identity': f'{extension_identity:.2f}',
+                'baseline_extension_min_query_coverage': f'{extension_coverage:.2f}',
+                'selection_diversity_distance': 'NA',
             })
 
         eligible = []
+        redundant_count = 0
         for row in members:
             if _available(row):
                 row['sequencing_set_role'] = 'SEQUENCED'
                 row['sequencing_set_reason'] = 'genome already sequenced and available'
+                row['baseline_redundancy_status'] = 'NOT_APPLICABLE_COMMITTED'
+                row['baseline_extension_status'] = 'NOT_APPLICABLE_COMMITTED'
             elif _selected(row):
                 row['sequencing_set_role'] = 'COMMITTED'
                 row['sequencing_set_reason'] = 'already selected for genome sequencing; genome not yet available'
+                row['baseline_redundancy_status'] = 'NOT_APPLICABLE_COMMITTED'
+                row['baseline_extension_status'] = 'NOT_APPLICABLE_COMMITTED'
             elif _evidence_quality(row) == 'LOW':
                 row['sequencing_set_role'] = 'REVIEW_EVIDENCE'
                 row['sequencing_set_reason'] = 'marker evidence requires review before selection'
-            elif gap == 0 and _exceptional_after_target(row):
-                eligible.append(row)
-            elif gap == 0:
-                row['sequencing_set_role'] = 'TARGET_MET'
-                row['sequencing_set_reason'] = f'{target}-genome assessment-species target already met'
+                row['baseline_redundancy_status'] = 'NOT_EVALUATED_EVIDENCE'
+                row['baseline_extension_status'] = 'NOT_EVALUATED_EVIDENCE'
             else:
-                eligible.append(row)
+                if is_baseline_extension:
+                    extension_eligible, extension_status, extension_reason = baseline_extension_evidence(
+                        row, extension_identity, extension_coverage,
+                    )
+                    row['baseline_extension_status'] = extension_status
+                    if not extension_eligible:
+                        row['sequencing_set_role'] = 'PANGENOME_BOUNDARY_REVIEW'
+                        row['baseline_redundancy_status'] = 'NOT_EVALUATED_PANGENOME_BOUNDARY'
+                        row['sequencing_set_reason'] = (
+                            f'not admitted to baseline-pangenome extension: {extension_reason}; '
+                            'review as a possible separate candidate lineage'
+                        )
+                        continue
+                redundant, identity, coverage = baseline_redundancy_evidence(
+                    row, redundancy_identity, redundancy_coverage,
+                )
+                if redundant:
+                    redundant_count += 1
+                    row['sequencing_set_role'] = 'BASELINE_REDUNDANT'
+                    row['baseline_redundancy_status'] = 'EXCLUDED_NEAR_IDENTICAL_BASELINE'
+                    if is_baseline_extension:
+                        row['baseline_extension_status'] = 'EXCLUDED_NEAR_IDENTICAL_BASELINE'
+                    row['sequencing_set_reason'] = (
+                        f'nearest cultured baseline {identity:.2f}% across {coverage:.2f}% of the query; '
+                        f'excluded at >={redundancy_identity:.2f}% identity and '
+                        f'>={redundancy_coverage:.2f}% query coverage; MWL evidence does not override redundancy'
+                    )
+                else:
+                    eligible.append(row)
 
         ranked = _farthest_first(eligible, committed_ids, distances)
-        recommended = ranked[:min(1 if gap == 0 else set_size, len(ranked))]
+        recommended = ranked[:min(set_size, len(ranked))]
         for rank, (row, spread) in enumerate(recommended, start=1):
             role = 'DIVERSITY_CANDIDATE' if gap == 0 else ('PRIMARY' if rank <= gap else 'BACKUP')
             row['sequencing_set_role'] = role
             row['sequencing_set_rank'] = str(rank)
-            spread_text = f'; patristic spread {spread:.5f}' if spread is not None else ''
+            row['selection_diversity_distance'] = f'{spread:.6f}' if spread is not None else 'NA'
             if role == 'PRIMARY':
-                reason = f'fills genome {committed_count + rank} of target {target}{spread_text}'
+                opening = f'fills genome {committed_count + rank} of target {target}'
             elif role == 'DIVERSITY_CANDIDATE':
-                reason = f'exceptional novelty/MWL evidence after minimum genome target was met{spread_text}'
+                opening = f'ranked diversity expansion after the {target}-genome count target was met'
             else:
-                reason = f'backup for DNA-extraction failure and strain-diversity capture{spread_text}'
-            row['sequencing_set_reason'] = reason
+                opening = 'ranked backup for DNA-extraction failure and additional within-group diversity'
+            row['sequencing_set_reason'] = _ranking_reason(row, opening, spread)
+
+        ranked_count = len(recommended)
+        unfilled_ranks = max(0, set_size - ranked_count)
 
         for row in members:
             output_rows.append({
                 'SetID': set_id,
+                'GroupType': group_type,
                 'GroupBasis': basis,
                 'AssessmentTaxon': taxon,
+                'BaselineAnchorIDs': ';'.join(baseline_anchor_ids) or 'None',
                 'NovelLookingClade': 'Yes' if novel_clade else 'No',
                 'BaselineGenomes': baseline_count,
                 'SequencedPartnerGenomes': selected_count,
@@ -325,34 +466,55 @@ def build_sequencing_sets(
                 'CommittedGenomeIDs': ';'.join(committed_ids) or 'None',
                 'PangenomeTarget': target,
                 'PangenomeGap': gap,
+                'DiversityPanelSize': set_size,
+                'EligibleCandidateCount': len(eligible),
+                'RankedCandidateCount': ranked_count,
+                'BaselineRedundantCount': redundant_count,
+                'UnfilledPanelRanks': unfilled_ranks,
                 'CandidateID': row.get('id', 'NA'),
                 'PartnerID': row.get('partner_id', 'NA'),
                 'SetRole': row.get('sequencing_set_role', 'NA'),
                 'SetRank': row.get('sequencing_set_rank', 'NA'),
                 'EvidenceQuality': _evidence_quality(row),
                 'BaselineNearestIdentity': row.get('nearest_identity', 'NA'),
+                'BaselineNearestQueryCoverage': row.get('nearest_query_coverage', 'NA'),
+                'BaselineRedundancyStatus': row.get('baseline_redundancy_status', 'NA'),
+                'BaselineRedundancyIdentityThreshold': f'{redundancy_identity:.2f}',
+                'BaselineRedundancyMinQueryCoverage': f'{redundancy_coverage:.2f}',
+                'BaselineExtensionStatus': row.get('baseline_extension_status', 'NA'),
+                'BaselineExtensionMinIdentity': f'{extension_identity:.2f}',
+                'BaselineExtensionMinQueryCoverage': f'{extension_coverage:.2f}',
                 'ProjectNearestIdentity': row.get('project_nearest_identity', 'NA'),
                 'GTDBReferenceIdentity': row.get('reference_nearest_identity', 'NA'),
                 'MWLMatchedRank': row.get('mwl_matched_rank', 'NA'),
+                'MWLScore': row.get('mwl_score', 'NA'),
                 'PhyloIsolation': row.get('phylo_isolation', 'NA'),
+                'SelectionDiversityDistance': row.get('selection_diversity_distance', 'NA'),
                 'LocalTreeFigure': row.get('local_neighbourhood_figure', 'NA'),
                 'SelectionReason': row.get('sequencing_set_reason', 'NA'),
             })
 
     role_order = {'PRIMARY': 0, 'BACKUP': 1, 'DIVERSITY_CANDIDATE': 2,
                   'COMMITTED': 3, 'SEQUENCED': 4, 'ALTERNATE': 5,
-                  'REVIEW_EVIDENCE': 6, 'TARGET_MET': 7}
+                  'REVIEW_EVIDENCE': 6, 'PANGENOME_BOUNDARY_REVIEW': 7,
+                  'BASELINE_REDUNDANT': 8, 'TARGET_MET': 9}
     output_rows.sort(key=lambda row: (
         row['SetID'], role_order.get(str(row['SetRole']), 99),
         _int(row['SetRank'], 999), str(row['CandidateID']),
     ))
     fields = list(output_rows[0]) if output_rows else [
-        'SetID', 'GroupBasis', 'AssessmentTaxon', 'NovelLookingClade', 'BaselineGenomes',
+        'SetID', 'GroupType', 'GroupBasis', 'AssessmentTaxon', 'BaselineAnchorIDs',
+        'NovelLookingClade', 'BaselineGenomes',
         'SequencedPartnerGenomes', 'SelectedPendingGenomes', 'CommittedGenomeCount', 'CommittedGenomeIDs',
-        'PangenomeTarget', 'PangenomeGap', 'CandidateID', 'PartnerID', 'SetRole',
-        'SetRank', 'EvidenceQuality', 'BaselineNearestIdentity', 'ProjectNearestIdentity',
-        'GTDBReferenceIdentity', 'MWLMatchedRank', 'PhyloIsolation', 'LocalTreeFigure',
-        'SelectionReason',
+        'PangenomeTarget', 'PangenomeGap', 'DiversityPanelSize', 'EligibleCandidateCount',
+        'RankedCandidateCount', 'BaselineRedundantCount', 'UnfilledPanelRanks',
+        'CandidateID', 'PartnerID', 'SetRole', 'SetRank', 'EvidenceQuality',
+        'BaselineNearestIdentity', 'BaselineNearestQueryCoverage', 'BaselineRedundancyStatus',
+        'BaselineRedundancyIdentityThreshold', 'BaselineRedundancyMinQueryCoverage',
+        'BaselineExtensionStatus', 'BaselineExtensionMinIdentity',
+        'BaselineExtensionMinQueryCoverage',
+        'ProjectNearestIdentity', 'GTDBReferenceIdentity', 'MWLMatchedRank', 'MWLScore', 'PhyloIsolation',
+        'SelectionDiversityDistance', 'LocalTreeFigure', 'SelectionReason',
     ]
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)

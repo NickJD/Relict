@@ -64,7 +64,7 @@ performance_review() {
     --alt-ref "$GG2" --alt-taxa "$GG2_TAXA" --alt-ref-name GG2 \
     --main-ref GTDB --chimera-ref "$GTDB" --mwl "$MWL" \
     --previous-review "$previous" --sequence-domain bacteria \
-    --pangenome-target 3 --candidate-set-size 4 \
+    --pangenome-target 9 --candidate-set-size 9 \
     --neighbourhood-format png --threads 10 \
     -o "$out/03_performance_review_hiring_panel"
 }

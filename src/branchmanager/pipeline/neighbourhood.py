@@ -321,12 +321,15 @@ def _selection_badge(metadata: dict) -> str:
         return f'P{rank}' if rank not in ('', 'NA', 'None') else 'PRIMARY'
     if role == 'BACKUP':
         return f'B{rank}' if rank not in ('', 'NA', 'None') else 'BACKUP'
+    if role == 'DIVERSITY_CANDIDATE':
+        return f'D{rank}' if rank not in ('', 'NA', 'None') else 'DIVERSITY'
     return {
         'COMMITTED': 'SELECTED',
         'SEQUENCED': 'SEQUENCED',
         'ALTERNATE': 'ALT',
-        'DIVERSITY_CANDIDATE': 'DIVERSITY',
         'REVIEW_EVIDENCE': 'REVIEW',
+        'PANGENOME_BOUNDARY_REVIEW': 'BOUNDARY REVIEW',
+        'BASELINE_REDUNDANT': 'BASELINE REDUNDANT',
         'TARGET_MET': 'TARGET MET',
     }.get(role, '')
 
@@ -629,7 +632,7 @@ def _write_group_png(
     draw.text((px(843), px(73)), 'backup', fill='#25313d', font=label_font)
     draw.text(
         (px(28), px(101)),
-        'Selection labels: [P#] primary; [B#] backup; [SELECTED] committed/pending; [SEQUENCED] genome available',
+        'Selection labels: [P#] primary; [B#] backup; [D#] post-target diversity; boundary review/exclusion shown in labels',
         fill='#4d5966', font=small_font,
     )
     identity_text = (
