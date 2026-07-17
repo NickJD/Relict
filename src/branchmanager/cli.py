@@ -25,7 +25,6 @@ except Exception:
 from branchmanager.db.interface import Database
 from branchmanager.pipeline import (
     classify,
-    derep,
     itol,
     neighbourhood,
     novelty,
@@ -349,14 +348,14 @@ def _write_detailed_output_guide(outdir: Path, rows):
     qc_section = [
         "## QC Filtering",
         "",
-        "QC happens before dereplication, classification, novelty scoring, and tree building. "
+        "QC happens before classification, novelty scoring, and tree building. "
         "Sequences that fail QC are not included in downstream reports because they are too short "
         "for reliable 16S placement or contain too many ambiguous bases.",
         "",
         "Filtering rules:",
         "",
         f"- `too_short`: sequence length is less than `min_len` (`{stat('min_len')}` bp for this run).",
-        f"- `too_many_n`: sequence has more than `max_n` ambiguous `N` bases (`{stat('max_n')}` for this run).",
+        f"- `too_many_n`: ambiguous `N` bases exceed `max_n_percent` (`{stat('max_n_percent')}`% for this run).",
         "- A sequence can have more than one reason in `qc_rejections.tsv`.",
         "",
     ]
@@ -387,6 +386,10 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "This guide explains the output files and metrics produced by the BranchManager Performance Review.",
         "",
+        "## Run Scope",
+        "",
+        "Assessment, selection, per-database taxonomy, novelty, baseline-hit, and neighbourhood target rows are limited to the dataset supplied to this run. Prior partner datasets and cultured baselines remain available as comparison context. Neighbourhood context leaves, the combined tree taxonomy, MSA, tree, and iTOL membership files are cumulative project-context outputs by design.",
+        "",
         "## Recommended Reading Order",
         "",
         "1. `assessment/sequencing_sets.tsv` - proposed primary, backup, and alternate isolates by GTDB species/local clade.",
@@ -406,7 +409,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "- `tree/`: MSA, Newick tree, and tree/alignment warning files.",
         "- `itol/`: one iTOL metadata dataset per metadata type, usually colour-strip files.",
         "- `ids/`: short ID to original FASTA header maps.",
-        "- `intermediate/`: QC/dereplication/collapse/debug FASTA files and scratch pools.",
+        "- `intermediate/`: QC, optional collapse, debug FASTA files, and scratch pools.",
         "- `logs/`: pipeline log.",
         "",
         *qc_section,
@@ -521,14 +524,14 @@ def _write_output_explanations(outdir: str):
         ('all_databases.tsv', 'Per-sequence taxonomic assignments from every configured reference database.'),
         ('baseline_hits.tsv', 'Nearest-hit report against baseline/provided datasets such as Hungate.'),
         ('nearest_project_hits_raw.tsv', 'Raw nearest-hit table produced for the newest submission; rolling project and baseline comparisons are summarised in novelty_metrics.tsv.'),
-        ('qc_rejections.tsv', 'Per-sequence QC rejection table. Columns: ID, Length, NCount, Reasons, MinLength, MaxN. Reasons explain exactly why each sequence was filtered before downstream analysis.'),
+        ('qc_rejections.tsv', 'Per-sequence QC rejection table. Columns: ID, Length, NCount, NPercent, Reasons, MinLength, MaxNPercent. Reasons explain exactly why each sequence was filtered before downstream analysis.'),
         ('partner_metadata_warnings.tsv', 'Warnings from --partner-metadata mapping. Rows indicate metadata IDs not found in the project database/current run, baseline IDs supplied as partner metadata, or current-run sequences missing from the metadata table.'),
         ('marker_qc_provenance.tsv', 'Per-isolate bridge from Paper Trail/Merge Meeting raw reads and marker QC into Performance Review, including source checksums, manual review, and chimera call.'),
         ('chimera_screen.tsv', 'Reference-UCHIME marker screen. CHIMERA, INDETERMINATE, SKIPPED, or NOT_RUN calls force selection evidence to review.'),
         ('decision_changes.tsv', 'Difference between the two latest stored assessment snapshots, including recommendation, set role, pangenome gap, and tracked evidence changes.'),
         ('run_manifest.json', 'Machine-readable workflow manifest with input/output SHA256 checksums, software/tool versions, stage status, timestamps, warnings, and failure details.'),
         ('performance_review_dashboard.html', 'Compact linked decision dashboard for the current Performance Review/Hiring Panel.'),
-        ('qc.stats', 'QC summary with total input, kept count, rejection counts, min_len, max_n, and pointer to qc_rejections.tsv when available.'),
+        ('qc.stats', 'QC summary with total input, kept count, rejection counts, min_len, max_n_percent, and pointer to qc_rejections.tsv when available.'),
         ('user_id_map.tsv', 'Mapping of runtime sequence IDs to original headers produced when inserting user sequences into the DB. When shortening is disabled these usually match.'),
         ('filing_cabinet_id_map.tsv', 'Mapping of Filing Cabinet runtime IDs back to original FASTA headers. Use this to trace tree labels back to source records.'),
         ('*_id_map.tsv', 'ID map mapping original headers to runtime DB ids. Useful for iTOL and metadata tracing.'),
@@ -536,8 +539,8 @@ def _write_output_explanations(outdir: str):
         ('filing_cabinet_collapsed_map.tsv', 'Cluster map for collapsed Filing Cabinet sequences: rep_id\ttaxonomy\tcount.'),
         ('collapsed_members.tsv', 'Member->representative mapping (member\trep) for collapsed clusters.'),
         ('filing_cabinet_collapsed_members.tsv', 'Member-to-representative mapping for collapsed Filing Cabinet clusters.'),
-        ('derep_short.fasta', 'Dereplicated FASTA where sequence headers are the runtime IDs used by the DB. These are preserved source IDs unless --shorten-ids was requested.'),
-        ('derep_short_collapsed.fasta', 'Dereplicated FASTA after collapse; representatives for clusters kept with runtime IDs.'),
+        ('current_dataset_sequences.fasta', 'QC-passing current-dataset FASTA with the runtime IDs used by the database. Exact marker duplicates retain separate isolate IDs.'),
+        ('current_dataset_collapsed.fasta', 'Optional collapsed tree-view FASTA; assessment and database rows still retain every current-dataset isolate ID.'),
         ('filing_cabinet_collapsed.fasta', 'Collapsed Filing Cabinet FASTA; representatives retained for tree building.'),
         ('novelty_matches.tsv', 'vsearch BLAST-like output used to compute nearest-neighbour novelty identities.'),
         ('novelty_metrics.tsv', (
@@ -837,9 +840,8 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
 
     for name in (
         'qc.fasta',
-        'derep.fasta',
-        'derep_short.fasta',
-        'derep_short_collapsed.fasta',
+        'current_dataset_sequences.fasta',
+        'current_dataset_collapsed.fasta',
         'collapsed_map.tsv',
         'collapsed_members.tsv',
         'submitted_sequences.fasta',
@@ -850,7 +852,6 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
         'new_sequences.fasta',
         'combined_aln.fasta',
         'tree_orientation_ref.fasta',
-        'rolling_candidate_sequences.fasta',
         'id_map.tsv',
     ):
         _move_if_exists(out, name, 'intermediate')
@@ -1653,22 +1654,28 @@ def _cmd_performance_review_impl(args):
             )
 
     # QC
-    qc_out = qc.run_qc(args.input, outdir, min_len=getattr(args, 'min_len', 800), max_n=getattr(args, 'max_n', 5))
+    qc_out = qc.run_qc(
+        args.input,
+        outdir,
+        min_len=getattr(args, 'min_len', 800),
+        max_n_percent=getattr(args, 'max_n_percent', 5.0),
+    )
 
-    # derep
-    derep_out = derep.run_derep(qc_out, outdir)
+    # Preserve every isolate ID, including exact marker-sequence duplicates.
+    # Distinct isolates can still contain different genomes or provide useful
+    # DNA-extraction backups; optional tree collapsing handles visual density.
+    candidate_input = qc_out
 
-    # map user-provided dereplicated IDs to runtime IDs and insert into DB
+    # Map user-provided IDs to runtime IDs and insert them into the DB.
     from branchmanager.utils.fasta import read_fasta, write_fasta
-    mapped_derep = Path(outdir) / 'derep_short.fasta'
+    current_dataset_fasta = Path(outdir) / 'current_dataset_sequences.fasta'
     used_ids = set(db.get_all_ids())
     orig_to_short = {}
     mapped_records = []
     skipped_existing = 0
 
-    # If the user requested a kingdom filter run classification early on the
-    # dereplicated fasta so we can keep only sequences assigned to the chosen
-    # kingdom. This avoids inserting unwanted sequences into the DB.
+    # If the user requested a kingdom filter, classify the QC-passing input
+    # before insertion so only sequences assigned to that domain are retained.
     early_class_out = None
     allowed_qids = None
     kingdom = domain_filter
@@ -1679,14 +1686,14 @@ def _cmd_performance_review_impl(args):
             allowed_qids = None
         else:
             try:
-                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Running pre-insert classification on dereplicated fasta to filter by domain=%s", kingdom)
-                early_class_out = classify.run_classification(str(derep_out), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Running pre-insert classification to filter by domain=%s", kingdom)
+                early_class_out = classify.run_classification(str(candidate_input), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
                 allowed_qids = _classification_ids_matching_kingdom(early_class_out, kingdom_text)
-                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Kingdom filter: %d dereplicated sequences match %s", len(allowed_qids), kingdom)
+                logging.getLogger(__name__).info("[PERFORMANCE REVIEW] Domain filter: %d QC-passing sequences match %s", len(allowed_qids), kingdom)
             except Exception as e:
                 raise SystemExit(f'[PERFORMANCE REVIEW] Domain classification/filtering failed: {e}')
 
-    for h, s in read_fasta(derep_out):
+    for h, s in read_fasta(candidate_input):
         # if kingdom filtering is active, skip sequences that did not match
         if allowed_qids is not None:
             # try a few candidate header forms for matching
@@ -1739,8 +1746,8 @@ def _cmd_performance_review_impl(args):
                 pass
     if skipped_existing:
         logging.getLogger(__name__).info("[DB] Found %d sequences already in DB; keeping them for tree inclusion", skipped_existing)
-    write_fasta(mapped_records, str(mapped_derep))
-    logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to runtime IDs and wrote %s", len(mapped_records), mapped_derep)
+    write_fasta(mapped_records, str(current_dataset_fasta))
+    logging.getLogger(__name__).info("[DB] Mapped %d user sequence IDs to runtime IDs and wrote %s", len(mapped_records), current_dataset_fasta)
     if not mapped_records:
         raise SystemExit(
             '[PERFORMANCE REVIEW] No sequences passed sequence/domain QC. Project state was not accepted; '
@@ -1825,7 +1832,7 @@ def _cmd_performance_review_impl(args):
         else:
             from branchmanager.pipeline import chimera as _chimera
             chimera_report, chimera_results = _chimera.run_reference_screen(
-                str(mapped_derep),
+                str(current_dataset_fasta),
                 getattr(args, 'chimera_ref', None) or effective_ref,
                 outdir,
                 threads=threads,
@@ -1908,7 +1915,7 @@ def _cmd_performance_review_impl(args):
                     ref_name, [n for _, _, n in alt_databases], run_main_db_name,
                 )
                 class_out, all_class_results = classify.run_all_classifications(
-                    str(mapped_derep), outdir,
+                    str(current_dataset_fasta), outdir,
                     primary_ref=effective_ref,
                     primary_taxa=effective_taxa_tsv,
                     primary_name=ref_name,
@@ -1918,7 +1925,7 @@ def _cmd_performance_review_impl(args):
                 )
                 _store_alt_taxonomy_in_db(db, all_class_results, run_main_db_name)
             else:
-                class_out = classify.run_classification(str(mapped_derep), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
+                class_out = classify.run_classification(str(current_dataset_fasta), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
 
     if (
         getattr(args, 'command', None) == 'performance-review'
@@ -1981,32 +1988,13 @@ def _cmd_performance_review_impl(args):
     except Exception as e:
         raise RuntimeError(f'Could not establish rolling dataset roles: {e}') from e
 
-    # Recalculate metrics for the full rolling partner-candidate collection,
-    # including this batch. Pool searches explicitly remove each query's self-hit.
-    rolling_candidate_fasta = Path(outdir) / 'rolling_candidate_sequences.fasta'
-    rolling_candidate_records = []
-    try:
-        candidate_datasets = db.get_dataset_names_by_role('candidate')
-        with db.connect() as conn:
-            placeholders = ','.join('?' for _ in candidate_datasets)
-            if placeholders:
-                rows = conn.execute(
-                    f"SELECT id, sequence FROM sequences WHERE dataset IN ({placeholders}) "
-                    "AND sequence IS NOT NULL AND sequence != '' ORDER BY id",
-                    tuple(candidate_datasets),
-                ).fetchall()
-            else:
-                rows = []
-        rolling_candidate_records = [(str(sid), str(seq)) for sid, seq in rows]
-        if rolling_candidate_records:
-            write_fasta(rolling_candidate_records, str(rolling_candidate_fasta))
-    except Exception as e:
-        raise RuntimeError(f'Could not build the rolling candidate sequence pool: {e}') from e
-    metrics_query_fasta = str(rolling_candidate_fasta) if rolling_candidate_records else str(mapped_derep)
+    # Assess only this submission. Novelty searches still use every registered
+    # candidate and baseline in the database as rolling comparison context.
+    metrics_query_fasta = str(current_dataset_fasta)
 
     # novelty
     target_fasta = getattr(args, 'target', None)
-    novelty_out = novelty.run_novelty(str(mapped_derep), effective_ref, outdir, db=db, run_dataset=run_dataset, threads=threads, target_fasta=target_fasta)
+    novelty_out = novelty.run_novelty(str(current_dataset_fasta), effective_ref, outdir, db=db, run_dataset=run_dataset, threads=threads, target_fasta=target_fasta)
     try:
         novelty_metrics_out = novelty.build_reference_novelty_metrics(
             metrics_query_fasta,
@@ -2034,7 +2022,7 @@ def _cmd_performance_review_impl(args):
     # Initialise cluster-tracking variables used by both the tree section and
     # the assessment section below.  They will be populated if --collapse is
     # active; otherwise they stay empty and the assessment omits cluster columns.
-    tree_fasta = mapped_derep
+    tree_fasta = current_dataset_fasta
     run_member_to_rep: dict = {}
     run_rep_to_members: dict = {}
 
@@ -2074,7 +2062,7 @@ def _cmd_performance_review_impl(args):
             # group short ids by tax
             taxa_groups = {}
             try:
-                for h, s in read_fasta(str(mapped_derep)):
+                for h, s in read_fasta(str(current_dataset_fasta)):
                     tax = qid_to_tax.get(h)
                     taxa_groups.setdefault(tax, []).append((h, s))
             except Exception:
@@ -2083,7 +2071,7 @@ def _cmd_performance_review_impl(args):
                 artefacts = collapse_fasta_within_taxa(
                     taxa_groups,
                     outdir,
-                    'derep_short_collapsed.fasta',
+                    'current_dataset_collapsed.fasta',
                     'collapsed_map.tsv',
                     'collapsed_members.tsv',
                     threshold=threshold,
@@ -2331,7 +2319,7 @@ def _cmd_performance_review_impl(args):
             novelty.build_run_novelty_itol(
                 outdir,
                 run_ids,
-                str(mapped_derep),
+                str(current_dataset_fasta),
                 db,
                 run_dataset,
                 orig_to_short,
@@ -2348,10 +2336,7 @@ def _cmd_performance_review_impl(args):
                 warn_path = write_placement_warning_tsv(Path(outdir) / 'placement_warnings.tsv', warning_rows)
                 logging.getLogger(__name__).warning("[PERFORMANCE REVIEW] Placement warnings written to %s", warn_path)
             try:
-                run_ids_for_assessment = (
-                    [record[0] for record in rolling_candidate_records]
-                    if rolling_candidate_records else [record[0] for record in mapped_records]
-                )
+                run_ids_for_assessment = [record[0] for record in mapped_records]
                 # Determine which sequences are actually in the tree
                 try:
                     _tree_ids = set()
@@ -3425,8 +3410,8 @@ def build_parser():
         help='Replace input headers with compact IDs. Default is to preserve the IDs exactly as supplied.')
     performance_review_parser.add_argument('--min-len', dest='min_len', type=int, default=800,
         help='Minimum sequence length to retain (bp, default: 800). Shorter sequences are filtered out.')
-    performance_review_parser.add_argument('--max-n', dest='max_n', type=int, default=5,
-        help='Maximum number of ambiguous (N) bases allowed (default: 5).')
+    performance_review_parser.add_argument('--max-n-percent', dest='max_n_percent', type=float, default=5.0,
+        help='Maximum percentage of ambiguous (N) bases allowed (default: 5.0).')
     performance_review_parser.add_argument('--chimera-ref', dest='chimera_ref', default=None,
         help='Curated chimera-free marker reference for UCHIME. Defaults to the primary classification reference.')
     performance_review_parser.add_argument('--skip-chimera-check', dest='skip_chimera_check', action='store_true', default=False,
@@ -3718,7 +3703,7 @@ def build_parser():
     paper_trail_parser.add_argument('--mixed-peak-min-quality', dest='mixed_peak_min_quality', type=int, default=paper_trail_policy.mixed_peak_min_quality,
         help='Minimum Phred score for a mixed-peak position to count (default: 20).')
     paper_trail_parser.add_argument('--screen-ref', dest='screen_ref', default=None,
-        help='Optional marker reference FASTA for independent per-primer taxonomy concordance screening.')
+        help='Optional marker reference FASTA for independent per-primer taxonomy concordance screening; disagreements require manual review and retain the read-level assignments.')
     paper_trail_parser.add_argument('--screen-taxa', dest='screen_taxa', default=None,
         help='Optional taxonomy table corresponding to --screen-ref; FASTA header taxonomy is used when omitted.')
     paper_trail_parser.add_argument('--threads', type=int, default=4,
@@ -3820,7 +3805,7 @@ def build_parser():
     )
     interview_parser.add_argument(
         '--screen-ref', dest='screen_ref', default=None,
-        help='Optional marker reference FASTA for independent per-read taxonomy concordance screening.',
+        help='Optional marker reference FASTA for independent per-read taxonomy concordance screening; disagreements trigger manual review and report each read assignment.',
     )
     interview_parser.add_argument(
         '--screen-taxa', dest='screen_taxa', default=None,
@@ -4822,7 +4807,8 @@ def cmd_assistant(args):
             baseline_skip_classify=False, baseline_colours=None, baseline_shorten_ids=False,
             novelty_baseline_datasets=[], mwl=args.mwl, mwl_sheet='MWL_V1', mwl_min_rank='p',
             taxa_assignments=None, previous_review=None, shorten_ids=False,
-            min_len=800, max_n=5, sequence_domain=args.sequence_domain,
+            min_len=800, max_n_percent=args.max_n_percent,
+            sequence_domain=args.sequence_domain,
             phylum=None, target=None, force_rebuild=False, anchors=None,
             threads=args.threads, tree_method=args.tree_method,
             neighbourhood_format='png', pangenome_target=args.pangenome_target,

@@ -212,7 +212,7 @@ branchmanager interview \
   -o UoG/UoG_01_interview
 ```
 
-`--screen-ref` is optional and only checks whether separate primer reads from the same isolate have discordant taxonomic hits. Without it, all chromatogram, trimming, assembly, quality, ambiguity, mixed-peak, and resequencing outputs are still produced.
+`--screen-ref` is optional and only checks whether separate primer reads from the same isolate have discordant taxonomic hits. A disagreement produces `PASS_WITH_WARNINGS / MANUAL_REVIEW` unless another QC criterion fails. The common comparison rank and each `read_id=taxon` assignment are written to the concordance, assembly, recommendation, and review tables. Without it, all chromatogram, trimming, assembly, quality, ambiguity, mixed-peak, and resequencing outputs are still produced.
 
 Interview accepts either the Mailroom directory or its `ab1_map.tsv`. It requires the accompanying `mailroom_summary.json`, rejects a Mailroom `FAIL`, and stops on `REVIEW_REQUIRED` unless the batch has been reviewed and `--allow-mailroom-review` is supplied explicitly.
 
@@ -319,7 +319,7 @@ BranchManager applies the same versioned Sanger QC policy in `interview`, `paper
 - Primer sequences are removed only after a confident IUPAC-aware leading match; customise them with repeatable `--primer-sequence NAME=SEQUENCE`.
 - Mixed chromatogram peaks are measured from `PLOC` and four `DATA9`-`DATA12` dye channels. `--secondary-peak-ratio` and `--max-mixed-peak-percent` control the retained-region gate.
 - Overlap consensus bases use posterior base probabilities from both Phred observations; qualities are not added as if they were independent certainty scores.
-- `--screen-ref` optionally classifies each primer read independently and rejects family/genus discordance before consensus use.
+- `--screen-ref` optionally classifies each primer read independently. Family/genus discordance triggers explicit manual review and reports the differing read-level assignments; it is not a QC failure by itself.
 - Final sequences must be at least 800 bp. Individual primer reads may be at least 300 bp so complementary reads can assemble into a valid final marker.
 - Ambiguous bases use a tiered rule: more than 3% requires manual review and more than 5% fails QC by default.
 - `--min-mean-quality`, expected-error limits, ambiguity, internal low-quality runs, mixed peaks, and overlap conflict density determine `PASS_HIGH_CONFIDENCE`, `PASS_WITH_WARNINGS`, or `FAIL_QC`.
@@ -346,11 +346,11 @@ Outputs:
 | `per_base_error.tsv` | Per-base quality/error probability table with left/right trim and retained-base status |
 | `visual_reports/read_error_profiles/read_error_profiles_page_*.png` | Paginated per-read quality/error profiles showing retained trim windows |
 | `visual_reports/trace_chromatograms/trace_chromatograms_page_*.png` | Paginated dye-channel chromatograms with retained windows and mixed-peak evidence |
-| `read_taxonomy_concordance.tsv` | Independent primer-read classifications and within-isolate agreement when `--screen-ref` is used |
-| `assembly_report.tsv` | Per-isolate assembly status, overlap identity, conflicts, unmerged reads, and contributing read IDs |
+| `read_taxonomy_concordance.tsv` | Independent primer-read classifications, common comparison rank, `read_id=taxon` assignments, and within-isolate agreement when `--screen-ref` is used |
+| `assembly_report.tsv` | Per-isolate assembly status, overlap identity, conflicts, unmerged reads, contributing read IDs, and any read-level taxonomy disagreement with the compared rank and assignments |
 | `assembly_read_placements.tsv` | Per-read consensus coordinates, aligned blocks, and whether the read contributed to the selected consensus |
-| `resequence_recommendations.tsv` | Per-isolate `ACCEPT`, `MANUAL_REVIEW`, or `RESEQUENCE` decision with reason codes and suggested action |
-| `marker_review_template.tsv` | Pre-filled rows for manual-review markers; complete `decision`, `reviewer`, and `notes`, then provide it as `--marker-review` |
+| `resequence_recommendations.tsv` | Per-isolate `ACCEPT`, `MANUAL_REVIEW`, or `RESEQUENCE` decision with reason codes, taxonomy-concordance evidence, and suggested action |
+| `marker_review_template.tsv` | Pre-filled rows for manual-review markers, including conflicting read-level taxonomy assignments; complete `decision`, `reviewer`, and `notes`, then provide it as `--marker-review` |
 | `paper_trail_qc_policy.tsv` | Versioned thresholds actually used for the run, for reproducibility |
 | `visual_reports/assembly_overviews/assembly_overview_page_*.png` | Paginated per-isolate overviews with reads placed on consensus coordinates, contribution status, and assembly diagnostics |
 | `visual_reports/visual_report_manifest.tsv` | Page index with report type, record range, dimensions, and continuation notes |
@@ -390,7 +390,7 @@ branchmanager performance-review \
 | `--partner-metadata / --sequencing-metadata` | Performance Review | — | Cumulative CSV/TSV ledger with sequence IDs, partner acronyms, optional `selected_for_genome_sequencing`, and required `already_sequenced` status |
 | `--shorten-ids / --no-shorten-ids` | | `--no-shorten-ids` | Preserve input headers exactly by default; use `--shorten-ids` only when compact generated IDs are desired |
 | `--min-len` | | `800` | Minimum sequence length to retain (bp) |
-| `--max-n` | | `5` | Maximum ambiguous (N) bases allowed |
+| `--max-n-percent` | | `5.0` | Maximum percentage of ambiguous (N) bases allowed; matches Paper Trail/Interview final-sequence QC |
 | `--marker-qc` | | auto | Paper Trail/Merge Meeting `assembly_report.tsv`; auto-discovered beside the FASTA |
 | `--marker-review` | | — | Reviewed accept/reject decisions for warning or unverified marker evidence |
 | `--accept-unverified-marker-qc` | | off | Explicit, audited acceptance of independently validated FASTA without Paper Trail provenance |
@@ -582,7 +582,7 @@ When `--collapse` is enabled, BranchManager groups sequences sharing ≥ `--coll
 | SequencingPriority | HIGH / MEDIUM / LOW — suggested priority for follow-up based on novelty + crowding |
 | Reference* | Parallel nearest hit, identity, score, crowding, and priority against the selected external reference FASTA, usually GTDB |
 | InTree | Yes = entered the phylogenetic tree; No = excluded (see ClusterRepresentative) |
-| ClusterRepresentative | `self` = this sequence IS in the tree; an ID = collapsed into that representative; `duplicate` = exact duplicate removed during dereplication |
+| ClusterRepresentative | `self` = this sequence is in the tree; an ID = represented by that leaf after optional collapse; `duplicate` = retained isolate omitted from the final tree as an exact marker duplicate |
 | ClusterSize | Total sequences in this cluster (1 = singleton) |
 | ClusteredMembers | Semicolon-separated IDs of OTHER sequences collapsed under this representative |
 | PlacementFlags | Warnings: LOW_CLASSIFICATION_IDENTITY, LOW_NEAREST_IDENTITY, NOVEL_BUT_ASSIGNED, etc. |
@@ -630,10 +630,10 @@ A species represented by one baseline genome therefore starts at `1/9`, leaving 
 | File | Description |
 |---|---|
 | `performance_review_dashboard.html` | Compact linked view of the current Hiring Panel recommendations |
-| `assessment/sequence_assessment.tsv` | **Full audit table.** Per-sequence novelty, taxonomy, crowding, priority, clustering, MWL matches, and placement flags |
-| `assessment/selection_summary.tsv` | **SAB decision table.** Recommendation, evidence quality, component novelty evidence, same-species genome coverage, candidate-set role, rationale, and local-tree link |
-| `assessment/sequencing_sets.tsv` | **Rolling nine-member diversity plan.** One row per candidate in a `BMEXT_*` baseline-pangenome extension or `BMSET_*` candidate-only group, with rank, marginal diversity, MWL context, panel completeness, and `PRIMARY`, `BACKUP`, `DIVERSITY_CANDIDATE`, `ALTERNATE`, `PANGENOME_BOUNDARY_REVIEW`, `BASELINE_REDUNDANT`, `SEQUENCED`, or `REVIEW_EVIDENCE` role |
-| `assessment/novelty_metrics.tsv` | Per-sequence novelty and crowding summary for candidate ranking |
+| `assessment/sequence_assessment.tsv` | **Current-dataset full audit table.** Per-sequence novelty, taxonomy, crowding, priority, clustering, MWL matches, and placement flags for only the dataset supplied to this Assistant/Performance Review run |
+| `assessment/selection_summary.tsv` | **Current-dataset SAB decision table.** Recommendation, evidence quality, component novelty evidence, same-species genome coverage, candidate-set role, rationale, and local-tree link |
+| `assessment/sequencing_sets.tsv` | **Current-dataset nine-member diversity plan.** Prior datasets and baselines inform coverage and diversity, but only current input candidates receive rows in this run |
+| `assessment/novelty_metrics.tsv` | Current-dataset novelty and crowding summary; searches use the cumulative baseline and project collection as comparison context |
 | `assessment/neighbourhoods/clade_*.png` | Labelled local phylogenetic neighbourhoods (default). Nearby assessed isolates are grouped into one figure rather than duplicated across figures |
 | `assessment/neighbourhoods/clade_*_pairwise_pident.tsv` | Complete long-form MSA percent-identity table for every pair of displayed tree leaves, including compared-column counts and the identity definition |
 | `assessment/neighbourhoods/neighbourhood_manifest.tsv` | Maps every assessed sequence to its image and pident table, including the P1 identity anchor, forced nearest-baseline hits, assessed isolates, baseline leaves, and already-sequenced genomes shown |
@@ -646,8 +646,8 @@ A species represented by one baseline genome therefore starts at `1/9`, leaving 
 | `taxonomy/<DB>.tsv` | Taxonomic assignment report for each reference database, e.g. `taxonomy/GTDB.tsv`, `taxonomy/GG2.tsv` |
 | `taxonomy/all_databases.tsv` | Multi-database assignment summary |
 | `taxonomy/tree_taxonomy.tsv` | ID → taxonomy → confidence table used for tree/iTOL metadata |
-| `tree/current_tree.nwk` | Updated tree incorporating new sequences |
-| `tree/current_alignment.fasta` | MSA used to build the tree |
+| `tree/current_tree.nwk` | Cumulative project-context tree incorporating baseline, prior partner datasets, and the current dataset |
+| `tree/current_alignment.fasta` | Cumulative MSA used to build the project-context tree |
 | `tree/tree_build_warnings.tsv` | Tree-quality warnings |
 | `itol/phylum.itol` | iTOL colour strip by phylum |
 | `itol/family.itol` | iTOL colour strip by family |
@@ -655,7 +655,7 @@ A species represented by one baseline genome therefore starts at `1/9`, leaving 
 | `itol/dataset_membership.itol` | iTOL strip showing which dataset each sequence belongs to |
 | `itol/novelty.itol` | iTOL strip showing nearest-hit novelty |
 | `ids/user_id_map.tsv` | Short ID → original FASTA header mapping for this run |
-| `intermediate/` | QC, dereplication, collapse, and classifier scratch outputs retained for debugging |
+| `intermediate/` | QC, optional collapse, and classifier scratch outputs retained for debugging; exact marker duplicates retain separate isolate IDs in assessment reports |
 | `logs/branchmanager.log` | Run log |
 
 BranchManager keeps iTOL `DATASET_COLORSTRIP` files, one per metadata type. Older `TREE_COLORS` branch/range files and symbol-strip variants are removed because they encoded the same metadata in additional visual styles.

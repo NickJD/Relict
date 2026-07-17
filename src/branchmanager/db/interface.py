@@ -1209,20 +1209,41 @@ class Database:
         return len(rows)
 
     def get_latest_assessment_rows(self):
-        """Return the most recently stored assessment for every sequence ID."""
+        """Return each sequence's latest assessment from its owning dataset.
+
+        Explicit project-wide imports remain eligible. Candidate-run snapshots
+        cannot supersede rows belonging to another partner dataset.
+        """
         latest = {}
         with self.connect() as conn:
+            candidate_datasets = {
+                str(row[0]) for row in conn.execute(
+                    "SELECT dataset FROM dataset_roles WHERE role = 'candidate'"
+                ).fetchall()
+            }
+            sequence_datasets = {
+                str(sequence_id): str(dataset or '')
+                for sequence_id, dataset in conn.execute(
+                    "SELECT id, dataset FROM sequences"
+                ).fetchall()
+            }
             rows = conn.execute(
                 "SELECT snapshot_id, sequence_id, dataset, source_path, assessment_json, created_at "
                 "FROM assessment_snapshots ORDER BY created_at, rowid"
             ).fetchall()
         for snapshot_id, sequence_id, dataset, source_path, payload, created_at in rows:
+            snapshot_dataset = str(dataset or '')
+            if (
+                snapshot_dataset in candidate_datasets
+                and sequence_datasets.get(str(sequence_id)) != snapshot_dataset
+            ):
+                continue
             try:
                 assessment = json.loads(payload)
             except (TypeError, ValueError):
                 continue
             assessment['_snapshot_id'] = snapshot_id
-            assessment['_snapshot_dataset'] = dataset or ''
+            assessment['_snapshot_dataset'] = snapshot_dataset
             assessment['_snapshot_source_path'] = source_path or ''
             assessment['_snapshot_created_at'] = created_at or ''
             latest[str(sequence_id)] = assessment

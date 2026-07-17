@@ -394,7 +394,7 @@ def build_sequence_assessment_rows(
     InTree              : 'Yes' / 'No' / 'Unknown'
     ClusterRepresentative : seq-id of the representative for this cluster,
                             or 'self' if this sequence IS in the tree as its own entry,
-                            or 'duplicate' if removed as an exact duplicate by dereplication,
+                            or 'duplicate' if omitted from the final tree as an exact duplicate,
                             or 'N/A' if no clustering was done.
     ClusterSize         : number of sequences in this cluster (1 if singleton).
     ClusteredMembers    : semi-colon-separated list of member IDs (empty for singletons).
@@ -409,9 +409,8 @@ def build_sequence_assessment_rows(
         if mapped:
             class_by_id[mapped] = row
 
-    # Earlier partner submissions are re-assessed on every Performance Review run. Their
-    # authoritative GTDB classification is loaded from the project DB because
-    # the current classification file contains only the newest submission.
+    # Reload stored evidence when a submitted ID was already present in the
+    # project database or was not represented in the current classifier output.
     if run_id_set:
         try:
             placeholders = ','.join('?' for _ in run_id_set)
@@ -641,8 +640,8 @@ def build_sequence_assessment_rows(
         if reference_hit not in (None, '', 'NA', 'None') and _best is not None and str(reference_hit) == str(_best):
             reference_hit_taxonomy = _tax if _tax is not None else 'NA'
 
-        # If a sequence is not in the tree and was not collapsed, it was
-        # removed as an exact duplicate during the dereplication step.
+        # Some tree builders can omit an exact duplicate even though every
+        # isolate remains in the assessment and project database.
         if in_tree == 'No' and cluster_rep == 'self':
             cluster_rep = 'duplicate'
 

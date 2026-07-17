@@ -507,6 +507,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.baseline_redundancy_min_query_coverage, 95.0)
         self.assertEqual(args.baseline_extension_min_identity, 98.65)
         self.assertEqual(args.baseline_extension_min_query_coverage, 95.0)
+        self.assertEqual(args.max_n_percent, 5.0)
 
         with self.assertRaises(SystemExit):
             parser.parse_args([
@@ -648,7 +649,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 taxa=None,
                 dataset='run1',
                 min_len=1,
-                max_n=10,
+                max_n_percent=100.0,
                 threads=1,
                 previous_review=None,
                 kingdom=None,
@@ -660,7 +661,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
             )
 
             with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
                  mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification) as classify_mock, \
                  mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty) as novelty_mock, \
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
@@ -682,22 +682,33 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 rows = cur.fetchall()
             self.assertEqual(rows, [('d__Bacteria; p__Firmicutes',)])
 
-    def test_performance_review_can_keep_canonical_ids_when_shortening_disabled(self):
+    def test_performance_review_silos_current_dataset_and_preserves_ids(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             input_fasta = tmp / 'input.fasta'
-            input_fasta.write_text('>origA extra words\nACGT\n')
+            input_fasta.write_text(
+                '>origA extra words\nACGT\n'
+                '>origB second isolate\nACGT\n'
+            )
             ref_fasta = tmp / 'ref.fasta'
             ref_fasta.write_text('>REF1 d__Bacteria;p__Firmicutes\nACGT\n')
             outdir = tmp / 'out'
             db_path = tmp / 'test.sqlite'
+            db = Database(str(db_path))
+            db.initialise()
+            db.insert_sequences([('prior_partner_isolate', 'TGCA')], dataset='Prior_01')
+            db.upsert_dataset_role('Prior_01', 'candidate')
+            metrics_query_ids = []
 
             def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
                 headers = [h for h, _ in read_fasta(input_path)]
                 class_path = Path(out_path) / 'taxonomy.tsv'
                 class_path.write_text(
-                    'ID\tBestHit\tIdentity\tTaxon\tConfidence\n'
-                    f'{headers[0]}\tREF1\t99.0\td__Bacteria; p__Firmicutes\t0.95\n'
+                    'ID\tBestHit\tIdentity\tTaxon\tConfidence\n' +
+                    ''.join(
+                        f'{header}\tREF1\t99.0\td__Bacteria; p__Firmicutes\t0.95\n'
+                        for header in headers
+                    )
                 )
                 return str(class_path)
 
@@ -705,17 +716,24 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 headers = [h for h, _ in read_fasta(input_path)]
                 novelty_path = Path(out_path) / 'novelty.tsv'
                 novelty_path.write_text(
-                    'ID\tNearestIdentity\tNearestHit\tNovel\n'
-                    f'{headers[0]}\t99.0\tREF1\tFalse\n'
+                    'ID\tNearestIdentity\tNearestHit\tNovel\n' +
+                    ''.join(
+                        f'{header}\t99.0\tREF1\tFalse\n'
+                        for header in headers
+                    )
                 )
                 return str(novelty_path)
 
             def fake_build_reference_novelty_metrics(input_path, _ref_path, out_path, threads=None, **kwargs):
                 headers = [h for h, _ in read_fasta(input_path)]
+                metrics_query_ids.extend(headers)
                 metrics_path = Path(out_path) / 'novelty_metrics.tsv'
                 metrics_path.write_text(
-                    'ID\tNearestIdentity\tNearestHit\tNovel\tMatchesGE99\tMatchesGE97\tMatchesGE95\tNoveltyScore\tCrowding\tSequencingPriority\n'
-                    f'{headers[0]}\t99.00\tREF1\tFalse\t1\t1\t1\t1.00\tdense\tLOW\n'
+                    'ID\tNearestIdentity\tNearestHit\tNovel\tMatchesGE99\tMatchesGE97\tMatchesGE95\tNoveltyScore\tCrowding\tSequencingPriority\n' +
+                    ''.join(
+                        f'{header}\t99.00\tREF1\tFalse\t1\t1\t1\t1.00\tdense\tLOW\n'
+                        for header in headers
+                    )
                 )
                 return str(metrics_path)
 
@@ -727,7 +745,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 taxa=None,
                 dataset='run1',
                 min_len=1,
-                max_n=10,
+                max_n_percent=100.0,
                 threads=1,
                 previous_review=None,
                 kingdom=None,
@@ -740,7 +758,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
             )
 
             with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
                  mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification), \
                  mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
@@ -751,14 +768,19 @@ class DatabaseBehaviourTests(unittest.TestCase):
                  mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
                 cmd_performance_review(args)
 
-            headers = [h for h, _ in read_fasta(outdir / 'intermediate' / 'derep_short.fasta')]
-            self.assertEqual(headers, ['origA extra words'])
+            headers = [h for h, _ in read_fasta(outdir / 'intermediate' / 'current_dataset_sequences.fasta')]
+            self.assertEqual(headers, ['origA extra words', 'origB second isolate'])
             mapping = (outdir / 'ids' / 'user_id_map.tsv').read_text()
             self.assertIn('origA extra words\torigA extra words', mapping)
             self.assertIn('origA extra words\torigA', mapping)
             self.assertTrue((outdir / 'assessment' / 'sequence_assessment.tsv').exists())
             self.assertTrue((outdir / 'baseline' / 'baseline_hits.tsv').exists())
             self.assertTrue((outdir / 'taxonomy' / 'ref.tsv').exists())
+            self.assertEqual(metrics_query_ids, ['origA extra words', 'origB second isolate'])
+            with open(outdir / 'assessment' / 'sequence_assessment.tsv') as handle:
+                assessment_ids = [row['ID'] for row in csv.DictReader(handle, delimiter='\t')]
+            self.assertEqual(assessment_ids, ['origA extra words', 'origB second isolate'])
+            self.assertNotIn('prior_partner_isolate', assessment_ids)
 
     def test_performance_review_defaults_to_bacterial_sequence_domain_filter(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -808,7 +830,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 taxa=None,
                 dataset='run1',
                 min_len=1,
-                max_n=10,
+                max_n_percent=100.0,
                 threads=1,
                 previous_review=None,
                 kingdom=None,
@@ -822,7 +844,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
             )
 
             with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
                  mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification), \
                  mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
@@ -888,7 +909,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 taxa=None,
                 dataset='run1',
                 min_len=1,
-                max_n=10,
+                max_n_percent=100.0,
                 threads=1,
                 previous_review=str(previous_review),
                 kingdom=None,
@@ -901,7 +922,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
             )
 
             with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
-                 mock.patch('branchmanager.cli.derep.run_derep', side_effect=lambda *a, **k: str(input_fasta)), \
                  mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification), \
                  mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
                  mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
@@ -1425,7 +1445,7 @@ class OutputHelperTests(unittest.TestCase):
 
             self.assertEqual(len(out['read_error_pngs']), 4)
             self.assertEqual(len(out['chromatogram_pngs']), 6)
-            self.assertEqual(len(out['assembly_pngs']), 4)
+            self.assertEqual(len(out['assembly_pngs']), 6)
             self.assertFalse(stale_page.exists())
             self.assertFalse(obsolete_single_image.exists())
             from PIL import Image
@@ -1440,9 +1460,112 @@ class OutputHelperTests(unittest.TestCase):
                     self.assertLessEqual(image.height, 600)
             with open(out['visual_manifest_tsv']) as handle:
                 rows = list(csv.DictReader(handle, delimiter='\t'))
-            self.assertEqual(len(rows), 14)
+            self.assertEqual(len(rows), 16)
             self.assertTrue(all(int(row['HeightPixels']) <= 600 for row in rows))
             self.assertEqual({row['MaxHeightPixels'] for row in rows}, {'600'})
+
+    def test_primer_read_taxonomy_conflict_requires_manual_review_and_reports_assignments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            forward = tmp / 'well_A01.ab1'
+            reverse = tmp / 'well_A02.ab1'
+            forward_seq = 'NNNNAAAACCCCGGGGTTTTAAAANNNN'
+            reverse_seq = 'NNNN' + reverse_complement('CCCCGGGGTTTTAAAACCCC') + 'NNNN'
+            _write_minimal_ab1(forward, forward_seq, [5] * 4 + [35] * 20 + [5] * 4)
+            _write_minimal_ab1(reverse, reverse_seq, [5] * 4 + [35] * 20 + [5] * 4)
+            sample_map = tmp / 'sample_reads.tsv'
+            sample_map.write_text(
+                'isolate_id\t27F\t907R\n'
+                'IsoConflict\twell_A01.ab1\twell_A02.ab1\n'
+            )
+
+            def fake_classification(input_fasta, outdir, **_kwargs):
+                query_ids = [record_id for record_id, _sequence in read_fasta(input_fasta)]
+                path = Path(outdir) / 'taxonomy.tsv'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                lineages = (
+                    'd__Bacteria;f__Prevotellaceae;g__Prevotella;s__Prevotella ruminicola',
+                    'd__Bacteria;f__Bacillaceae;g__Bacillus;s__Bacillus subtilis',
+                )
+                path.write_text(
+                    'ID\tTaxon\n' + ''.join(
+                        f'{read_id}\t{lineages[index]}\n'
+                        for index, read_id in enumerate(query_ids)
+                    )
+                )
+                return str(path)
+
+            with mock.patch(
+                'branchmanager.pipeline.classify.run_classification',
+                side_effect=fake_classification,
+            ):
+                out = paper_trail_pipeline.run_paper_trail(
+                    [], tmp / 'out', sample_map=str(sample_map),
+                    min_quality=20, min_length=8, min_overlap=8,
+                    min_overlap_identity=0.90, screen_ref='gtdb.fna.gz',
+                )
+
+            self.assertIn('IsoConflict', dict(read_fasta(out['assembled_fasta'])))
+            self.assertEqual(dict(read_fasta(out['failed_final_fasta'])), {})
+            with open(out['assembly_tsv']) as handle:
+                assembly = next(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(assembly['QCClass'], 'PASS_WITH_WARNINGS')
+            self.assertEqual(assembly['Recommendation'], 'MANUAL_REVIEW')
+            self.assertEqual(assembly['TaxonomyConcordance'], 'CONFLICT')
+            self.assertEqual(assembly['TaxonomyComparedRank'], 'genus')
+            self.assertIn('g__Prevotella', assembly['ReadTaxonomyAssignments'])
+            self.assertIn('g__Bacillus', assembly['ReadTaxonomyAssignments'])
+            self.assertIn('primer_read_taxonomic_conflict_at_genus', assembly['Reasons'])
+            self.assertIn('g__Prevotella', assembly['SuggestedAction'])
+            with open(out['taxonomy_screen_tsv']) as handle:
+                concordance = next(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(concordance['ConcordanceStatus'], 'CONFLICT')
+            self.assertIn('different genus assignments', concordance['Reason'])
+            with open(out['marker_review_template_tsv']) as handle:
+                review = next(csv.DictReader(handle, delimiter='\t'))
+            self.assertEqual(review['taxonomy_concordance'], 'CONFLICT')
+            self.assertIn('g__Bacillus', review['read_taxonomy_assignments'])
+
+    def test_primer_read_taxonomy_screen_uses_shared_family_when_genus_resolution_differs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reads = [
+                paper_trail_pipeline.SangerRead(
+                    read_id='R1', sequence_id='Iso1', primer='27F', direction='forward',
+                    source_file='R1.ab1', raw_sequence='ACGT', raw_qualities=[35] * 4,
+                ),
+                paper_trail_pipeline.SangerRead(
+                    read_id='R2', sequence_id='Iso1', primer='907R', direction='reverse',
+                    source_file='R2.ab1', raw_sequence='ACGT', raw_qualities=[35] * 4,
+                ),
+            ]
+            trimmed = tmp / 'trimmed.fasta'
+            trimmed.write_text('>R1\nACGT\n>R2\nACGT\n')
+
+            def fake_classification(_input_fasta, outdir, **_kwargs):
+                path = Path(outdir) / 'taxonomy.tsv'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    'ID\tTaxon\n'
+                    'R1\td__Bacteria;f__Prevotellaceae;g__Prevotella\n'
+                    'R2\td__Bacteria;f__Prevotellaceae\n'
+                )
+                return str(path)
+
+            with mock.patch(
+                'branchmanager.pipeline.classify.run_classification',
+                side_effect=fake_classification,
+            ):
+                results, report = paper_trail_pipeline._screen_primer_read_taxonomy(
+                    reads, trimmed, tmp / 'out', ref_fasta='gtdb.fna.gz',
+                    taxa_tsv=None, threads=1,
+                )
+
+            self.assertFalse(results['Iso1']['conflict'])
+            self.assertEqual(results['Iso1']['status'], 'CONCORDANT')
+            self.assertEqual(results['Iso1']['compared_rank'], 'family')
+            self.assertIn('R1=f__Prevotellaceae', results['Iso1']['assignments'])
+            self.assertIn('CONCORDANT', Path(report).read_text())
 
     def test_paper_trail_sample_map_best_read_selects_highest_quality_read(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1972,19 +2095,26 @@ class OutputHelperTests(unittest.TestCase):
             fasta.write_text(
                 '>keep\nACGTACGT\n'
                 '>short\nACG\n'
-                '>ambiguous\nACGTNNN\n'
+                f'>four_percent\n{"A" * 96}{"N" * 4}\n'
+                f'>six_percent\n{"A" * 94}{"N" * 6}\n'
                 '>both\nNN\n'
             )
 
-            qc_pipeline.run_qc(str(fasta), str(tmp), min_len=4, max_n=1)
+            qc_pipeline.run_qc(str(fasta), str(tmp), min_len=8, max_n_percent=5.0)
 
             stats = (tmp / 'qc.stats').read_text()
             rejections = (tmp / 'qc_rejections.tsv').read_text()
             self.assertIn('rejected_total\t3', stats)
+            self.assertIn('kept\t2', stats)
+            self.assertIn('max_n_percent\t5', stats)
             self.assertIn('rejection_details\t', stats)
-            self.assertIn('short\t3\t0\ttoo_short\t4\t1', rejections)
-            self.assertIn('ambiguous\t7\t3\ttoo_many_n\t4\t1', rejections)
-            self.assertIn('both\t2\t2\ttoo_short;too_many_n\t4\t1', rejections)
+            self.assertIn('short\t3\t0\t0.000000\ttoo_short\t8\t5', rejections)
+            self.assertIn('six_percent\t100\t6\t6.000000\ttoo_many_n\t8\t5', rejections)
+            self.assertIn('both\t2\t2\t100.000000\ttoo_short;too_many_n\t8\t5', rejections)
+            self.assertEqual(
+                [record_id for record_id, _sequence in read_fasta(tmp / 'qc.fasta')],
+                ['keep', 'four_percent'],
+            )
 
     def test_write_output_explanations_writes_detailed_output_guide(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1999,10 +2129,11 @@ class OutputHelperTests(unittest.TestCase):
                 'rejected_too_short\t2\n'
                 'rejected_too_many_n\t2\n'
                 'min_len\t4\n'
-                'max_n\t1\n'
+                'max_n_percent\t5\n'
             )
             (assessment / 'qc_rejections.tsv').write_text(
-                'ID\tLength\tNCount\tReasons\tMinLength\tMaxN\nshort\t3\t0\ttoo_short\t4\t1\n'
+                'ID\tLength\tNCount\tNPercent\tReasons\tMinLength\tMaxNPercent\n'
+                'short\t3\t0\t0.000000\ttoo_short\t4\t5\n'
             )
 
             _write_output_explanations(str(tmp))
@@ -2646,6 +2777,32 @@ class OutputHelperTests(unittest.TestCase):
                     ('quarterly_review_1',),
                 ).fetchone()
             self.assertEqual(stored, ('PRIMARY', 1))
+
+    def test_latest_assessments_ignore_rows_leaked_from_another_candidate_dataset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('U1', 'ACGT')], dataset='UoG_01')
+            db.insert_sequences([('Q1', 'TGCA')], dataset='QUB_01')
+            db.upsert_dataset_role('UoG_01', 'candidate')
+            db.upsert_dataset_role('QUB_01', 'candidate')
+            db.save_assessment_snapshot(
+                'UoG_01:first', [{'id': 'U1', 'nearest_identity': '97.0'}],
+                dataset='UoG_01',
+            )
+            db.save_assessment_snapshot(
+                'QUB_01:contaminated', [
+                    {'id': 'U1', 'nearest_identity': '99.9'},
+                    {'id': 'Q1', 'nearest_identity': '96.0'},
+                ],
+                dataset='QUB_01',
+            )
+
+            latest = db.get_latest_assessment_rows()
+
+            self.assertEqual(latest['U1']['nearest_identity'], '97.0')
+            self.assertEqual(latest['U1']['_snapshot_id'], 'UoG_01:first')
+            self.assertEqual(latest['Q1']['nearest_identity'], '96.0')
 
     def test_quarterly_review_fills_gaps_then_balances_post_target_diversity(self):
         def row(sequence_id, species, available, nearest_genome, *, sequenced=False):

@@ -41,7 +41,7 @@ class PaperTrailQCPolicy:
     min_overlap_identity: float = 0.95
 
 
-PAPER_TRAIL_QC_POLICY_VERSION = '2.0'
+PAPER_TRAIL_QC_POLICY_VERSION = '2.1'
 DEFAULT_QC_POLICY = PaperTrailQCPolicy()
 
 
@@ -1362,7 +1362,11 @@ def _classify_output_qc(
     if unmerged and processing_mode == 'assemble':
         warn_reasons.append('unmerged_primer_reads_' + str(len([value for value in unmerged.split(';') if value])))
     if stats.get('taxonomy_conflict'):
-        fail_reasons.append('primer_read_taxonomic_conflict')
+        rank = str(stats.get('taxonomy_compared_rank') or 'resolved_rank')
+        assignments = str(stats.get('taxonomy_assignments') or 'assignments unavailable')
+        warn_reasons.append(
+            f'primer_read_taxonomic_conflict_at_{rank}[{assignments}]'
+        )
     if mode_warning:
         warn_reasons.append(mode_warning)
     failed_reads = [read.read_id for read in group if read.qc_class == 'FAIL_QC']
@@ -1385,6 +1389,12 @@ def _classify_output_qc(
     recommendation = _recommendation_from_qc_class(qc_class)
     if recommendation == 'RESEQUENCE':
         suggested_action = 'Repeat Sanger sequencing for this isolate; inspect chromatograms and primer setup before reuse.'
+    elif recommendation == 'MANUAL_REVIEW' and stats.get('taxonomy_conflict'):
+        suggested_action = (
+            'Review the independent primer-read taxonomy assignments before accepting the consensus: '
+            f'{stats.get("taxonomy_assignments") or "assignments unavailable"}. '
+            'Check sample labels, chromatograms, mixed-template evidence, and assembly support.'
+        )
     elif recommendation == 'MANUAL_REVIEW':
         suggested_action = 'Inspect chromatograms/overlap manually; accept only if trace evidence supports the consensus.'
     else:
@@ -1828,7 +1838,7 @@ def _write_chromatogram_png(
 
 
 def _assembly_group_height(reads: list[SangerRead]) -> int:
-    return 118 + max(1, len(reads)) * 30
+    return 138 + max(1, len(reads)) * 30
 
 
 def _write_assembly_overview_png(
@@ -1914,16 +1924,29 @@ def _write_assembly_overview_png(
         draw.rounded_rectangle((18, y, width - 18, y + group_height - 10), radius=6, fill='#f9fafb', outline='#d1d5db')
         draw.text((30, y + 12), _fit_report_text(draw, sequence_id, label_bold_font, width - 64), fill='#111827', font=label_bold_font)
         draw.text((30, y + 36), _fit_report_text(draw, details, label_font, width - 64), fill=status_colour, font=label_font)
-        draw.text((30, y + 65), f'consensus | {output_length} bp', fill='#4b5563', font=label_font)
-        draw.rounded_rectangle((left, y + 65, left + graph_width, y + 77), radius=2, fill='#e5e7eb')
+        taxonomy_status = str(row.get('TaxonomyConcordance', 'NOT_SCREENED'))
+        taxonomy_rank = str(row.get('TaxonomyComparedRank', 'NA'))
+        taxonomy_assignments = str(row.get('ReadTaxonomyAssignments', 'NA'))
+        taxonomy_line = (
+            f'taxonomy {taxonomy_status.lower()} ({taxonomy_rank}): {taxonomy_assignments}'
+            if taxonomy_status != 'NOT_SCREENED' else 'taxonomy screen: not requested'
+        )
+        draw.text(
+            (30, y + 57),
+            _fit_report_text(draw, taxonomy_line, small_font, width - 64),
+            fill='#b45309' if taxonomy_status == 'CONFLICT' else '#6b7280',
+            font=small_font,
+        )
+        draw.text((30, y + 85), f'consensus | {output_length} bp', fill='#4b5563', font=label_font)
+        draw.rounded_rectangle((left, y + 85, left + graph_width, y + 97), radius=2, fill='#e5e7eb')
         consensus_width = graph_width if output_length else 1
-        draw.rounded_rectangle((left, y + 65, left + consensus_width, y + 77), radius=2, fill='#374151')
+        draw.rounded_rectangle((left, y + 85, left + consensus_width, y + 97), radius=2, fill='#374151')
         if output_length:
-            draw.text((left, y + 80), '1', fill='#6b7280', font=small_font)
+            draw.text((left, y + 100), '1', fill='#6b7280', font=small_font)
             end_label = f'{output_length} bp'
-            draw.text((left + graph_width - draw.textlength(end_label, font=small_font), y + 80), end_label, fill='#6b7280', font=small_font)
+            draw.text((left + graph_width - draw.textlength(end_label, font=small_font), y + 100), end_label, fill='#6b7280', font=small_font)
         placements = row.get('_ReadPlacements') or {}
-        read_y = y + 104
+        read_y = y + 124
         for read in reads:
             placement = placements.get(read.read_id, {})
             read_len = int(placement.get('read_length') or len(_read_sequence_for_placement(read)))
@@ -2168,7 +2191,7 @@ def _screen_primer_read_taxonomy(
     ref_fasta: Optional[str | Path],
     taxa_tsv: Optional[str | Path],
     threads: int,
-) -> tuple[dict[str, bool], Optional[str]]:
+) -> tuple[dict[str, dict[str, object]], Optional[str]]:
     """Flag isolate groups whose independently classified primer reads disagree."""
     if not ref_fasta:
         return {}, None
@@ -2189,33 +2212,74 @@ def _screen_primer_read_taxonomy(
         row = by_read.get(read.read_id, {})
         read.taxonomy_screen = str(row.get('Taxon') or 'NA')
 
-    conflicts = {}
+    results: dict[str, dict[str, object]] = {}
     groups: dict[str, list[SangerRead]] = {}
     for read in reads:
         groups.setdefault(read.sequence_id, []).append(read)
     report_path = outdir / 'read_taxonomy_concordance.tsv'
     with open(report_path, 'w') as handle:
-        handle.write('SequenceID\tReadIDs\tTaxonomies\tComparedRank\tConcordant\tReason\n')
+        handle.write(
+            'SequenceID\tReadIDs\tTaxonomies\tComparedRank\tComparedAssignments\t'
+            'ConcordanceStatus\tConcordant\tReason\n'
+        )
         for sequence_id, group in sorted(groups.items()):
             resolved = []
             for read in group:
                 parsed = parse_taxon_string(read.taxonomy_screen)
-                rank = str(parsed.get('g') or parsed.get('f') or '').strip()
-                if rank:
-                    resolved.append((read.read_id, rank, read.taxonomy_screen))
-            distinct = {rank for _read_id, rank, _taxonomy in resolved}
+                genus = str(parsed.get('g') or '').strip()
+                family = str(parsed.get('f') or '').strip()
+                if genus or family:
+                    resolved.append({
+                        'read_id': read.read_id,
+                        'genus': genus,
+                        'family': family,
+                        'taxonomy': read.taxonomy_screen,
+                    })
+            compared_rank = 'NA'
+            compared = []
+            if len(resolved) >= 2 and all(row['genus'] for row in resolved):
+                compared_rank = 'genus'
+                compared = [(str(row['read_id']), str(row['genus'])) for row in resolved]
+            elif len(resolved) >= 2 and all(row['family'] for row in resolved):
+                compared_rank = 'family'
+                compared = [(str(row['read_id']), str(row['family'])) for row in resolved]
+            rank_prefix = {'genus': 'g', 'family': 'f'}.get(compared_rank, '')
+            assignments = ' | '.join(
+                f'{read_id}={rank_prefix}__{taxon}' if rank_prefix else f'{read_id}={taxon}'
+                for read_id, taxon in compared
+            ) or 'insufficient common-rank assignments'
+            distinct = {taxon for _read_id, taxon in compared}
             conflict = len(distinct) > 1
-            conflicts[sequence_id] = conflict
-            reason = 'different genus/family assignments across primer reads' if conflict else (
-                'concordant' if resolved else 'insufficient classified primer reads'
-            )
+            if conflict:
+                status = 'CONFLICT'
+                reason = f'different {compared_rank} assignments: {assignments}'
+            elif compared:
+                status = 'CONCORDANT'
+                taxon = next(iter(distinct))
+                display_taxon = f'{rank_prefix}__{taxon}' if rank_prefix else taxon
+                reason = f'concordant {compared_rank} assignment: {display_taxon}'
+            else:
+                status = 'INSUFFICIENT_CLASSIFICATION'
+                reason = 'fewer than two primer reads had taxonomy resolved at a common genus/family rank'
+            concordant = 'no' if conflict else ('yes' if compared else 'NA')
+            results[sequence_id] = {
+                'conflict': conflict,
+                'status': status,
+                'compared_rank': compared_rank,
+                'assignments': assignments,
+                'full_taxonomies': ' | '.join(
+                    f'{read.read_id}={read.taxonomy_screen or "NA"}' for read in group
+                ),
+                'reason': reason,
+            }
             handle.write(
                 f'{_clean_field(sequence_id)}\t'
                 f'{_clean_field(";".join(read.read_id for read in group))}\t'
-                f'{_clean_field(" | ".join(read.taxonomy_screen for read in group))}\t'
-                f'genus_then_family\t{"no" if conflict else "yes"}\t{reason}\n'
+                f'{_clean_field(results[sequence_id]["full_taxonomies"])}\t'
+                f'{compared_rank}\t{_clean_field(assignments)}\t{status}\t'
+                f'{concordant}\t{_clean_field(reason)}\n'
             )
-    return conflicts, str(report_path)
+    return results, str(report_path)
 
 
 def _validate_qc_policy(
@@ -2509,7 +2573,7 @@ def run_paper_trail(
 
     write_fasta(raw_records, str(raw_fasta))
     write_fasta(trimmed_records, str(trimmed_fasta))
-    taxonomy_conflicts, taxonomy_screen_path = _screen_primer_read_taxonomy(
+    taxonomy_screen_results, taxonomy_screen_path = _screen_primer_read_taxonomy(
         reads,
         trimmed_fasta,
         out,
@@ -2605,6 +2669,7 @@ def run_paper_trail(
         handle.write(
             'SequenceID\tStatus\tReadCount\tUsedReads\tOutputLength\tMeanQuality\t'
             'OutputExpectedErrors\tOutputNPercent\tConflictDensity\tQCClass\tRecommendation\t'
+            'TaxonomyConcordance\tTaxonomyComparedRank\tReadTaxonomyAssignments\t'
             'OverlapIdentity\tOverlapLength\tConflicts\tAmbiguousConflicts\tUnmergedReads\t'
             'ReadIDs\tKeptReadIDs\tUsedReadIDs\tMergeMethod\tProcessingMode\tSelectedReadID\t'
             'PassLengthQC\tReasons\tSuggestedAction\tFailedReadIDs\tModeWarning\n'
@@ -2620,7 +2685,11 @@ def run_paper_trail(
                 )
             else:
                 consensus, stats = select_best_read_group(group)
-            stats['taxonomy_conflict'] = bool(taxonomy_conflicts.get(sequence_id, False))
+            taxonomy_result = taxonomy_screen_results.get(sequence_id, {})
+            stats['taxonomy_conflict'] = bool(taxonomy_result.get('conflict', False))
+            stats['taxonomy_screen_status'] = taxonomy_result.get('status', 'NOT_SCREENED')
+            stats['taxonomy_compared_rank'] = taxonomy_result.get('compared_rank', 'NA')
+            stats['taxonomy_assignments'] = taxonomy_result.get('assignments', 'NA')
             consensus_qualities = list(stats.get('qualities') or [])
             final_qc = _classify_output_qc(
                 consensus,
@@ -2666,6 +2735,9 @@ def run_paper_trail(
                 'ConflictDensity': final_qc.get('conflict_density', 0.0),
                 'QCClass': final_qc.get('qc_class', 'FAIL_QC'),
                 'Recommendation': final_qc.get('recommendation', 'RESEQUENCE'),
+                'TaxonomyConcordance': stats.get('taxonomy_screen_status', 'NOT_SCREENED'),
+                'TaxonomyComparedRank': stats.get('taxonomy_compared_rank', 'NA'),
+                'ReadTaxonomyAssignments': stats.get('taxonomy_assignments', 'NA'),
                 'OverlapIdentity': overlap_identity,
                 'OverlapLength': stats['overlap_length'],
                 'Conflicts': stats['conflicts'],
@@ -2731,7 +2803,9 @@ def run_paper_trail(
                 f'{_clean_field(sequence_id)}\t{stats["status"]}\t{stats["read_count"]}\t{stats["used_reads"]}\t'
                 f'{len(consensus)}\t{row["MeanQuality"]}\t{row["OutputExpectedErrors"]}\t'
                 f'{row["OutputNPercent"]}\t{row["ConflictDensity"]}\t{row["QCClass"]}\t'
-                f'{row["Recommendation"]}\t{overlap_identity}\t'
+                f'{row["Recommendation"]}\t{_clean_field(row["TaxonomyConcordance"])}\t'
+                f'{_clean_field(row["TaxonomyComparedRank"])}\t'
+                f'{_clean_field(row["ReadTaxonomyAssignments"])}\t{overlap_identity}\t'
                 f'{stats["overlap_length"]}\t{stats["conflicts"]}\t{stats.get("ambiguous_conflicts", "NA")}\t'
                 f'{_clean_field(stats["unmerged_reads"])}\t{read_ids}\t{kept_read_ids}\t{_clean_field(row["UsedReadIDs"])}\t'
                 f'{_clean_field(stats.get("method", "NA"))}\t{processing_mode}\t'
@@ -2835,7 +2909,7 @@ def run_paper_trail(
             f'- expected_errors_gt_{float(max_read_expected_errors):g}: summed Phred error probabilities exceeded the read-level limit.',
             f'- internal_low_quality_run_gt_{int(max_internal_low_quality_run)}: a retained ambiguous/low-quality run exceeded {int(max_internal_low_quality_run)} bases.',
             '- failed_no_reads: no physical read passed read-level QC for final-marker construction.',
-            '- primer_read_taxonomic_conflict: separate primer reads classified to different genus/family contexts.',
+            '- primer_read_taxonomic_conflict_at_<rank>: separate primer reads received different genus/family assignments. This triggers manual review, not failure by itself; the assignments are reported in assembly_report.tsv.',
             '',
         ])
     )
@@ -2850,6 +2924,7 @@ def run_paper_trail(
     with open(recommendations_tsv, 'w') as handle:
         handle.write(
             'SequenceID\tRecommendation\tQCClass\tReasons\tSuggestedAction\t'
+            'TaxonomyConcordance\tTaxonomyComparedRank\tReadTaxonomyAssignments\t'
             'Status\tProcessingMode\tOutputLength\tMeanQuality\tOutputExpectedErrors\t'
             'OutputNPercent\tConflictDensity\tReadCount\tUsedReads\tReadIDs\t'
             'KeptReadIDs\tFailedReadIDs\tSelectedReadID\tMergeMethod\n'
@@ -2858,7 +2933,11 @@ def run_paper_trail(
             handle.write(
                 f'{_clean_field(row.get("SequenceID", ""))}\t{_clean_field(row.get("Recommendation", ""))}\t'
                 f'{_clean_field(row.get("QCClass", ""))}\t{_clean_field(row.get("Reasons", ""))}\t'
-                f'{_clean_field(row.get("SuggestedAction", ""))}\t{_clean_field(row.get("Status", ""))}\t'
+                f'{_clean_field(row.get("SuggestedAction", ""))}\t'
+                f'{_clean_field(row.get("TaxonomyConcordance", ""))}\t'
+                f'{_clean_field(row.get("TaxonomyComparedRank", ""))}\t'
+                f'{_clean_field(row.get("ReadTaxonomyAssignments", ""))}\t'
+                f'{_clean_field(row.get("Status", ""))}\t'
                 f'{_clean_field(row.get("ProcessingMode", ""))}\t{row.get("OutputLength", 0)}\t'
                 f'{row.get("MeanQuality", 0.0)}\t{row.get("OutputExpectedErrors", 0.0)}\t'
                 f'{row.get("OutputNPercent", 0.0)}\t{row.get("ConflictDensity", 0.0)}\t'
@@ -2869,14 +2948,18 @@ def run_paper_trail(
             )
     with open(marker_review_template_tsv, 'w') as handle:
         handle.write(
-            'sequence_id\tdecision\treviewer\tnotes\tqc_reasons\toutput_length\tn_percent\n'
+            'sequence_id\tdecision\treviewer\tnotes\tqc_reasons\ttaxonomy_concordance\t'
+            'read_taxonomy_assignments\toutput_length\tn_percent\n'
         )
         for row in recommendation_rows:
             if row.get('Recommendation') != 'MANUAL_REVIEW':
                 continue
             handle.write(
                 f'{_clean_field(row.get("SequenceID", ""))}\t\t\t\t'
-                f'{_clean_field(row.get("Reasons", ""))}\t{row.get("OutputLength", 0)}\t'
+                f'{_clean_field(row.get("Reasons", ""))}\t'
+                f'{_clean_field(row.get("TaxonomyConcordance", ""))}\t'
+                f'{_clean_field(row.get("ReadTaxonomyAssignments", ""))}\t'
+                f'{row.get("OutputLength", 0)}\t'
                 f'{row.get("OutputNPercent", 0.0)}\n'
             )
     qc_policy_tsv.write_text(
@@ -2905,6 +2988,7 @@ def run_paper_trail(
             f'trim_primers\t{bool(trim_primers)}\tRemove a confidently observed known primer sequence at the read start',
             f'quality_difference\t{int(quality_difference)}\tMinimum Phred-scaled posterior odds required to resolve a conflicting overlap base',
             f'allow_missing_quality\t{bool(allow_missing_quality)}\tWhether AB1 reads missing PCON quality scores may pass QC',
+            'primer_read_taxonomic_conflict_action\tmanual_review\tDiscordant independent primer-read assignments require review but do not fail an otherwise passing consensus',
             f'default_processing_mode\t{default_mode}\tFallback handling when a sample-map row does not specify assemble or best_read',
             f'max_report_image_height\t{max_report_image_height}\tMaximum PNG page height before visual reports are paginated',
             '',
