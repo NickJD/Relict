@@ -86,15 +86,28 @@ def normalise_assessment_row(row: dict, *, source_path: str = '') -> dict:
         'classification_query_coverage': _value(
             row, 'classification_query_coverage', 'GTDBQueryCoverage', 'QueryCoverage',
         ),
-        'nearest_hit': _value(row, 'nearest_hit', 'BaselineNearestHit'),
+        'baseline_evidence_class': _value(row, 'baseline_evidence_class', 'BaselineEvidenceClass'),
+        'hungate_nearest_hit': _value(row, 'hungate_nearest_hit', 'HungateNearestHit'),
+        'hungate_nearest_hit_taxonomy': _value(row, 'hungate_nearest_hit_taxonomy', 'HungateNearestHitTaxonomy'),
+        'hungate_nearest_identity': _value(row, 'hungate_nearest_identity', 'HungateNearestIdentity'),
+        'hungate_nearest_query_coverage': _value(row, 'hungate_nearest_query_coverage', 'HungateNearestQueryCoverage'),
+        'secondary_baseline_nearest_hit': _value(row, 'secondary_baseline_nearest_hit', 'SecondaryBaselineNearestHit'),
+        'secondary_baseline_nearest_hit_taxonomy': _value(row, 'secondary_baseline_nearest_hit_taxonomy', 'SecondaryBaselineNearestHitTaxonomy'),
+        'secondary_baseline_nearest_identity': _value(row, 'secondary_baseline_nearest_identity', 'SecondaryBaselineNearestIdentity'),
+        'secondary_baseline_nearest_query_coverage': _value(row, 'secondary_baseline_nearest_query_coverage', 'SecondaryBaselineNearestQueryCoverage'),
+        'cultured_rumen_nearest_hit': _value(row, 'cultured_rumen_nearest_hit', 'CulturedRumenNearestHit', 'nearest_hit', 'BaselineNearestHit'),
+        'cultured_rumen_nearest_hit_taxonomy': _value(row, 'cultured_rumen_nearest_hit_taxonomy', 'CulturedRumenNearestHitTaxonomy', 'nearest_hit_taxonomy', 'BaselineNearestHitTaxonomy'),
+        'cultured_rumen_nearest_identity': _value(row, 'cultured_rumen_nearest_identity', 'CulturedRumenNearestIdentity', 'nearest_identity', 'BaselineNearestIdentity'),
+        'cultured_rumen_nearest_query_coverage': _value(row, 'cultured_rumen_nearest_query_coverage', 'CulturedRumenNearestQueryCoverage', 'nearest_query_coverage', 'BaselineNearestQueryCoverage'),
+        'nearest_hit': _value(row, 'nearest_hit', 'CulturedRumenNearestHit', 'BaselineNearestHit'),
         'nearest_hit_taxonomy': _value(
-            row, 'nearest_hit_taxonomy', 'BaselineNearestHitTaxonomy',
+            row, 'nearest_hit_taxonomy', 'CulturedRumenNearestHitTaxonomy', 'BaselineNearestHitTaxonomy',
         ),
-        'nearest_identity': _value(row, 'nearest_identity', 'BaselineNearestIdentity'),
+        'nearest_identity': _value(row, 'nearest_identity', 'CulturedRumenNearestIdentity', 'BaselineNearestIdentity'),
         'nearest_query_coverage': _value(
-            row, 'nearest_query_coverage', 'BaselineNearestQueryCoverage',
+            row, 'nearest_query_coverage', 'CulturedRumenNearestQueryCoverage', 'BaselineNearestQueryCoverage',
         ),
-        'density_source': _value(row, 'density_source', 'BaselineSource', default=''),
+        'density_source': _value(row, 'density_source', 'CulturedRumenSource', 'BaselineSource', default=''),
         'project_nearest_identity': _value(row, 'project_nearest_identity', 'ProjectNearestIdentity'),
         'project_density_source': _value(row, 'project_density_source', 'ProjectSource', default=''),
         'reference_nearest_identity': reference_identity,
@@ -111,8 +124,22 @@ def normalise_assessment_row(row: dict, *, source_path: str = '') -> dict:
             row, 'nearest_genome_identity_source', 'NearestGenomeIdentitySource',
             default='assessment_snapshot',
         ),
+        'hungate_genome_count_same_species': _value(
+            row, 'hungate_genome_count_same_species', 'HungateGenomesSameAssessmentSpecies',
+            'HungateGenomeCountSameAssessmentSpecies', default='0',
+        ),
+        'secondary_baseline_genome_count_same_species': _value(
+            row, 'secondary_baseline_genome_count_same_species', 'SecondaryBaselineGenomesSameAssessmentSpecies',
+            'SecondaryBaselineGenomeCountSameAssessmentSpecies', default='0',
+        ),
+        'cultured_rumen_genome_count_same_species': _value(
+            row, 'cultured_rumen_genome_count_same_species', 'CulturedRumenGenomesSameAssessmentSpecies',
+            'CulturedRumenGenomeCountSameAssessmentSpecies', 'BaselineGenomesSameAssessmentSpecies',
+            'BaselineGenomesSameSpecies', default='0',
+        ),
         'genome_available_count_same_species': _value(
-            row, 'genome_available_count_same_species', 'BaselineGenomesSameAssessmentSpecies',
+            row, 'genome_available_count_same_species', 'CulturedRumenGenomesSameAssessmentSpecies',
+            'CulturedRumenGenomeCountSameAssessmentSpecies', 'BaselineGenomesSameAssessmentSpecies',
             'BaselineGenomesSameSpecies', default='0',
         ),
         'genome_selected_count_same_species': _value(
@@ -325,6 +352,18 @@ def _divergence(identity) -> float:
     return max(0.0, 100.0 - value) if value is not None and value > 0 else 0.0
 
 
+def _baseline_evidence_rank(row: dict) -> int:
+    ranks = {
+        'NOVEL TO BOTH BASELINES': 4,
+        'HUNGATE GAP / SECONDARY COVERED': 3,
+        'HUNGATE COVERED': 2,
+        'NO CULTURED BASELINE AVAILABLE': 1,
+        'CULTURED BASELINE REDUNDANT': 0,
+    }
+    value = str(row.get('baseline_evidence_class') or '').strip().upper()
+    return ranks.get(value, 1)
+
+
 def _candidate_key(row: dict, anchors: List[str], distances: Dict[tuple[str, str], float]) -> tuple:
     patristic = _marginal_distance(row, anchors, distances)
     mwl = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
@@ -332,6 +371,7 @@ def _candidate_key(row: dict, anchors: List[str], distances: Dict[tuple[str, str
     return (
         0 if patristic is not None else 1,
         -(patristic or 0.0),
+        -_baseline_evidence_rank(row),
         -_divergence(row.get('nearest_genome_identity')),
         -_divergence(row.get('nearest_identity')),
         -_divergence(row.get('project_nearest_identity')),
@@ -432,6 +472,8 @@ def build_quarterly_review(
     available_anchors_by_group = {}
     counts_by_group = {}
     baseline_counts_by_group = {}
+    hungate_counts_by_group = {}
+    secondary_counts_by_group = {}
     for key, members in grouped.items():
         species = _species(members[0].get('taxonomy'))
         available_anchors = list(available_species.get(normalise_taxon_name(species), [])) if species else []
@@ -442,10 +484,14 @@ def build_quarterly_review(
         anchors_by_group[key] = sorted(set(committed_anchors))
         reported = max((_int(row.get('genome_committed_count_same_species')) for row in members), default=0)
         counts_by_group[key] = max(reported, len(anchors_by_group[key]))
-        baseline_counts_by_group[key] = max(
-            (_int(row.get('genome_available_count_same_species')) for row in members),
-            default=0,
-        )
+        hungate_count = max((_int(row.get('hungate_genome_count_same_species')) for row in members), default=0)
+        secondary_count = max((_int(row.get('secondary_baseline_genome_count_same_species')) for row in members), default=0)
+        prior_baseline_count = max((_int(row.get('genome_available_count_same_species')) for row in members), default=0)
+        if hungate_count + secondary_count == 0 and prior_baseline_count:
+            hungate_count = prior_baseline_count
+        hungate_counts_by_group[key] = hungate_count
+        secondary_counts_by_group[key] = secondary_count
+        baseline_counts_by_group[key] = hungate_count + secondary_count
 
     _refresh_nearest_available_from_alignment(grouped, available_anchors_by_group, alignment_path)
 
@@ -459,10 +505,14 @@ def build_quarterly_review(
     recommendations = {}
     candidates = defaultdict(list)
     for key, members in grouped.items():
-        is_baseline_extension = bool(_species(members[0].get('taxonomy')) and baseline_counts_by_group[key] > 0)
-        selection_group_type = (
-            'BASELINE_PANGENOME_EXTENSION' if is_baseline_extension else 'CANDIDATE_PANGENOME_GROUP'
-        )
+        species_name = _species(members[0].get('taxonomy'))
+        if species_name and hungate_counts_by_group[key] > 0:
+            selection_group_type = 'HUNGATE_BASELINE_EXTENSION'
+        elif species_name and secondary_counts_by_group[key] > 0:
+            selection_group_type = 'SECONDARY_BASELINE_EXTENSION'
+        else:
+            selection_group_type = 'CANDIDATE_ONLY_GROUP'
+        is_baseline_extension = selection_group_type != 'CANDIDATE_ONLY_GROUP'
         for row in members:
             evidence = _evidence_quality(row)
             base = {
@@ -473,6 +523,9 @@ def build_quarterly_review(
                 'selection_group_type': selection_group_type,
                 'evidence_quality': evidence,
                 'available_genomes_before': counts_by_group[key],
+                'hungate_baseline_genomes_before': hungate_counts_by_group[key],
+                'secondary_baseline_genomes_before': secondary_counts_by_group[key],
+                'cultured_rumen_baseline_genomes_before': baseline_counts_by_group[key],
                 'pangenome_target': target,
                 'coverage_gap_before': max(0, target - counts_by_group[key]),
                 'qc_passed_genome_ids': ';'.join(
@@ -484,6 +537,16 @@ def build_quarterly_review(
                 'nearest_available_genome': row.get('nearest_genome_hit', 'NA'),
                 'nearest_available_identity': row.get('nearest_genome_identity', 'NA'),
                 'nearest_available_identity_source': row.get('nearest_genome_identity_source', 'assessment_snapshot'),
+                'baseline_evidence_class': row.get('baseline_evidence_class', 'NA'),
+                'hungate_nearest_hit': row.get('hungate_nearest_hit', 'NA'),
+                'hungate_nearest_identity': row.get('hungate_nearest_identity', 'NA'),
+                'hungate_nearest_query_coverage': row.get('hungate_nearest_query_coverage', 'NA'),
+                'secondary_baseline_nearest_hit': row.get('secondary_baseline_nearest_hit', 'NA'),
+                'secondary_baseline_nearest_identity': row.get('secondary_baseline_nearest_identity', 'NA'),
+                'secondary_baseline_nearest_query_coverage': row.get('secondary_baseline_nearest_query_coverage', 'NA'),
+                'cultured_rumen_nearest_hit': row.get('cultured_rumen_nearest_hit', row.get('nearest_hit', 'NA')),
+                'cultured_rumen_nearest_identity': row.get('cultured_rumen_nearest_identity', row.get('nearest_identity', 'NA')),
+                'cultured_rumen_nearest_query_coverage': row.get('cultured_rumen_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
                 'baseline_nearest_hit': row.get('nearest_hit', 'NA'),
                 'baseline_nearest_identity': row.get('nearest_identity', 'NA'),
                 'baseline_nearest_query_coverage': row.get('nearest_query_coverage', 'NA'),
@@ -664,11 +727,17 @@ def build_quarterly_review(
 QUARTERLY_REVIEW_FIELDS = [
     'round_id', 'sequence_id', 'partner_id', 'role', 'round_rank', 'backup_rank', 'backup_for',
     'priority_tier', 'assessment_species', 'evidence_quality', 'available_genomes_before',
-    'selection_group_type',
+    'hungate_baseline_genomes_before', 'secondary_baseline_genomes_before',
+    'cultured_rumen_baseline_genomes_before', 'selection_group_type',
     'qc_passed_genome_ids', 'available_ani_clusters',
     'pangenome_target', 'coverage_gap_before', 'nearest_available_genome',
     'nearest_available_identity', 'nearest_available_identity_source',
-    'marginal_patristic_distance', 'baseline_nearest_hit',
+    'marginal_patristic_distance', 'baseline_evidence_class',
+    'hungate_nearest_hit', 'hungate_nearest_identity', 'hungate_nearest_query_coverage',
+    'secondary_baseline_nearest_hit', 'secondary_baseline_nearest_identity',
+    'secondary_baseline_nearest_query_coverage',
+    'cultured_rumen_nearest_hit', 'cultured_rumen_nearest_identity',
+    'cultured_rumen_nearest_query_coverage', 'baseline_nearest_hit',
     'baseline_nearest_identity', 'baseline_nearest_query_coverage',
     'baseline_redundancy_identity_threshold', 'baseline_redundancy_min_query_coverage',
     'baseline_redundancy_status', 'baseline_extension_status',

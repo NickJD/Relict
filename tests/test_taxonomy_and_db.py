@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 import gzip
 import csv
 import os
@@ -128,6 +129,25 @@ class DatabaseBehaviourTests(unittest.TestCase):
             db = Database(str(db_path))
             db.initialise()
             self.assertTrue(db_path.exists())
+
+    def test_dataset_roles_store_and_discover_baseline_tiers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(os.path.join(tmpdir, 'test.sqlite'))
+            db.initialise()
+            db.insert_sequences([('H1', 'ACGT')], dataset='Hungate')
+            db.insert_sequences([('S1', 'ACGA')], dataset='OtherRumen')
+            db.upsert_dataset_role('Hungate', 'baseline', genomes_available=True, baseline_tier='priority')
+            db.upsert_dataset_role('OtherRumen', 'baseline', genomes_available=True, baseline_tier='secondary')
+
+            roles = db.get_dataset_roles()
+            self.assertEqual(roles['Hungate']['baseline_tier'], 'priority')
+            self.assertEqual(roles['OtherRumen']['baseline_tier'], 'secondary')
+            self.assertEqual(db.get_baseline_datasets_by_tier()['priority'], ['Hungate'])
+            self.assertEqual(db.get_baseline_datasets_by_tier()['secondary'], ['OtherRumen'])
+            with db.connect() as conn:
+                rows = dict(conn.execute('SELECT dataset, baseline_tier FROM sequences'))
+            self.assertEqual(rows['Hungate'], 'priority')
+            self.assertEqual(rows['OtherRumen'], 'secondary')
 
     def test_taxonomy_replace_is_unique_per_dataset(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -482,6 +502,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             '--partner-metadata', 'partner_metadata.tsv',
             '--baseline-fasta', 'hungate.fna',
             '--baseline-dataset', 'Hungate',
+            '--baseline-tier', 'priority',
             '--novelty-baseline-dataset', 'CulturedSetB',
             '--baseline-taxa-assignments', 'hungate_taxonomy.tsv',
             '--baseline-skip-classify',
@@ -495,6 +516,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.partner_metadata, 'partner_metadata.tsv')
         self.assertEqual(args.baseline_fasta, 'hungate.fna')
         self.assertEqual(args.baseline_dataset, 'Hungate')
+        self.assertEqual(args.baseline_tier, 'priority')
         self.assertEqual(args.novelty_baseline_datasets, ['CulturedSetB'])
         self.assertEqual(args.baseline_taxa_assignments, 'hungate_taxonomy.tsv')
         self.assertTrue(args.baseline_skip_classify)
@@ -1432,8 +1454,8 @@ class OutputHelperTests(unittest.TestCase):
             stale_dir.mkdir(parents=True)
             stale_page = stale_dir / 'read_error_profiles_page_999.png'
             stale_page.write_bytes(b'stale')
-            obsolete_single_image = output_dir / 'read_error_profiles.png'
-            obsolete_single_image.write_bytes(b'stale')
+            stale_single_image = output_dir / 'read_error_profiles.png'
+            stale_single_image.write_bytes(b'stale')
 
             out = paper_trail_pipeline.run_paper_trail(
                 [fasta],
@@ -1447,7 +1469,7 @@ class OutputHelperTests(unittest.TestCase):
             self.assertEqual(len(out['chromatogram_pngs']), 6)
             self.assertEqual(len(out['assembly_pngs']), 6)
             self.assertFalse(stale_page.exists())
-            self.assertFalse(obsolete_single_image.exists())
+            self.assertFalse(stale_single_image.exists())
             from PIL import Image
             all_pages = (
                 out['read_error_pngs']
@@ -2235,6 +2257,10 @@ class OutputHelperTests(unittest.TestCase):
 
             text = Path(out).read_text()
             self.assertIn('BaselineNoveltyScore', text)
+            self.assertIn('HungateNearestHit', text)
+            self.assertIn('SecondaryBaselineNearestHit', text)
+            self.assertIn('CulturedRumenNearestHit', text)
+            self.assertIn('BaselineEvidenceClass', text)
             self.assertIn('ProjectNoveltyScore', text)
             self.assertIn('ReferenceNoveltyScore', text)
             self.assertIn('Q1\t96.20\tHungateHit\tTrue', text)
@@ -2592,13 +2618,45 @@ class OutputHelperTests(unittest.TestCase):
         extension = next(row for row in rows if row['id'] == 'EXTENSION')
         redundant = next(row for row in rows if row['id'] == 'REDUNDANT')
         self.assertTrue(extension['sequencing_set_id'].startswith('BMEXT_'))
-        self.assertEqual(extension['selection_group_type'], 'BASELINE_PANGENOME_EXTENSION')
+        self.assertEqual(extension['selection_group_type'], 'HUNGATE_BASELINE_EXTENSION')
         self.assertEqual(extension['sequencing_set_role'], 'PRIMARY')
         self.assertEqual(extension['sequencing_set_rank'], '1')
         self.assertEqual(extension['baseline_extension_status'], 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION')
         self.assertEqual(redundant['sequencing_set_role'], 'BASELINE_REDUNDANT')
         self.assertEqual(written[0]['PangenomeGap'], '8')
         self.assertEqual(written[0]['BaselineAnchorIDs'], 'BASELINE_1')
+
+    def test_secondary_baseline_extension_reports_tier_counts(self):
+        taxonomy = 'd__Bacteria; g__Anchor; s__Anchor species'
+        row = {
+            'id': 'SEC_EXTENSION', 'partner_id': 'QUB', 'taxonomy': taxonomy,
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'classification_query_coverage': '100.0',
+            'baseline_evidence_class': 'HUNGATE GAP / SECONDARY COVERED',
+            'secondary_baseline_nearest_hit': 'SEC_BASELINE_1',
+            'secondary_baseline_nearest_hit_taxonomy': taxonomy,
+            'secondary_baseline_nearest_identity': '99.10',
+            'secondary_baseline_nearest_query_coverage': '100.0',
+            'nearest_hit': 'SEC_BASELINE_1', 'nearest_hit_taxonomy': taxonomy,
+            'nearest_identity': '99.10', 'nearest_query_coverage': '100.0',
+            'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+            'hungate_genome_count_same_species': '0',
+            'secondary_baseline_genome_count_same_species': '1',
+            'genome_available_count_same_species': '1',
+            'genome_selected_count_same_species': '0',
+            'genome_pending_count_same_species': '0',
+            'placement_flags': '',
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = selection_sets_pipeline.build_sequencing_sets(
+                [row], Path(tmpdir) / 'sequencing_sets.tsv',
+            )
+            written = list(csv.DictReader(open(output), delimiter='	'))
+
+        self.assertEqual(row['selection_group_type'], 'SECONDARY_BASELINE_EXTENSION')
+        self.assertEqual(row['baseline_extension_status'], 'ELIGIBLE_SECONDARY_BASELINE_EXTENSION')
+        self.assertEqual(written[0]['SecondaryBaselineGenomes'], '1')
+        self.assertEqual(written[0]['HungateBaselineGenomes'], '0')
 
     def test_baseline_extension_requires_exact_species_and_close_full_length_marker(self):
         candidate_taxonomy = 'd__Bacteria; g__Anchor; s__Anchor species'
@@ -2881,7 +2939,7 @@ class OutputHelperTests(unittest.TestCase):
         by_id = {item['sequence_id']: item for item in recommendations}
 
         self.assertEqual(by_id['EXTENSION']['role'], 'PRIMARY')
-        self.assertEqual(by_id['EXTENSION']['selection_group_type'], 'BASELINE_PANGENOME_EXTENSION')
+        self.assertEqual(by_id['EXTENSION']['selection_group_type'], 'HUNGATE_BASELINE_EXTENSION')
         self.assertEqual(by_id['BOUNDARY']['role'], 'PANGENOME_BOUNDARY_REVIEW')
         self.assertEqual(by_id['BOUNDARY']['baseline_extension_status'], 'BASELINE_SPECIES_MISMATCH')
 

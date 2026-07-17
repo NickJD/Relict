@@ -325,7 +325,7 @@ def _repair_internal_node_label_delimiters(newick_text: Optional[str]) -> str:
 # Normalisation helpers
 
 def _norm_id(x: str) -> str:
-    """Return the persistent FASTA ID without legacy shortening heuristics."""
+    """Return the persistent FASTA ID without older shortening heuristics."""
     return str(x).strip() if x is not None else ''
 
 
@@ -932,7 +932,7 @@ def initialise_or_update_tree(
     Parameters
     ----------
     ref_fasta      : Path to reference FASTA used for classification (not used
-                     for tree building — kept for API compatibility).
+                     for tree building; accepted for older callers).
     user_fasta     : FASTA of new query sequences to add.
     outdir         : Output directory. Persistent files:
                        current_alignment.fasta — the growing backbone

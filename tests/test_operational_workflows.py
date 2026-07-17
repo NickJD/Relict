@@ -1,3 +1,5 @@
+# ruff: noqa: E402
+import json
 import sqlite3
 import shlex
 import subprocess
@@ -220,16 +222,52 @@ class OperationalWorkflowTests(unittest.TestCase):
             root = Path(tmpdir)
             db = Database(str(root / 'project.sqlite'))
             db.initialise()
-            db.insert_sequences([('ISO1', 'ACGT')], dataset='Batch1')
+            db.insert_sequences([('ISO1', 'ACGT'), ('ISO2', 'ACGA')], dataset='Batch1')
+            db.upsert_dataset_role('Batch1', 'candidate')
             db.update_isolate_status('ISO1', 'MARKER_QC_PASSED')
+            db.update_isolate_status('ISO2', 'PROPOSED')
             db.record_project_run('performance-review:1', 'performance_review', 'COMPLETE', dataset='Batch1')
             outputs = write_annual_report(db, root / 'annual_report')
             self.assertEqual(Path(outputs['html']).name, 'annual_report.html')
-            self.assertIn('Cumulative Project Overview', Path(outputs['html']).read_text())
+            html = Path(outputs['html']).read_text()
+            self.assertIn('Cumulative Project Overview', html)
+            self.assertIn('Proposed sequences', html)
+            self.assertIn('<td>Batch1</td><td>candidate</td><td></td><td>0</td><td>1</td><td>2</td>', html)
             self.assertIn('ISO1', Path(outputs['isolates']).read_text())
             self.assertTrue(Path(outputs['candidates']).is_file())
             self.assertTrue(Path(outputs['removals']).is_file())
             self.assertTrue(Path(outputs['decision_changes']).is_file())
+
+    def test_annual_report_discovers_failed_manifest_and_staged_dataset(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('HUN1', 'ACGT')], dataset='Hungate')
+            db.upsert_dataset_role('Hungate', 'baseline', genomes_available=True)
+            review_dir = root / 'UoG_01' / '03_performance_review_hiring_panel'
+            review_dir.mkdir(parents=True)
+            staged = Database(str(review_dir / '.performance_review_project.sqlite'))
+            staged.initialise()
+            staged.insert_sequences([('UOG1', 'ACGT'), ('UOG2', 'ACGA')], dataset='UoG_01')
+            staged.upsert_dataset_role('UoG_01', 'candidate')
+            staged.update_isolate_status('UOG1', 'MARKER_QC_PASSED')
+            staged.update_isolate_status('UOG2', 'TRACE_REVIEW')
+            (review_dir / 'run_manifest.json').write_text(json.dumps({
+                'workflow': 'performance_review',
+                'status': 'FAILED',
+                'started_at': '2026-07-17T07:37:43Z',
+                'completed_at': '2026-07-17T07:39:32Z',
+                'command': ['branchmanager', 'assistant', '--dataset', 'UoG_01'],
+                'error': 'local tree context resolved 49/50 assessed sequences',
+            }))
+
+            outputs = write_annual_report(db, root / 'annual_report')
+            html = Path(outputs['html']).read_text()
+            self.assertIn('<td>UoG_01</td><td>candidate</td><td></td><td>0</td><td>0</td><td>2</td>', html)
+            self.assertIn('FAILED', html)
+            self.assertIn('UOG1', Path(outputs['isolates']).read_text())
+            self.assertIn('NOT YET ASSESSED', Path(outputs['candidates']).read_text())
 
     def test_exit_interview_removes_active_records_and_retains_audit(self):
         with tempfile.TemporaryDirectory() as tmpdir:

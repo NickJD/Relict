@@ -3,7 +3,8 @@ CREATE TABLE IF NOT EXISTS sequences (
     id TEXT PRIMARY KEY,
     sequence TEXT,
     length INTEGER,
-    dataset TEXT
+    dataset TEXT,
+    baseline_tier TEXT
 );
 
 CREATE TABLE IF NOT EXISTS taxonomy (
@@ -75,7 +76,8 @@ CREATE TABLE IF NOT EXISTS sequencing_metadata (
 CREATE TABLE IF NOT EXISTS dataset_roles (
     dataset TEXT PRIMARY KEY,
     role TEXT NOT NULL,
-    genomes_available INTEGER DEFAULT 0
+    genomes_available INTEGER DEFAULT 0,
+    baseline_tier TEXT
 );
 
 CREATE TABLE IF NOT EXISTS assessment_snapshots (

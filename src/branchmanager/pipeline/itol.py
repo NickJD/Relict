@@ -318,6 +318,34 @@ def write_dataset_membership_strip(output_path: str, ids_in_order, ds_map, datas
     return str(p)
 
 
+def write_baseline_tier_strip(output_path: str, ids_in_order, tier_map, dataset_label: str = 'Baseline tier'):
+    colours = {
+        'priority': '#2e7d32',
+        'secondary': '#00838f',
+    }
+    lines = [
+        'DATASET_COLORSTRIP',
+        'SEPARATOR COMMA',
+        f'DATASET_LABEL,{dataset_label}',
+        'COLOR,#AAAAAA',
+        'MARGIN,5',
+        'SHOW_INTERNAL,0',
+        'LEGEND_TITLE,Baseline tier legend',
+        'LEGEND_SHAPES,1,2',
+        'LEGEND_COLORS,#2e7d32,#00838f',
+        'LEGEND_LABELS,Hungate baseline (priority),Secondary rumen baseline',
+        'DATA',
+    ]
+    for iid in ids_in_order:
+        tier = str(tier_map.get(iid) or '').strip().lower()
+        if tier in colours:
+            lines.append(f'{iid},{colours[tier]}')
+    p = Path(output_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('\n'.join(lines) + '\n')
+    return str(p)
+
+
 def generate_itol_colours(taxonomy_tsv: str, outdir: str, user_colour_csv: str = None, id_map: dict = None, tree_file: str = None, phylum_groups: list = None):
     """Generate one iTOL-compatible colour strip per taxonomy metadata type.
 

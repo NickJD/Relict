@@ -30,7 +30,13 @@ from pathlib import Path
 from typing import Optional
 
 from branchmanager.pipeline import tree as tree_pipeline
-from branchmanager.pipeline.selection_sets import DEFAULT_PANGENOME_TARGET
+from branchmanager.pipeline.selection_sets import (
+    DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
+    DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
+    DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
+    DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
+    DEFAULT_PANGENOME_TARGET,
+)
 from branchmanager.taxonomy import parse_taxon_string
 from branchmanager.utils.fasta import read_fasta, write_fasta
 from branchmanager.utils.subprocess import run_cmd
@@ -63,8 +69,8 @@ def run_novelty(
     Parameters
     ----------
     input_fasta    : Query sequences (dereplicated, QC-passed)
-    ref_fasta      : Reference database FASTA (kept for API compatibility; not
-                     used directly — novelty is against submitted sequences)
+    ref_fasta      : Reference database FASTA (accepted for older callers;
+                     novelty is measured against submitted sequences)
     outdir         : Output directory
     db             : Database instance to pull other submitted sequences from
     run_dataset    : Current run dataset name (used to exclude self from comparison)
@@ -584,6 +590,64 @@ def _normalise_dataset_names(dataset_names) -> list[str]:
     return names
 
 
+def _infer_baseline_tier_name(dataset: str, explicit: str | None = None) -> str:
+    tier = str(explicit or '').strip().lower()
+    if tier in {'primary', 'hungate'}:
+        tier = 'priority'
+    if tier in {'priority', 'secondary'}:
+        return tier
+    return 'priority' if 'hungate' in str(dataset or '').strip().lower() else 'secondary'
+
+
+def _discover_tiered_baseline_datasets(
+    db,
+    *,
+    baseline_datasets=None,
+    hungate_datasets=None,
+    secondary_baseline_datasets=None,
+) -> tuple[list[str], list[str], list[str]]:
+    priority: list[str] = []
+    secondary: list[str] = []
+
+    def add(names, tier: str):
+        target = priority if tier == 'priority' else secondary
+        for name in _normalise_dataset_names(names):
+            if name not in priority and name not in secondary:
+                target.append(name)
+
+    role_tiers: dict[str, str] = {}
+    if db is not None:
+        try:
+            grouped = db.get_baseline_datasets_by_tier()
+            add(grouped.get('priority', []), 'priority')
+            add(grouped.get('secondary', []), 'secondary')
+        except Exception:
+            try:
+                for dataset, metadata in db.get_dataset_roles().items():
+                    if metadata.get('role') != 'baseline':
+                        continue
+                    tier = _infer_baseline_tier_name(dataset, metadata.get('baseline_tier'))
+                    role_tiers[dataset] = tier
+                    add([dataset], tier)
+            except Exception:
+                pass
+        else:
+            try:
+                for dataset, metadata in db.get_dataset_roles().items():
+                    if metadata.get('role') == 'baseline':
+                        role_tiers[dataset] = _infer_baseline_tier_name(dataset, metadata.get('baseline_tier'))
+            except Exception:
+                pass
+
+    for name in _normalise_dataset_names(baseline_datasets):
+        add([name], role_tiers.get(name) or _infer_baseline_tier_name(name))
+    add(hungate_datasets, 'priority')
+    add(secondary_baseline_datasets, 'secondary')
+
+    combined = list(dict.fromkeys(priority + secondary))
+    return list(dict.fromkeys(priority)), list(dict.fromkeys(secondary)), combined
+
+
 def _query_db_pool(
     db,
     *,
@@ -817,6 +881,8 @@ def _empty_sequencing_context(qids, pangenome_target: int = DEFAULT_PANGENOME_TA
             'adjusted_priority': 'NA',
             'source': 'none',
             'genome_same_species_committed': 0,
+            'genome_same_species_hungate': 0,
+            'genome_same_species_secondary_baseline': 0,
             'genome_same_species_available': 0,
             'genome_same_species_selected': 0,
             'genome_same_species_pending': 0,
@@ -825,6 +891,57 @@ def _empty_sequencing_context(qids, pangenome_target: int = DEFAULT_PANGENOME_TA
         }
         for qid in qids
     }
+
+
+def _compute_db_pool_metrics(
+    *,
+    input_fasta: str,
+    outdir: str,
+    qids,
+    db,
+    run_dataset: Optional[str],
+    datasets,
+    pool_name: str,
+    source_prefix: str,
+    threads: Optional[int],
+):
+    dataset_names = _normalise_dataset_names(datasets)
+    if not dataset_names or db is None:
+        return None, _empty_pool_metrics(qids, source='none'), 'none', [], 0
+    pool_path, _pool_source, datasets_found, count = _build_db_pool_fasta(
+        db=db,
+        outdir=outdir,
+        name=pool_name,
+        run_dataset=run_dataset,
+        include_datasets=dataset_names,
+    )
+    if not pool_path:
+        return None, _empty_pool_metrics(qids, source='none'), 'none', datasets_found, count
+    source = source_prefix + ':' + ','.join(datasets_found or dataset_names)
+    logger.info(
+        '[NOVELTY] %s pool: %d sequences from dataset(s): %s',
+        source_prefix.replace('_', ' '), count, datasets_found or dataset_names,
+    )
+    nearest = _run_nearest_search(
+        input_fasta,
+        pool_path,
+        Path(outdir) / f'novelty_{pool_name}_nearest_matches.tsv',
+        threads=threads,
+    )
+    density = _run_density_search(
+        input_fasta,
+        pool_path,
+        Path(outdir) / f'novelty_{pool_name}_density_matches.tsv',
+        threads=threads,
+    )
+    metrics = _metrics_from_nearest_and_density(
+        qids,
+        nearest,
+        density,
+        source=source,
+        id_threshold=0.97,
+    )
+    return pool_path, metrics, source, datasets_found, count
 
 
 def _compute_sequencing_context(
@@ -857,7 +974,7 @@ def _compute_sequencing_context(
         with db.connect() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT s.id, s.sequence, s.dataset, t.taxonomy, "
+                "SELECT s.id, s.sequence, s.dataset, s.baseline_tier, t.taxonomy, "
                 "COALESCE(m.selected_for_wgs, 0), COALESCE(m.selected_for_sequencing, 0) "
                 "FROM sequences s "
                 "LEFT JOIN taxonomy t ON s.id = t.id AND (t.dataset = s.dataset OR t.dataset IS NULL) "
@@ -866,11 +983,12 @@ def _compute_sequencing_context(
             )
             rows = cur.fetchall()
         by_id = {}
-        for sid, sequence, dataset, taxonomy, available, selected in rows:
+        for sid, sequence, dataset, baseline_tier, taxonomy, available, selected in rows:
             sid = str(sid)
             entry = by_id.setdefault(sid, {
                 'sequence': str(sequence),
                 'dataset': str(dataset or ''),
+                'baseline_tier': str(baseline_tier or ''),
                 'taxonomy': '',
                 'available': bool(available),
                 'selected': bool(selected),
@@ -880,13 +998,23 @@ def _compute_sequencing_context(
         for sid, entry in by_id.items():
             if sid in qids:
                 query_taxonomy[sid] = entry.get('taxonomy', '')
-            is_baseline_genome = entry.get('dataset') in baseline_genome_datasets
+            dataset = entry.get('dataset', '')
+            role = dataset_roles.get(dataset, {})
+            is_baseline_genome = dataset in baseline_genome_datasets
+            tier = entry.get('baseline_tier') or role.get('baseline_tier') or ''
+            if is_baseline_genome and tier not in {'priority', 'secondary'}:
+                tier = _infer_baseline_tier_name(dataset)
+            is_hungate_baseline = is_baseline_genome and tier == 'priority'
+            is_secondary_baseline = is_baseline_genome and tier == 'secondary'
             is_partner_genome = bool(entry.get('available')) and not is_baseline_genome
             is_pending_selection = bool(entry.get('selected')) and not is_partner_genome and not is_baseline_genome
             collection_metadata[sid] = {
                 'taxonomy': entry.get('taxonomy', ''),
-                'dataset': entry.get('dataset', ''),
+                'dataset': dataset,
+                'baseline_tier': tier,
                 'baseline_available': is_baseline_genome,
+                'hungate_baseline_available': is_hungate_baseline,
+                'secondary_baseline_available': is_secondary_baseline,
                 'partner_available': is_partner_genome,
                 'selected_pending': is_pending_selection,
             }
@@ -949,9 +1077,13 @@ def _compute_sequencing_context(
             sid for sid, values in collection_metadata.items()
             if query_species and species_key(values.get('taxonomy')) == query_species
         ]
-        same_species_baseline = sum(
-            1 for sid in same_species_ids if collection_metadata[sid].get('baseline_available')
+        same_species_hungate = sum(
+            1 for sid in same_species_ids if collection_metadata[sid].get('hungate_baseline_available')
         )
+        same_species_secondary_baseline = sum(
+            1 for sid in same_species_ids if collection_metadata[sid].get('secondary_baseline_available')
+        )
+        same_species_baseline = same_species_hungate + same_species_secondary_baseline
         same_species_partner_available = sum(
             1 for sid in same_species_ids if collection_metadata[sid].get('partner_available')
         )
@@ -1004,6 +1136,8 @@ def _compute_sequencing_context(
             'adjusted_priority': adjusted_priority,
             'source': 'baseline_genomes_and_project_ledger' if metadata or genome_records else 'none',
             'genome_same_species_committed': same_species_committed,
+            'genome_same_species_hungate': same_species_hungate,
+            'genome_same_species_secondary_baseline': same_species_secondary_baseline,
             'genome_same_species_available': same_species_baseline,
             'genome_same_species_selected': same_species_partner_available,
             'genome_same_species_pending': same_species_pending,
@@ -1013,59 +1147,117 @@ def _compute_sequencing_context(
     return context
 
 
-def _write_novelty_metrics_table(output: Path, qids, primary_metrics, baseline_metrics, project_metrics, reference_metrics, sequencing_context=None):
-    headers = [
-        'ID',
+def _metric_values(metrics, qid):
+    row = metrics.get(qid) or _empty_pool_metrics([qid])[qid]
+    return [
+        f"{float(row['nearest_identity']):.2f}",
+        row['nearest_hit'],
+        row['novel'],
+        str(row['matches_ge_99']),
+        str(row['matches_ge_97']),
+        str(row['matches_ge_95']),
+        f"{float(row['novelty_score']):.2f}",
+        row['crowding'],
+        row['sequencing_priority'],
+        'NA' if row.get('nearest_query_coverage') is None else f"{float(row['nearest_query_coverage']):.2f}",
+        'NA' if row.get('nearest_alignment_length') is None else str(int(row['nearest_alignment_length'])),
+        row['density_source'],
+    ]
+
+
+def _pool_has_hit(row: dict) -> bool:
+    if not row:
+        return False
+    source = str(row.get('density_source') or '')
+    return source not in {'', 'none', 'NA'}
+
+
+def _passes_identity_coverage(row: dict, identity_threshold: float, coverage_threshold: float) -> bool:
+    if not _pool_has_hit(row):
+        return False
+    try:
+        identity = float(row.get('nearest_identity'))
+        coverage = float(row.get('nearest_query_coverage'))
+    except (TypeError, ValueError):
+        return False
+    return identity >= float(identity_threshold) and coverage >= float(coverage_threshold)
+
+
+def _baseline_evidence_class(qid, hungate_metrics, secondary_metrics, cultured_metrics) -> str:
+    hungate = hungate_metrics.get(qid, {})
+    secondary = secondary_metrics.get(qid, {})
+    cultured = cultured_metrics.get(qid, {})
+    if not any(_pool_has_hit(row) for row in (hungate, secondary, cultured)):
+        return 'NO CULTURED BASELINE AVAILABLE'
+    if any(
+        _passes_identity_coverage(row, DEFAULT_BASELINE_REDUNDANCY_IDENTITY, DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE)
+        for row in (hungate, secondary)
+    ):
+        return 'CULTURED BASELINE REDUNDANT'
+    if _passes_identity_coverage(
+        hungate, DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY, DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
+    ):
+        return 'HUNGATE COVERED'
+    if _passes_identity_coverage(
+        secondary, DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY, DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
+    ):
+        return 'HUNGATE GAP / SECONDARY COVERED'
+    return 'NOVEL TO BOTH BASELINES'
+
+
+def _write_novelty_metrics_table(
+    output: Path,
+    qids,
+    primary_metrics,
+    hungate_metrics,
+    secondary_metrics,
+    cultured_metrics,
+    project_metrics,
+    reference_metrics,
+    sequencing_context=None,
+):
+    metric_fields = [
         'NearestIdentity', 'NearestHit', 'Novel', 'MatchesGE99', 'MatchesGE97', 'MatchesGE95',
-        'NoveltyScore', 'Crowding', 'SequencingPriority', 'NearestQueryCoverage', 'NearestAlignmentLength', 'DensitySource',
-        'BaselineNearestIdentity', 'BaselineNearestHit', 'BaselineNovel',
-        'BaselineMatchesGE99', 'BaselineMatchesGE97', 'BaselineMatchesGE95',
-        'BaselineNoveltyScore', 'BaselineCrowding', 'BaselineSequencingPriority', 'BaselineNearestQueryCoverage', 'BaselineNearestAlignmentLength', 'BaselineDensitySource',
-        'ProjectNearestIdentity', 'ProjectNearestHit', 'ProjectNovel',
-        'ProjectMatchesGE99', 'ProjectMatchesGE97', 'ProjectMatchesGE95',
-        'ProjectNoveltyScore', 'ProjectCrowding', 'ProjectSequencingPriority', 'ProjectNearestQueryCoverage', 'ProjectNearestAlignmentLength', 'ProjectDensitySource',
-        'ReferenceNearestIdentity', 'ReferenceNearestHit', 'ReferenceNovel',
-        'ReferenceMatchesGE99', 'ReferenceMatchesGE97', 'ReferenceMatchesGE95',
-        'ReferenceNoveltyScore', 'ReferenceCrowding', 'ReferenceSequencingPriority', 'ReferenceNearestQueryCoverage', 'ReferenceNearestAlignmentLength', 'ReferenceDensitySource',
+        'NoveltyScore', 'Crowding', 'SequencingPriority', 'NearestQueryCoverage',
+        'NearestAlignmentLength', 'DensitySource',
+    ]
+    headers = ['ID']
+    headers.extend(metric_fields)
+    for prefix in ('Hungate', 'SecondaryBaseline', 'CulturedRumen', 'Baseline', 'Project', 'Reference'):
+        headers.extend(prefix + field for field in metric_fields)
+    headers.extend([
+        'BaselineEvidenceClass',
         'PartnerID', 'SelectedForGenomeSequencing', 'GenomeAlreadySequenced',
         'NearestGenomeHit', 'NearestGenomeIdentity',
         'GenomeCollectionMatchesGE99', 'GenomeCollectionMatchesGE97', 'GenomeCollectionMatchesGE95',
         'RelatedGenomeCladeGE97',
         'CommittedGenomeCountSameAssessmentSpecies',
+        'HungateGenomeCountSameAssessmentSpecies',
+        'SecondaryBaselineGenomeCountSameAssessmentSpecies',
+        'CulturedRumenGenomeCountSameAssessmentSpecies',
         'BaselineGenomeCountSameAssessmentSpecies',
         'SequencedPartnerGenomeCountSameAssessmentSpecies',
         'SelectedPendingGenomeCountSameAssessmentSpecies',
         'PangenomeTarget', 'PangenomeGap',
         'GenomeSequencingMetadataSource',
-    ]
-
-    def vals(metrics, qid):
-        row = metrics.get(qid) or _empty_pool_metrics([qid])[qid]
-        return [
-            f"{float(row['nearest_identity']):.2f}",
-            row['nearest_hit'],
-            row['novel'],
-            str(row['matches_ge_99']),
-            str(row['matches_ge_97']),
-            str(row['matches_ge_95']),
-            f"{float(row['novelty_score']):.2f}",
-            row['crowding'],
-            row['sequencing_priority'],
-            'NA' if row.get('nearest_query_coverage') is None else f"{float(row['nearest_query_coverage']):.2f}",
-            'NA' if row.get('nearest_alignment_length') is None else str(int(row['nearest_alignment_length'])),
-            row['density_source'],
-        ]
+    ])
 
     with open(output, 'w') as fh:
         fh.write('\t'.join(headers) + '\n')
         sequencing_context = sequencing_context or _empty_sequencing_context(qids)
         for qid in qids:
-            primary = vals(primary_metrics, qid)
-            baseline = vals(baseline_metrics, qid)
-            project = vals(project_metrics, qid)
-            reference = vals(reference_metrics, qid)
+            primary = _metric_values(primary_metrics, qid)
+            hungate = _metric_values(hungate_metrics, qid)
+            secondary = _metric_values(secondary_metrics, qid)
+            cultured = _metric_values(cultured_metrics, qid)
+            baseline_alias = cultured
+            project = _metric_values(project_metrics, qid)
+            reference = _metric_values(reference_metrics, qid)
+            evidence_class = _baseline_evidence_class(qid, hungate_metrics, secondary_metrics, cultured_metrics)
             seq_ctx = sequencing_context.get(qid) or _empty_sequencing_context([qid])[qid]
+            cultured_count = int(seq_ctx.get('genome_same_species_available') or 0)
             sequencing = [
+                evidence_class,
                 seq_ctx['partner_id'],
                 seq_ctx['selected_for_sequencing'],
                 seq_ctx['already_sequenced'],
@@ -1076,14 +1268,17 @@ def _write_novelty_metrics_table(output: Path, qids, primary_metrics, baseline_m
                 str(seq_ctx['genome_ge_95']),
                 seq_ctx['related_genome_clade'],
                 str(seq_ctx['genome_same_species_committed']),
-                str(seq_ctx['genome_same_species_available']),
+                str(seq_ctx.get('genome_same_species_hungate', 0)),
+                str(seq_ctx.get('genome_same_species_secondary_baseline', 0)),
+                str(cultured_count),
+                str(cultured_count),
                 str(seq_ctx['genome_same_species_selected']),
                 str(seq_ctx['genome_same_species_pending']),
                 str(seq_ctx['pangenome_target']),
                 str(seq_ctx['pangenome_gap']),
                 seq_ctx['source'],
             ]
-            fh.write('\t'.join([qid] + primary + baseline + project + reference + sequencing) + '\n')
+            fh.write('\t'.join([qid] + primary + hungate + secondary + cultured + baseline_alias + project + reference + sequencing) + '\n')
     return str(output)
 
 
@@ -1096,6 +1291,8 @@ def build_reference_novelty_metrics(
     run_dataset: Optional[str] = None,
     target_fasta: Optional[str] = None,
     baseline_datasets=None,
+    hungate_datasets=None,
+    secondary_baseline_datasets=None,
     pangenome_target: int = DEFAULT_PANGENOME_TARGET,
 ):
     """Write per-sequence novelty metrics comparing against user-submitted sequences.
@@ -1136,7 +1333,12 @@ def build_reference_novelty_metrics(
         if not tree_pipeline.is_ref_anchor(h)
     ]
 
-    baseline_names = _normalise_dataset_names(baseline_datasets)
+    hungate_names, secondary_names, baseline_names = _discover_tiered_baseline_datasets(
+        db,
+        baseline_datasets=baseline_datasets,
+        hungate_datasets=hungate_datasets,
+        secondary_baseline_datasets=secondary_baseline_datasets,
+    )
 
     all_pool_path: Optional[str] = None
     all_source = 'none'
@@ -1232,53 +1434,45 @@ def build_reference_novelty_metrics(
     else:
         reference_metrics = _empty_pool_metrics(qids, source='none')
 
-    baseline_pool_path: Optional[str] = None
-    baseline_source = 'none'
-    baseline_datasets_found: list[str] = []
-    baseline_count = 0
-    if baseline_names and db is not None:
-        baseline_pool_path, baseline_source, baseline_datasets_found, baseline_count = _build_db_pool_fasta(
-            db=db,
-            outdir=outdir,
-            name='baseline',
-            run_dataset=run_dataset,
-            include_datasets=baseline_names,
+    hungate_pool_path, hungate_metrics, hungate_source, _hungate_found, _hungate_count = _compute_db_pool_metrics(
+        input_fasta=input_fasta,
+        outdir=outdir,
+        qids=qids,
+        db=db,
+        run_dataset=run_dataset,
+        datasets=hungate_names,
+        pool_name='hungate_baseline',
+        source_prefix='hungate_baseline',
+        threads=threads,
+    )
+    secondary_pool_path, secondary_metrics, secondary_source, _secondary_found, _secondary_count = _compute_db_pool_metrics(
+        input_fasta=input_fasta,
+        outdir=outdir,
+        qids=qids,
+        db=db,
+        run_dataset=run_dataset,
+        datasets=secondary_names,
+        pool_name='secondary_baseline',
+        source_prefix='secondary_baseline',
+        threads=threads,
+    )
+    cultured_pool_path, cultured_metrics, cultured_source, cultured_found, cultured_count = _compute_db_pool_metrics(
+        input_fasta=input_fasta,
+        outdir=outdir,
+        qids=qids,
+        db=db,
+        run_dataset=run_dataset,
+        datasets=baseline_names,
+        pool_name='baseline',
+        source_prefix='cultured_rumen',
+        threads=threads,
+    )
+    if baseline_names and db is not None and not cultured_pool_path:
+        raise RuntimeError(
+            f'no cultured-baseline sequences were found for registered dataset(s): {baseline_names}'
         )
-        if baseline_pool_path:
-            baseline_source = 'baseline:' + ','.join(baseline_datasets_found or baseline_names)
-            logger.info(
-                '[NOVELTY] Baseline pool: %d sequences from dataset(s): %s',
-                baseline_count, baseline_datasets_found or baseline_names,
-            )
-        else:
-            raise RuntimeError(
-                f'no cultured-baseline sequences were found for registered dataset(s): {baseline_names}'
-            )
 
-    if baseline_pool_path:
-        baseline_nearest = _run_nearest_search(
-            input_fasta,
-            baseline_pool_path,
-            Path(outdir) / 'novelty_baseline_nearest_matches.tsv',
-            threads=threads,
-        )
-        baseline_density = _run_density_search(
-            input_fasta,
-            baseline_pool_path,
-            Path(outdir) / 'novelty_baseline_density_matches.tsv',
-            threads=threads,
-        )
-        baseline_metrics = _metrics_from_nearest_and_density(
-            qids,
-            baseline_nearest,
-            baseline_density,
-            source=baseline_source,
-            id_threshold=0.97,
-        )
-    else:
-        baseline_metrics = _empty_pool_metrics(qids, source='none')
-
-    primary_metrics = baseline_metrics if baseline_pool_path else all_metrics
+    primary_metrics = cultured_metrics if cultured_pool_path else all_metrics
     sequencing_context = _compute_sequencing_context(
         input_fasta,
         outdir,
@@ -1292,16 +1486,20 @@ def build_reference_novelty_metrics(
         output,
         qids,
         primary_metrics,
-        baseline_metrics,
+        hungate_metrics,
+        secondary_metrics,
+        cultured_metrics,
         all_metrics,
         reference_metrics,
         sequencing_context,
     )
     logger.info(
-        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; baseline=%s; project=%s; reference=%s)',
+        '[NOVELTY] Wrote novelty metrics to %s (primary=%s; hungate=%s; secondary=%s; cultured=%s; project=%s; reference=%s)',
         output,
-        'baseline' if baseline_pool_path else all_source,
-        baseline_source,
+        'cultured_rumen' if cultured_pool_path else all_source,
+        hungate_source,
+        secondary_source,
+        cultured_source,
         all_source,
         reference_source,
     )

@@ -97,7 +97,7 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
 
     Returns rows with normalised keys:
       source_id, partner_id, selected_for_sequencing, genome_available,
-      selected_for_wgs (internal compatibility alias for genome_available)
+      selected_for_wgs (stored alias for genome_available)
     """
     p = Path(path)
     lower = str(p).lower()
@@ -163,8 +163,8 @@ def load_partner_sequencing_metadata(path: str | Path, sheet_name: str | None = 
             'partner_id': partner_id or source_id,
             'selected_for_sequencing': selected_for_sequencing,
             'genome_available': genome_available,
-            # selected_for_wgs is retained internally until the storage schema
-            # can be renamed without ambiguity; it means genome available.
+            # Existing project databases store genome availability in this
+            # field; it does not mean current selection for sequencing.
             'selected_for_wgs': genome_available,
             'raw_selected_value': '' if raw_genome is None else str(raw_genome),
             'raw_commitment_value': '' if raw_selection is None else str(raw_selection),

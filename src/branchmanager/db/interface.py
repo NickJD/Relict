@@ -8,6 +8,23 @@ import logging
 from branchmanager.taxonomy import canonicalise_sequence_id, parse_taxon_string
 
 
+BASELINE_TIERS = {'priority', 'secondary'}
+
+
+def _infer_baseline_tier(dataset: str, explicit: str | None = None) -> str | None:
+    tier = str(explicit or '').strip().lower()
+    if tier in {'hungate', 'primary'}:
+        tier = 'priority'
+    if tier:
+        if tier not in BASELINE_TIERS:
+            raise ValueError('baseline tier must be priority or secondary')
+        return tier
+    dataset_name = str(dataset or '').strip().lower()
+    if not dataset_name:
+        return None
+    return 'priority' if 'hungate' in dataset_name else 'secondary'
+
+
 class Database:
     logger = logging.getLogger(__name__)
 
@@ -424,16 +441,29 @@ class Database:
                 cur.execute('DROP TABLE colors')
             for table, column, definition in (
                 ('sequences', 'dataset', "TEXT DEFAULT 'user'"),
+                ('sequences', 'baseline_tier', 'TEXT'),
                 ('taxonomy', 'dataset', 'TEXT'),
                 ('colours', 'dataset', 'TEXT'),
                 ('distances', 'dataset', 'TEXT'),
+                ('dataset_roles', 'baseline_tier', 'TEXT'),
             ):
                 columns = {row[1] for row in cur.execute(f'PRAGMA table_info({table})')}
                 if column not in columns:
                     cur.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
             cur.execute("UPDATE distances SET dataset = 'gg2' WHERE dataset IS NULL")
+            cur.execute(
+                "UPDATE dataset_roles SET baseline_tier = CASE "
+                "WHEN lower(dataset) LIKE '%hungate%' THEN 'priority' ELSE 'secondary' END "
+                "WHERE role = 'baseline' AND (baseline_tier IS NULL OR baseline_tier = '')"
+            )
+            cur.execute(
+                "UPDATE sequences SET baseline_tier = ("
+                "SELECT r.baseline_tier FROM dataset_roles r WHERE r.dataset = sequences.dataset AND r.role = 'baseline'"
+                ") WHERE (baseline_tier IS NULL OR baseline_tier = '') "
+                "AND dataset IN (SELECT dataset FROM dataset_roles WHERE role = 'baseline')"
+            )
 
-            # Older prototypes had no uniqueness constraint. Retain the newest
+            # Older project databases had no uniqueness constraint. Retain the newest
             # row deterministically before adding the indexes used by upserts.
             cur.execute(
                 'DELETE FROM taxonomy WHERE rowid NOT IN '
@@ -476,7 +506,7 @@ class Database:
             conn.commit()
 
             # Record the first formal schema generation. CREATE TABLE statements
-            # above remain idempotent for databases produced by earlier prototypes.
+            # above remain idempotent for databases created by earlier BranchManager versions.
             cur.execute(
                 'INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)',
                 (1,),
@@ -500,7 +530,7 @@ class Database:
         from branchmanager.utils.fasta import read_fasta
         return [h for h, _ in read_fasta(fasta)]
 
-    def register_filing_cabinet(self, fasta_path, taxa_tsv=None, colour_csv=None, source='filing_cabinet', dataset='Baseline', outdir=None, shorten_ids=False):
+    def register_filing_cabinet(self, fasta_path, taxa_tsv=None, colour_csv=None, source='filing_cabinet', dataset='Baseline', outdir=None, shorten_ids=False, baseline_tier=None):
         """Register Filing Cabinet sequences and optional taxonomy/colours into the database.
 
         - fasta_path: FASTA file of reference sequences to add
@@ -511,6 +541,8 @@ class Database:
         from branchmanager.utils.fasta import read_fasta
         self.logger.info("[DB][FILING CABINET] Reading fasta %s", fasta_path)
         records = [(h, s) for h, s in read_fasta(fasta_path)]
+        dataset = str(dataset or 'Baseline')
+        tier = _infer_baseline_tier(dataset, baseline_tier)
         self.logger.info("[DB][FILING CABINET] Read %d records from %s", len(records), fasta_path)
         alias_entries = []
         # prepare mapping containers so downstream mapping code can reference them
@@ -550,19 +582,23 @@ class Database:
                     cur = conn.cursor()
                     self.logger.info("[DB][FILING CABINET] Inserting %d sequences into DB (dataset=%s)", len(records_to_insert), dataset)
                     seq_rows = []
+                    update_rows = []
                     for sid, seq in records_to_insert:
                         rid = self._provided_id_from_header(sid)
                         if rid is None:
                             continue
-                        seq_rows.append((rid, seq, len(seq), dataset))
-                    cur.executemany("INSERT OR IGNORE INTO sequences (id, sequence, length, dataset) VALUES (?, ?, ?, ?)", seq_rows)
+                        seq_rows.append((rid, seq, len(seq), dataset, tier))
+                        update_rows.append((dataset, tier, rid))
+                    cur.executemany("INSERT OR IGNORE INTO sequences (id, sequence, length, dataset, baseline_tier) VALUES (?, ?, ?, ?, ?)", seq_rows)
+                    if update_rows:
+                        cur.executemany("UPDATE sequences SET dataset = ?, baseline_tier = ? WHERE id = ?", update_rows)
                     if alias_entries:
                         cur.executemany("INSERT OR REPLACE INTO seq_aliases (canonical_id, original_header) VALUES (?, ?)", alias_entries)
                     conn.commit()
                     self.logger.info("[DB][FILING CABINET] Inserted %d sequences and %d alias mappings", len(seq_rows), len(alias_entries))
             except Exception as e:
                 self.logger.warning("[DB][FILING CABINET] Bulk insert failed, falling back to per-record inserts: %s", e)
-                self.insert_sequences(records_to_insert, dataset=dataset)
+                self.insert_sequences(records_to_insert, dataset=dataset, baseline_tier=tier)
                 if alias_entries:
                     self.insert_aliases(alias_entries)
 
@@ -738,32 +774,76 @@ class Database:
             rows = cur.fetchall()
         return [r[0] for r in rows]
 
-    def upsert_dataset_role(self, dataset, role, genomes_available=False):
+    def upsert_dataset_role(self, dataset, role, genomes_available=False, baseline_tier=None):
         """Record whether a dataset is a baseline or partner-candidate collection."""
         dataset = str(dataset or '').strip()
         role = str(role or '').strip().lower()
         if not dataset or role not in ('baseline', 'candidate'):
             raise ValueError('dataset role must be baseline or candidate')
+        tier = _infer_baseline_tier(dataset, baseline_tier) if role == 'baseline' else None
         with self.connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO dataset_roles (dataset, role, genomes_available) VALUES (?, ?, ?)",
-                (dataset, role, 1 if genomes_available else 0),
+                "INSERT INTO dataset_roles (dataset, role, genomes_available, baseline_tier) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(dataset) DO UPDATE SET role=excluded.role, "
+                "genomes_available=excluded.genomes_available, baseline_tier=excluded.baseline_tier",
+                (dataset, role, 1 if genomes_available else 0, tier),
             )
+            if role == 'baseline':
+                conn.execute(
+                    "UPDATE sequences SET baseline_tier = ? WHERE dataset = ?",
+                    (tier, dataset),
+                )
+            else:
+                conn.execute(
+                    "UPDATE sequences SET baseline_tier = NULL WHERE dataset = ?",
+                    (dataset,),
+                )
             conn.commit()
 
     def get_dataset_roles(self):
-        """Return {dataset: {role, genomes_available}} for registered datasets."""
+        """Return {dataset: {role, genomes_available, baseline_tier}} for registered datasets."""
         with self.connect() as conn:
-            rows = conn.execute(
-                "SELECT dataset, role, genomes_available FROM dataset_roles"
-            ).fetchall()
-        return {
-            str(dataset): {
-                'role': str(role),
+            try:
+                rows = conn.execute(
+                    "SELECT dataset, role, genomes_available, baseline_tier FROM dataset_roles"
+                ).fetchall()
+            except Exception:
+                rows = [(*row, None) for row in conn.execute(
+                    "SELECT dataset, role, genomes_available FROM dataset_roles"
+                ).fetchall()]
+        result = {}
+        for dataset, role, genomes_available, baseline_tier in rows:
+            dataset = str(dataset)
+            role = str(role)
+            tier = None
+            if role == 'baseline':
+                tier = _infer_baseline_tier(dataset, baseline_tier)
+            result[dataset] = {
+                'role': role,
                 'genomes_available': bool(genomes_available),
+                'baseline_tier': tier,
             }
-            for dataset, role, genomes_available in rows
-        }
+        return result
+
+    def get_baseline_datasets_by_tier(self):
+        """Return registered baseline datasets split into priority and secondary tiers."""
+        grouped = {'priority': [], 'secondary': []}
+        for dataset, metadata in self.get_dataset_roles().items():
+            if metadata.get('role') != 'baseline':
+                continue
+            tier = metadata.get('baseline_tier') or _infer_baseline_tier(dataset)
+            grouped.setdefault(tier, []).append(dataset)
+        return {tier: sorted(dict.fromkeys(values)) for tier, values in grouped.items()}
+
+    def get_baseline_datasets(self, tier=None):
+        grouped = self.get_baseline_datasets_by_tier()
+        if tier:
+            wanted = _infer_baseline_tier('', tier)
+            return grouped.get(wanted, [])
+        names = []
+        for key in ('priority', 'secondary'):
+            names.extend(grouped.get(key, []))
+        return list(dict.fromkeys(names))
 
     def get_dataset_names_by_role(self, role):
         wanted = str(role or '').strip().lower()
@@ -978,21 +1058,24 @@ class Database:
             cur.execute("SELECT DISTINCT ref_db FROM taxonomy_alt ORDER BY ref_db")
             return [r[0] for r in cur.fetchall()]
 
-    def insert_sequences(self, records, dataset='user'):
+    def insert_sequences(self, records, dataset='user', baseline_tier=None):
         """Insert sequence records into the DB.
 
         records: iterable of (id, seq)
         Uses INSERT OR IGNORE for sequences table (id is PK).
         """
         alias_entries = []
+        tier = _infer_baseline_tier(dataset, baseline_tier) if baseline_tier else None
         with self.connect() as conn:
             cur = conn.cursor()
             for sid, seq in records:
                 rid = self._provided_id_from_header(sid)
                 if rid is None:
                     continue
-                cur.execute("INSERT OR IGNORE INTO sequences (id, sequence, length, dataset) VALUES (?, ?, ?, ?)",
-                            (rid, seq, len(seq), dataset))
+                cur.execute("INSERT OR IGNORE INTO sequences (id, sequence, length, dataset, baseline_tier) VALUES (?, ?, ?, ?, ?)",
+                            (rid, seq, len(seq), dataset, tier))
+                if tier:
+                    cur.execute("UPDATE sequences SET baseline_tier = ? WHERE id = ?", (tier, rid))
                 alias_entries.append((rid, sid))
             conn.commit()
         if alias_entries:
@@ -1104,7 +1187,7 @@ class Database:
     def upsert_sequencing_metadata(self, metadata_rows):
         """Insert/update rolling partner WGS-selection metadata.
 
-        ``selected_for_sequencing`` is a project commitment. The legacy-named
+        ``selected_for_sequencing`` is a project commitment. The older
         ``selected_for_wgs`` column means a genome is already available.
         """
         rows = []

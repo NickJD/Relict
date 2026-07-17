@@ -227,7 +227,8 @@ def _baseline_dataset_names(rows: List[dict]) -> set[str]:
     names: set[str] = set()
     for row in rows:
         source = str(row.get('density_source') or '')
-        if not source.startswith('baseline:'):
+        prefix = source.split(':', 1)[0]
+        if prefix not in {'baseline', 'cultured_rumen', 'hungate_baseline', 'secondary_baseline'}:
             continue
         for name in source.split(':', 1)[1].split(','):
             if name.strip():
@@ -243,15 +244,22 @@ def _load_metadata(db, leaf_names: List[str], assessment_rows: List[dict]) -> Di
                 cur = conn.cursor()
                 placeholders = ','.join('?' for _ in leaf_names)
                 cur.execute(
-                    "SELECT s.id, s.dataset, t.taxonomy "
+                    "SELECT s.id, s.dataset, s.baseline_tier, COALESCE(r.role, ''), "
+                    "COALESCE(r.baseline_tier, ''), t.taxonomy "
                     "FROM sequences s LEFT JOIN taxonomy t ON s.id = t.id "
+                    "LEFT JOIN dataset_roles r ON r.dataset = s.dataset "
                     f"WHERE s.id IN ({placeholders})",
                     tuple(leaf_names),
                 )
-                for sid, dataset, taxonomy in cur.fetchall():
+                for sid, dataset, sequence_tier, role, role_tier, taxonomy in cur.fetchall():
                     entry = metadata.setdefault(str(sid), {'dataset': '', 'taxonomy': ''})
                     entry['dataset'] = entry.get('dataset') or dataset or ''
                     entry['taxonomy'] = entry.get('taxonomy') or taxonomy or ''
+                    tier = sequence_tier or role_tier or ''
+                    if role == 'baseline' and tier not in {'priority', 'secondary'}:
+                        tier = 'priority' if 'hungate' in str(dataset or '').lower() else 'secondary'
+                    if tier in {'priority', 'secondary'}:
+                        entry['baseline_tier'] = tier
         except Exception as exc:
             logger.warning('[NEIGHBOURHOOD] Could not load tree metadata: %s', exc)
         try:
@@ -367,19 +375,27 @@ def _identity_anchor(targets: List[dict], aligned_sequences: Dict[str, str]) -> 
 
 def _baseline_context_for_group(group: dict, leaf_map: Dict[str, _Node]) -> Dict[str, dict]:
     context: Dict[str, dict] = {}
+    hit_specs = (
+        ('priority', 'hungate_nearest_hit', 'hungate_nearest_identity'),
+        ('secondary', 'secondary_baseline_nearest_hit', 'secondary_baseline_nearest_identity'),
+        ('cultured_rumen', 'nearest_hit', 'nearest_identity'),
+    )
     for target in group['targets']:
         row = target['row']
-        hit = str(row.get('nearest_hit') or '').strip()
-        if not hit or hit in ('NA', 'None') or hit not in leaf_map:
-            continue
-        try:
-            identity = float(row.get('nearest_identity'))
-        except (TypeError, ValueError):
-            identity = None
-        entry = context.setdefault(hit, {'identity': identity, 'queries': []})
-        if identity is not None and (entry.get('identity') is None or identity > entry['identity']):
-            entry['identity'] = identity
-        entry['queries'].append(str(row.get('id') or ''))
+        for tier, hit_key, identity_key in hit_specs:
+            hit = str(row.get(hit_key) or '').strip()
+            if not hit or hit in ('NA', 'None') or hit not in leaf_map:
+                continue
+            try:
+                identity = float(row.get(identity_key))
+            except (TypeError, ValueError):
+                identity = None
+            entry = context.setdefault(hit, {'identity': identity, 'queries': [], 'tier': tier})
+            if entry.get('tier') == 'cultured_rumen' and tier in {'priority', 'secondary'}:
+                entry['tier'] = tier
+            if identity is not None and (entry.get('identity') is None or identity > entry['identity']):
+                entry['identity'] = identity
+            entry['queries'].append(str(row.get('id') or ''))
     return context
 
 
@@ -513,7 +529,11 @@ def _figure_geometry(
         if metadata.get(leaf.name.strip(), {}).get('selected_for_sequencing')
         and not metadata.get(leaf.name.strip(), {}).get('selected_for_wgs')
     )
-    baseline_count = sum(1 for leaf in leaves if metadata.get(leaf.name.strip(), {}).get('dataset') in baseline_datasets)
+    hungate_count = sum(1 for leaf in leaves if metadata.get(leaf.name.strip(), {}).get('baseline_tier') == 'priority')
+    secondary_baseline_count = sum(1 for leaf in leaves if metadata.get(leaf.name.strip(), {}).get('baseline_tier') == 'secondary')
+    baseline_count = hungate_count + secondary_baseline_count
+    if baseline_count == 0:
+        baseline_count = sum(1 for leaf in leaves if metadata.get(leaf.name.strip(), {}).get('dataset') in baseline_datasets)
     return {
         'leaves': leaves,
         'assessed_by_leaf': assessed_by_leaf,
@@ -530,6 +550,8 @@ def _figure_geometry(
         'selected_count': selected_count,
         'pending_count': pending_count,
         'baseline_count': baseline_count,
+        'hungate_count': hungate_count,
+        'secondary_baseline_count': secondary_baseline_count,
         'identity_anchor': identity_anchor or '',
         'nearest_baseline_ids': sorted(baseline_context),
     }
@@ -594,6 +616,8 @@ def _write_group_png(
     selected_count = geometry['selected_count']
     pending_count = geometry['pending_count']
     baseline_count = geometry['baseline_count']
+    hungate_count = geometry.get('hungate_count', 0)
+    secondary_baseline_count = geometry.get('secondary_baseline_count', 0)
     identity_anchor = geometry['identity_anchor']
     nearest_baseline_ids = geometry['nearest_baseline_ids']
 
@@ -614,22 +638,25 @@ def _write_group_png(
     draw.text(
         (px(28), px(39)),
         f'{len(assessed_ids)} assessed isolate(s); {len(leaves)} tree leaves; '
-        f'{baseline_count} baseline; {selected_count} sequenced; {pending_count} selected pending',
+        f'{hungate_count} Hungate; {secondary_baseline_count} secondary baseline; '
+        f'{selected_count} sequenced; {pending_count} selected pending',
         fill='#4d5966',
         font=body_font,
     )
     draw.ellipse((px(28), px(76), px(40), px(88)), fill='#1565c0')
     draw.text((px(46), px(73)), 'assessed isolate', fill='#25313d', font=label_font)
     draw.rectangle((px(174), px(76), px(186), px(88)), fill='#2e7d32')
-    draw.text((px(193), px(73)), 'baseline dataset', fill='#25313d', font=label_font)
-    draw.polygon([(px(330), px(75)), (px(337), px(82)), (px(330), px(89)), (px(323), px(82))], fill='#ef6c00')
-    draw.text((px(345), px(73)), 'already sequenced', fill='#25313d', font=label_font)
-    draw.rectangle((px(468), px(76), px(480), px(88)), fill='#ffffff', outline='#b7791f', width=px(2))
-    draw.text((px(487), px(73)), 'selected, genome pending', fill='#25313d', font=label_font)
-    draw.polygon([(px(x), px(y)) for x, y in _star_points(680, 82)], fill='#8e24aa', outline='#5f146f')
-    draw.text((px(693), px(73)), 'sequence next', fill='#25313d', font=label_font)
-    draw.polygon([(px(x), px(y)) for x, y in _star_points(830, 82)], fill='#ffffff', outline='#8e24aa')
-    draw.text((px(843), px(73)), 'backup', fill='#25313d', font=label_font)
+    draw.text((px(193), px(73)), 'Hungate baseline', fill='#25313d', font=label_font)
+    draw.polygon([(px(338), px(75)), (px(346), px(89)), (px(330), px(89))], fill='#00838f')
+    draw.text((px(356), px(73)), 'secondary baseline', fill='#25313d', font=label_font)
+    draw.polygon([(px(520), px(75)), (px(527), px(82)), (px(520), px(89)), (px(513), px(82))], fill='#ef6c00')
+    draw.text((px(535), px(73)), 'sequenced partner', fill='#25313d', font=label_font)
+    draw.rectangle((px(684), px(76), px(696), px(88)), fill='#ffffff', outline='#b7791f', width=px(2))
+    draw.text((px(703), px(73)), 'selected pending', fill='#25313d', font=label_font)
+    draw.polygon([(px(x), px(y)) for x, y in _star_points(846, 82)], fill='#8e24aa', outline='#5f146f')
+    draw.text((px(859), px(73)), 'sequence next', fill='#25313d', font=label_font)
+    draw.polygon([(px(x), px(y)) for x, y in _star_points(990, 82)], fill='#ffffff', outline='#8e24aa')
+    draw.text((px(1003), px(73)), 'backup', fill='#25313d', font=label_font)
     draw.text(
         (px(28), px(101)),
         'Selection labels: [P#] primary; [B#] backup; [D#] post-target diversity; boundary review/exclusion shown in labels',
@@ -660,17 +687,20 @@ def _write_group_png(
         x = node_x[id(leaf)]
         meta = metadata.get(sid, {})
         assessed = sid in assessed_by_leaf
-        baseline = meta.get('dataset') in baseline_datasets
+        baseline_tier = str(meta.get('baseline_tier') or '')
+        baseline = baseline_tier in {'priority', 'secondary'} or meta.get('dataset') in baseline_datasets
         selected = bool(meta.get('selected_for_wgs'))
         pending = bool(meta.get('selected_for_sequencing')) and not selected
         selection_role = str(meta.get('sequencing_set_role') or '').upper()
         if assessed:
             draw.ellipse((px(x - 6), px(y - 6), px(x + 6), px(y + 6)), fill='#1565c0', outline='#0d3f78', width=px(1))
+        elif baseline and baseline_tier == 'secondary':
+            draw.polygon([(px(x), px(y - 6)), (px(x + 6), px(y + 6)), (px(x - 6), px(y + 6))], fill='#00838f')
         elif baseline:
             draw.rectangle((px(x - 5), px(y - 5), px(x + 5), px(y + 5)), fill='#2e7d32')
         else:
             draw.ellipse((px(x - 4), px(y - 4), px(x + 4), px(y + 4)), fill='#8c98a4')
-        if selected:
+        if selected and not baseline:
             sx = x + 12.0
             draw.polygon(
                 [(px(sx), px(y - 6)), (px(sx + 6), px(y)), (px(sx), px(y + 6)), (px(sx - 6), px(y))],

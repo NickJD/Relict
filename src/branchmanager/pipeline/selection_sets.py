@@ -117,6 +117,9 @@ def _stable_set_id(group_key: str, prefix: str = 'BMSET') -> str:
 
 def _novel_looking(rows: Iterable[dict]) -> bool:
     for row in rows:
+        evidence_class = str(row.get('baseline_evidence_class') or '').upper()
+        if evidence_class in {'NOVEL TO BOTH BASELINES', 'HUNGATE GAP / SECONDARY COVERED'}:
+            return True
         baseline = _float(row.get('nearest_identity'))
         reference = _float(row.get('reference_nearest_identity'))
         if baseline is not None and baseline < 98.65:
@@ -126,21 +129,109 @@ def _novel_looking(rows: Iterable[dict]) -> bool:
     return False
 
 
+def _first_present(*values):
+    for value in values:
+        if value not in (None, '', 'NA', 'None'):
+            return value
+    return None
+
+
+def _baseline_hit_records(row: dict, *, include_combined: bool = True) -> list[dict]:
+    records = [
+        {
+            'tier': 'priority',
+            'label': 'Hungate',
+            'hit': row.get('hungate_nearest_hit'),
+            'identity': _float(row.get('hungate_nearest_identity')),
+            'coverage': _float(row.get('hungate_nearest_query_coverage')),
+            'taxonomy': row.get('hungate_nearest_hit_taxonomy'),
+            'dataset': row.get('hungate_nearest_hit_dataset'),
+        },
+        {
+            'tier': 'secondary',
+            'label': 'SecondaryBaseline',
+            'hit': row.get('secondary_baseline_nearest_hit'),
+            'identity': _float(row.get('secondary_baseline_nearest_identity')),
+            'coverage': _float(row.get('secondary_baseline_nearest_query_coverage')),
+            'taxonomy': row.get('secondary_baseline_nearest_hit_taxonomy'),
+            'dataset': row.get('secondary_baseline_nearest_hit_dataset'),
+        },
+    ]
+    if include_combined:
+        records.append({
+            'tier': 'cultured_rumen',
+            'label': 'CulturedRumen',
+            'hit': _first_present(row.get('cultured_rumen_nearest_hit'), row.get('nearest_hit')),
+            'identity': _float(_first_present(row.get('cultured_rumen_nearest_identity'), row.get('nearest_identity'))),
+            'coverage': _float(_first_present(row.get('cultured_rumen_nearest_query_coverage'), row.get('nearest_query_coverage'))),
+            'taxonomy': _first_present(row.get('cultured_rumen_nearest_hit_taxonomy'), row.get('nearest_hit_taxonomy')),
+            'dataset': _first_present(row.get('cultured_rumen_nearest_hit_dataset'), row.get('nearest_hit_dataset')),
+        })
+    deduped = []
+    seen = set()
+    for record in records:
+        hit = str(record.get('hit') or '').strip()
+        if hit in {'', 'NA', 'None'}:
+            continue
+        key = (record['label'], hit)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return deduped
+
+
+def _baseline_evidence_rank(row: dict) -> int:
+    evidence_class = str(row.get('baseline_evidence_class') or '').strip().upper()
+    ranks = {
+        'NOVEL TO BOTH BASELINES': 4,
+        'HUNGATE GAP / SECONDARY COVERED': 3,
+        'HUNGATE COVERED': 2,
+        'NO CULTURED BASELINE AVAILABLE': 1,
+        'CULTURED BASELINE REDUNDANT': 0,
+    }
+    if evidence_class in ranks:
+        return ranks[evidence_class]
+    identity = _float(row.get('nearest_identity'))
+    coverage = _float(row.get('nearest_query_coverage'))
+    if identity is not None and coverage is not None and identity >= DEFAULT_BASELINE_REDUNDANCY_IDENTITY and coverage >= DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE:
+        return 0
+    if identity is not None and identity < DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY:
+        return 4
+    return 1
+
+
 def baseline_redundancy_evidence(
     row: dict,
     identity_threshold: float = DEFAULT_BASELINE_REDUNDANCY_IDENTITY,
     min_query_coverage: float = DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE,
 ) -> tuple[bool, Optional[float], Optional[float]]:
-    """Return whether a candidate is near-identical to a cultured baseline marker."""
-    identity = _float(row.get('nearest_identity'))
-    coverage = _float(row.get('nearest_query_coverage'))
-    redundant = bool(
-        identity is not None
-        and coverage is not None
-        and identity >= float(identity_threshold)
-        and coverage >= float(min_query_coverage)
-    )
-    return redundant, identity, coverage
+    """Return whether a candidate is near-identical to either cultured baseline tier."""
+    hits = _baseline_hit_records(row, include_combined=False)
+    if not hits:
+        hits = _baseline_hit_records(row, include_combined=True)
+    if not hits:
+        identity = _float(_first_present(row.get('cultured_rumen_nearest_identity'), row.get('nearest_identity')))
+        coverage = _float(_first_present(row.get('cultured_rumen_nearest_query_coverage'), row.get('nearest_query_coverage')))
+        redundant = bool(
+            identity is not None and coverage is not None
+            and identity >= float(identity_threshold)
+            and coverage >= float(min_query_coverage)
+        )
+        return redundant, identity, coverage
+    observed = [record for record in hits if record.get('identity') is not None]
+    best = max(observed, key=lambda record: record['identity'], default=None)
+    redundant_hits = [
+        record for record in hits
+        if record.get('identity') is not None
+        and record.get('coverage') is not None
+        and record['identity'] >= float(identity_threshold)
+        and record['coverage'] >= float(min_query_coverage)
+    ]
+    if redundant_hits:
+        winner = max(redundant_hits, key=lambda record: (record['identity'], record['coverage'] or 0.0))
+        return True, winner.get('identity'), winner.get('coverage')
+    return False, (best or {}).get('identity'), (best or {}).get('coverage')
 
 
 def baseline_extension_evidence(
@@ -148,43 +239,68 @@ def baseline_extension_evidence(
     min_identity: float = DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY,
     min_query_coverage: float = DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
 ) -> tuple[bool, str, str]:
-    """Test whether a candidate can extend the pangenome of its nearest baseline isolate."""
-    hit = str(row.get('nearest_hit') or '').strip()
-    if hit in {'', 'NA', 'None'}:
-        return False, 'BASELINE_HIT_UNAVAILABLE', 'no cultured-baseline hit is available'
+    """Test whether a candidate can extend either cultured-rumen baseline tier."""
     candidate_species = _species(row.get('taxonomy'))
-    baseline_species = _species(row.get('nearest_hit_taxonomy'))
     if not candidate_species:
         return False, 'CANDIDATE_SPECIES_UNRESOLVED', 'candidate GTDB species is unresolved'
-    if not baseline_species:
-        return False, 'BASELINE_SPECIES_UNRESOLVED', 'nearest cultured-baseline species is unresolved'
-    if normalise_taxon_name(candidate_species) != normalise_taxon_name(baseline_species):
+    hits = _baseline_hit_records(row, include_combined=False)
+    if not hits:
+        hits = _baseline_hit_records(row, include_combined=True)
+    if not hits:
+        return False, 'BASELINE_HIT_UNAVAILABLE', 'no cultured-baseline hit is available'
+
+    failures: list[tuple[str, str]] = []
+    for record in hits:
+        hit = str(record.get('hit') or '').strip()
+        baseline_species = _species(record.get('taxonomy'))
+        label = str(record.get('label') or 'Baseline')
+        status_prefix = {
+            'Hungate': 'HUNGATE_BASELINE',
+            'SecondaryBaseline': 'SECONDARY_BASELINE',
+            'CulturedRumen': 'BASELINE',
+        }.get(label, 'BASELINE')
+        eligible_status = {
+            'Hungate': 'ELIGIBLE_HUNGATE_BASELINE_EXTENSION',
+            'SecondaryBaseline': 'ELIGIBLE_SECONDARY_BASELINE_EXTENSION',
+            'CulturedRumen': 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION',
+        }.get(label, 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION')
+        if not baseline_species:
+            failures.append((
+                f'{status_prefix}_SPECIES_UNRESOLVED',
+                f'{label} hit {hit} has unresolved species',
+            ))
+            continue
+        if normalise_taxon_name(candidate_species) != normalise_taxon_name(baseline_species):
+            failures.append((
+                f'{status_prefix}_SPECIES_MISMATCH',
+                f'candidate species {candidate_species} differs from {label} species {baseline_species}',
+            ))
+            continue
+        identity = record.get('identity')
+        if identity is None or identity < float(min_identity):
+            observed = 'unavailable' if identity is None else f'{identity:.2f}%'
+            failures.append((
+                f'{status_prefix}_IDENTITY_BELOW_EXTENSION_THRESHOLD',
+                f'{label} identity {observed} is below {float(min_identity):.2f}%',
+            ))
+            continue
+        coverage = record.get('coverage')
+        if coverage is None or coverage < float(min_query_coverage):
+            observed = 'unavailable' if coverage is None else f'{coverage:.2f}%'
+            failures.append((
+                f'{status_prefix}_COVERAGE_BELOW_EXTENSION_THRESHOLD',
+                f'{label} query coverage {observed} is below {float(min_query_coverage):.2f}%',
+            ))
+            continue
         return (
-            False,
-            'BASELINE_SPECIES_MISMATCH',
-            f'candidate species {candidate_species} differs from baseline species {baseline_species}',
+            True,
+            eligible_status,
+            f'exact species agreement with {hit}; {identity:.2f}% identity across {coverage:.2f}% of the query',
         )
-    identity = _float(row.get('nearest_identity'))
-    if identity is None or identity < float(min_identity):
-        observed = 'unavailable' if identity is None else f'{identity:.2f}%'
-        return (
-            False,
-            'BASELINE_IDENTITY_BELOW_EXTENSION_THRESHOLD',
-            f'nearest cultured-baseline identity {observed} is below {float(min_identity):.2f}%',
-        )
-    coverage = _float(row.get('nearest_query_coverage'))
-    if coverage is None or coverage < float(min_query_coverage):
-        observed = 'unavailable' if coverage is None else f'{coverage:.2f}%'
-        return (
-            False,
-            'BASELINE_COVERAGE_BELOW_EXTENSION_THRESHOLD',
-            f'nearest cultured-baseline query coverage {observed} is below {float(min_query_coverage):.2f}%',
-        )
-    return (
-        True,
-        'ELIGIBLE_BASELINE_PANGENOME_EXTENSION',
-        f'exact species agreement with {hit}; {identity:.2f}% identity across {coverage:.2f}% of the query',
-    )
+
+    if failures:
+        return False, failures[0][0], failures[0][1]
+    return False, 'BASELINE_EXTENSION_CRITERIA_NOT_MET', 'no cultured-baseline tier met extension criteria'
 
 
 def _evidence_tuple(row: dict) -> tuple:
@@ -196,6 +312,7 @@ def _evidence_tuple(row: dict) -> tuple:
     mwl = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
     mwl_score = _float(row.get('mwl_score'), 0.0)
     return (
+        _baseline_evidence_rank(row),
         100.0 - float(baseline),
         100.0 - float(project),
         100.0 - float(reference),
@@ -345,25 +462,43 @@ def build_sequencing_sets(
         committed_ids = committed_by_species.get(species_key, []) if species_key else [
             str(row.get('id')) for row in members if _committed(row)
         ]
-        baseline_count = max((_int(row.get('genome_available_count_same_species')) for row in members), default=0)
+        hungate_count = max((_int(row.get('hungate_genome_count_same_species')) for row in members), default=0)
+        secondary_count = max((_int(row.get('secondary_baseline_genome_count_same_species')) for row in members), default=0)
+        prior_baseline_count = max((_int(row.get('genome_available_count_same_species')) for row in members), default=0)
+        if hungate_count + secondary_count == 0 and prior_baseline_count:
+            hungate_count = prior_baseline_count
+        baseline_count = hungate_count + secondary_count
         selected_count = max((_int(row.get('genome_selected_count_same_species')) for row in members), default=0)
         pending_count = max((_int(row.get('genome_pending_count_same_species')) for row in members), default=0)
         committed_count = max(baseline_count + selected_count + pending_count, len(committed_ids))
         gap = max(0, target - committed_count)
         novel_clade = _novel_looking(members)
-        is_baseline_extension = bool(species and baseline_count > 0)
-        group_type = 'BASELINE_PANGENOME_EXTENSION' if is_baseline_extension else 'CANDIDATE_PANGENOME_GROUP'
-        basis = (
-            'baseline-pangenome extension: exact species + close full-length marker'
-            if is_baseline_extension else basis
-        )
-        set_id = _stable_set_id(group_key, 'BMEXT' if is_baseline_extension else 'BMSET')
-        baseline_anchor_ids = sorted({
-            str(row.get('nearest_hit')) for row in members
-            if str(row.get('nearest_hit') or '') not in {'', 'NA', 'None'}
-            and _species(row.get('nearest_hit_taxonomy'))
-            and normalise_taxon_name(_species(row.get('nearest_hit_taxonomy'))) == species_key
-        })
+        if species and hungate_count > 0:
+            group_type = 'HUNGATE_BASELINE_EXTENSION'
+            basis = 'Hungate-anchored pangenome extension: exact species + close full-length marker'
+            set_prefix = 'BMEXT'
+        elif species and secondary_count > 0:
+            group_type = 'SECONDARY_BASELINE_EXTENSION'
+            basis = 'secondary cultured-rumen baseline extension: exact species + close full-length marker'
+            set_prefix = 'BMEXT'
+        else:
+            group_type = 'CANDIDATE_ONLY_GROUP'
+            set_prefix = 'BMSET'
+        is_baseline_extension = group_type != 'CANDIDATE_ONLY_GROUP'
+        set_id = _stable_set_id(group_key, set_prefix)
+
+        def same_species_hits(hit_key: str, tax_key: str) -> set[str]:
+            return {
+                str(row.get(hit_key)) for row in members
+                if str(row.get(hit_key) or '') not in {'', 'NA', 'None'}
+                and _species(row.get(tax_key))
+                and normalise_taxon_name(_species(row.get(tax_key))) == species_key
+            }
+
+        hungate_anchor_ids = sorted(same_species_hits('hungate_nearest_hit', 'hungate_nearest_hit_taxonomy'))
+        secondary_anchor_ids = sorted(same_species_hits('secondary_baseline_nearest_hit', 'secondary_baseline_nearest_hit_taxonomy'))
+        cultured_anchor_ids = sorted(same_species_hits('nearest_hit', 'nearest_hit_taxonomy'))
+        baseline_anchor_ids = sorted(set(hungate_anchor_ids + secondary_anchor_ids + cultured_anchor_ids))
 
         for row in members:
             row.update({
@@ -458,7 +593,12 @@ def build_sequencing_sets(
                 'GroupBasis': basis,
                 'AssessmentTaxon': taxon,
                 'BaselineAnchorIDs': ';'.join(baseline_anchor_ids) or 'None',
+                'HungateAnchorIDs': ';'.join(hungate_anchor_ids) or 'None',
+                'SecondaryBaselineAnchorIDs': ';'.join(secondary_anchor_ids) or 'None',
                 'NovelLookingClade': 'Yes' if novel_clade else 'No',
+                'HungateBaselineGenomes': hungate_count,
+                'SecondaryBaselineGenomes': secondary_count,
+                'CulturedRumenBaselineGenomes': baseline_count,
                 'BaselineGenomes': baseline_count,
                 'SequencedPartnerGenomes': selected_count,
                 'SelectedPendingGenomes': pending_count,
@@ -476,6 +616,13 @@ def build_sequencing_sets(
                 'SetRole': row.get('sequencing_set_role', 'NA'),
                 'SetRank': row.get('sequencing_set_rank', 'NA'),
                 'EvidenceQuality': _evidence_quality(row),
+                'BaselineEvidenceClass': row.get('baseline_evidence_class', 'NA'),
+                'HungateNearestIdentity': row.get('hungate_nearest_identity', 'NA'),
+                'HungateNearestQueryCoverage': row.get('hungate_nearest_query_coverage', 'NA'),
+                'SecondaryBaselineNearestIdentity': row.get('secondary_baseline_nearest_identity', 'NA'),
+                'SecondaryBaselineNearestQueryCoverage': row.get('secondary_baseline_nearest_query_coverage', 'NA'),
+                'CulturedRumenNearestIdentity': row.get('cultured_rumen_nearest_identity', row.get('nearest_identity', 'NA')),
+                'CulturedRumenNearestQueryCoverage': row.get('cultured_rumen_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
                 'BaselineNearestIdentity': row.get('nearest_identity', 'NA'),
                 'BaselineNearestQueryCoverage': row.get('nearest_query_coverage', 'NA'),
                 'BaselineRedundancyStatus': row.get('baseline_redundancy_status', 'NA'),
@@ -504,11 +651,16 @@ def build_sequencing_sets(
     ))
     fields = list(output_rows[0]) if output_rows else [
         'SetID', 'GroupType', 'GroupBasis', 'AssessmentTaxon', 'BaselineAnchorIDs',
-        'NovelLookingClade', 'BaselineGenomes',
+        'HungateAnchorIDs', 'SecondaryBaselineAnchorIDs',
+        'NovelLookingClade', 'HungateBaselineGenomes', 'SecondaryBaselineGenomes',
+        'CulturedRumenBaselineGenomes', 'BaselineGenomes',
         'SequencedPartnerGenomes', 'SelectedPendingGenomes', 'CommittedGenomeCount', 'CommittedGenomeIDs',
         'PangenomeTarget', 'PangenomeGap', 'DiversityPanelSize', 'EligibleCandidateCount',
         'RankedCandidateCount', 'BaselineRedundantCount', 'UnfilledPanelRanks',
         'CandidateID', 'PartnerID', 'SetRole', 'SetRank', 'EvidenceQuality',
+        'BaselineEvidenceClass', 'HungateNearestIdentity', 'HungateNearestQueryCoverage',
+        'SecondaryBaselineNearestIdentity', 'SecondaryBaselineNearestQueryCoverage',
+        'CulturedRumenNearestIdentity', 'CulturedRumenNearestQueryCoverage',
         'BaselineNearestIdentity', 'BaselineNearestQueryCoverage', 'BaselineRedundancyStatus',
         'BaselineRedundancyIdentityThreshold', 'BaselineRedundancyMinQueryCoverage',
         'BaselineExtensionStatus', 'BaselineExtensionMinIdentity',

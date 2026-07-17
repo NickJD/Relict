@@ -319,7 +319,7 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
             with open(path, 'rb') as handle:
                 record = SeqIO.read(handle, 'abi')
     except Exception as biopython_error:
-        # Some legacy/minimal ABIF writers use non-standard PCON encodings that
+        # Some older/minimal ABIF writers use non-standard PCON encodings that
         # Biopython rejects. Preserve their calls and qualities for review, but
         # do not claim chromatogram-level evidence without decoded trace arrays.
         entries = _read_abif_entries(path)
@@ -343,7 +343,7 @@ def _read_ab1_details(path: str | Path) -> dict[str, object]:
             'trace_channels': {},
             'secondary_peak_ratios': [0.0] * len(sequence),
             'secondary_peak_bases': [''] * len(sequence),
-            'parser_warning': 'legacy_abif_calls_only',
+            'parser_warning': 'abif_calls_only',
         }
     sequence = str(record.seq).strip().upper()
     sequence = ''.join(base if base in IUPAC_BASES else 'N' for base in sequence)
@@ -2557,12 +2557,12 @@ def run_paper_trail(
     qc_policy_tsv = out / 'paper_trail_qc_policy.tsv'
     visual_root = out / 'visual_reports'
     visual_manifest_tsv = visual_root / 'visual_report_manifest.tsv'
-    for obsolete_name in (
+    for stale_output_name in (
         'read_error_profiles.png', 'trace_chromatograms.png', 'assembly_overview.png',
     ):
-        obsolete_path = out / obsolete_name
-        if obsolete_path.exists():
-            obsolete_path.unlink()
+        stale_output_path = out / stale_output_name
+        if stale_output_path.exists():
+            stale_output_path.unlink()
     summary_txt = out / 'paper_trail_summary.txt'
     failed_qc_dir = out / 'failed_qc_sequences'
     failed_final_fasta = failed_qc_dir / 'failed_final_sequences.fasta'

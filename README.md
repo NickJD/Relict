@@ -1,6 +1,6 @@
 # BranchManager
 
-**Working research prototype. Use with caution.**
+**Research workflow for marker-gene assessment and genome-candidate selection.**
 
 **Marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation for genome-sequencing candidate selection.**
 
@@ -591,13 +591,15 @@ When `--collapse` is enabled, BranchManager groups sequences sharing ≥ `--coll
 
 This table keeps the novelty lenses separate:
 
-- `Baseline*`: nearest hit and density against explicit cultured/baseline datasets such as Hungate.
+- `Hungate*`: nearest hit, identity, query coverage, novelty, and density against priority Hungate baselines.
+- `SecondaryBaseline*`: the same evidence against secondary cultured-rumen baseline datasets.
+- `CulturedRumen*`: closest evidence across Hungate and secondary baseline tiers combined.
 - `Project*`: nearest hit and density against all partner candidates accumulated across runs, including the current collection but excluding each query's self-hit.
 - `Reference*`: nearest hit and density against the selected external reference FASTA supplied with `--ref`, usually GTDB.
 - `GenomeCollection*` / `Pangenome*`: rolling genome coverage. Every baseline isolate counts because its genome is available; partner isolates count once selected. The default target is nine committed genomes per exact GTDB species or unresolved local clade.
-- `SelectionGroupType`: `BASELINE_PANGENOME_EXTENSION` (`BMEXT_*`) means at least one baseline genome anchors the exact GTDB species; `CANDIDATE_PANGENOME_GROUP` (`BMSET_*`) has no baseline-genome anchor.
-- `BaselineExtension*`: membership gate for a baseline-pangenome extension. The candidate and nearest baseline must have the same exact GTDB species, with >=98.65% 16S identity across >=95% of the query by default. A failed gate is `PANGENOME_BOUNDARY_REVIEW`, not an automatic rejection: it may represent a separate candidate lineage.
-- `BaselineRedundancy*`: hard eligibility gate for uncommitted candidates. By default, a nearest cultured-baseline hit at >=99.8% identity across >=95% of the query is reported as `BASELINE_REDUNDANT` and receives no panel rank.
+- `SelectionGroupType`: `HUNGATE_BASELINE_EXTENSION` means a Hungate genome anchors the exact GTDB species, `SECONDARY_BASELINE_EXTENSION` means only secondary cultured-rumen genomes anchor it, and `CANDIDATE_ONLY_GROUP` has no baseline-genome anchor.
+- `BaselineExtension*`: membership gate for a baseline-pangenome extension. The candidate and nearest cultured-rumen baseline must have the same exact GTDB species, with >=98.65% 16S identity across >=95% of the query by default. A failed gate is `PANGENOME_BOUNDARY_REVIEW`, not an automatic rejection: it may represent a separate candidate lineage.
+- `BaselineRedundancy*`: hard eligibility gate for uncommitted candidates. By default, a nearest cultured-rumen hit at >=99.8% identity across >=95% of the query is reported as `BASELINE_REDUNDANT` and receives no panel rank.
 - `SelectionDiversityDistance`: marginal patristic distance from baseline and already committed genome markers when tree distances are available. This drives farthest-first diversity capture; cultured-baseline, project, and GTDB-reference divergence provide the fallback, with MWL evidence used as an additional tie-break signal.
 
 A species represented by one baseline genome therefore starts at `1/9`, leaving eight primary genome slots. Eligible partner isolates are ranked to extend that baseline pangenome; additional ranked isolates can be retained as extraction-failure/diversity backups. MWL evidence can order eligible isolates but cannot override the species/coverage boundary or the near-identical baseline exclusion.

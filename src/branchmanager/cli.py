@@ -446,8 +446,8 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "",
         "`assessment/novelty_metrics.tsv` contains cultured-baseline novelty, rolling project novelty, GTDB-reference context, and genome-collection coverage.",
         "",
-        "- Leading `Nearest*`, `NoveltyScore`, `Crowding`, and `SequencingPriority` columns mirror the baseline/cultured comparison when a baseline pool exists; otherwise they mirror project novelty.",
-        "- `Baseline*` columns compare only against explicit baseline datasets such as Hungate or datasets supplied with `--novelty-baseline-dataset`.",
+        "- Leading `Nearest*`, `NoveltyScore`, `Crowding`, and `SequencingPriority` columns mirror the cultured-rumen comparison when a baseline pool exists; otherwise they mirror project novelty.",
+        "- `Hungate*`, `SecondaryBaseline*`, and `CulturedRumen*` columns keep priority, secondary, and combined cultured-rumen evidence separate.",
         "- `Project*` columns compare against all partner candidate datasets, including the current rolling collection and excluding each query's self-hit. Baseline datasets are not mixed into this pool.",
         "- `Reference*` columns compare against the chosen external reference FASTA supplied with `--ref`, usually GTDB. These are separate from the baseline/project novelty scores.",
         "- `GenomeCollection*` columns compare against every baseline genome and every partner isolate with a genome already available. Exact same-GTDB-species counts drive the nine-genome target, while baseline identity and query coverage prevent near-identical cultured isolates from consuming diversity-panel ranks.",
@@ -545,8 +545,8 @@ def _write_output_explanations(outdir: str):
         ('novelty_matches.tsv', 'vsearch BLAST-like output used to compute nearest-neighbour novelty identities.'),
         ('novelty_metrics.tsv', (
             'Per-sequence novelty metrics. The leading Nearest*/NoveltyScore columns mirror the '
-            'baseline/cultured comparison when available; explicit Baseline* columns compare against '
-            'datasets such as Hungate, and Project* columns compare against all partner candidates '
+            'cultured-rumen comparison when available; explicit Hungate*, SecondaryBaseline*, and '
+            'CulturedRumen* columns separate baseline-tier evidence, and Project* columns compare against all partner candidates '
             'stored in the DB. Reference* columns compare against the external reference FASTA, usually '
             'GTDB. GenomeCollection* and Pangenome* columns add rolling genome-coverage context. '
             'DensitySource columns name the comparison pool.'
@@ -800,6 +800,7 @@ def _organise_run_outputs(outdir: str, *, primary_db_name: str | None = None):
         'itol_family_colours.itol': 'family.itol',
         'itol_genus_colours.itol': 'genus.itol',
         'itol_dataset_membership.itol': 'dataset_membership.itol',
+        'itol_baseline_tier.itol': 'baseline_tier.itol',
         'itol_novelty.itol': 'novelty.itol',
         'itol_user_colours.itol': 'user_colours.itol',
         'filing_cabinet_dataset.itol': 'filing_cabinet_dataset.itol',
@@ -922,7 +923,13 @@ def _load_performance_review_baseline(
         )
 
     log = logging.getLogger(__name__)
-    db.upsert_dataset_role(baseline_dataset, 'baseline', genomes_available=True)
+    baseline_tier = _normalise_cli_baseline_tier(
+        baseline_dataset, getattr(args, 'baseline_tier', None),
+    )
+    db.upsert_dataset_role(
+        baseline_dataset, 'baseline', genomes_available=True,
+        baseline_tier=baseline_tier,
+    )
     baseline_out = Path(outdir) / 'filing_cabinet_baseline'
     baseline_out.mkdir(parents=True, exist_ok=True)
 
@@ -940,6 +947,7 @@ def _load_performance_review_baseline(
         dataset=baseline_dataset,
         outdir=str(baseline_out),
         shorten_ids=bool(getattr(args, 'baseline_shorten_ids', False)),
+        baseline_tier=baseline_tier,
     )
 
     try:
@@ -1157,6 +1165,16 @@ def _resolve_reference_inputs(
     return effective_ref, effective_taxa, assignments_tsv
 
 
+def _normalise_cli_baseline_tier(dataset: str, explicit: str | None = None) -> str:
+    value = str(explicit or '').strip().lower()
+    if value in {'primary', 'hungate'}:
+        value = 'priority'
+    if value in {'priority', 'secondary'}:
+        return value
+    dataset_name = str(dataset or '').strip().lower()
+    return 'priority' if 'hungate' in dataset_name else 'secondary'
+
+
 def _resolve_novelty_baseline_datasets(db, args) -> list[str]:
     """Return every registered cultured baseline plus explicit current-run additions."""
     roles = db.get_dataset_roles()
@@ -1187,10 +1205,14 @@ def _cmd_filing_cabinet_impl(args):
         "[FILING CABINET] Sequence-domain profile: %s",
         _sequence_domain_label(requested_kingdom),
     )
+    baseline_tier = _normalise_cli_baseline_tier(
+        getattr(args, 'dataset', 'Baseline'), getattr(args, 'baseline_tier', None),
+    )
     db.upsert_dataset_role(
         getattr(args, 'dataset', 'Baseline'),
         'baseline',
         genomes_available=True,
+        baseline_tier=baseline_tier,
     )
 
     alias_entries, mapped_fasta = db.register_filing_cabinet(
@@ -1201,6 +1223,7 @@ def _cmd_filing_cabinet_impl(args):
         dataset=getattr(args, 'dataset', 'Baseline'),
         outdir=outdir,
         shorten_ids=bool(getattr(args, 'shorten_ids', False)),
+        baseline_tier=baseline_tier,
     )
     try:
         if alias_entries:
@@ -1504,6 +1527,9 @@ def _cmd_filing_cabinet_impl(args):
                 id_to_colour = {iid: ds_colour for (iid,) in cur.fetchall()}
             itol.write_dataset_colourstrip(str(itol_path), dataset_label, id_to_colour, legend_title=f"{dataset_label} legend")
             logging.getLogger(__name__).info("[FILING CABINET] Wrote dataset iTOL colour strip to %s", itol_path)
+            tier_path = out_p / 'baseline_tier.itol'
+            itol.write_baseline_tier_strip(str(tier_path), list(id_to_colour), {iid: baseline_tier for iid in id_to_colour})
+            logging.getLogger(__name__).info("[FILING CABINET] Wrote baseline-tier iTOL colour strip to %s", tier_path)
         except Exception as e:
             logging.getLogger(__name__).warning("[FILING CABINET] Failed to write dataset iTOL colour strip: %s", e)
     except Exception:
@@ -1975,7 +2001,10 @@ def _cmd_performance_review_impl(args):
     # run datasets into the rolling candidate collection.
     novelty_baseline_datasets = _resolve_novelty_baseline_datasets(db, args)
     for baseline_name in novelty_baseline_datasets:
-        db.upsert_dataset_role(baseline_name, 'baseline', genomes_available=True)
+        db.upsert_dataset_role(
+            baseline_name, 'baseline', genomes_available=True,
+            baseline_tier=_normalise_cli_baseline_tier(baseline_name),
+        )
     try:
         registered_roles = db.get_dataset_roles()
         with db.connect() as conn:
@@ -2297,6 +2326,27 @@ def _cmd_performance_review_impl(args):
         membership_path = Path(outdir) / 'itol_dataset_membership.itol'
         itol.write_dataset_membership_strip(str(membership_path), ids_in_order, ds_map)
         logging.getLogger(__name__).info("[ITOL] Wrote dataset membership ITOL to %s", membership_path)
+        tier_map = {}
+        try:
+            with db.connect() as conn:
+                cur = conn.cursor()
+                placeholders = ','.join('?' for _ in ids_in_order) if ids_in_order else ''
+                if placeholders:
+                    cur.execute(
+                        "SELECT s.id, COALESCE(NULLIF(s.baseline_tier, ''), r.baseline_tier), COALESCE(r.role, '') "
+                        "FROM sequences s LEFT JOIN dataset_roles r ON r.dataset = s.dataset "
+                        f"WHERE s.id IN ({placeholders})",
+                        tuple(ids_in_order),
+                    )
+                    for iid_row, tier, role in cur.fetchall():
+                        if role == 'baseline' and str(tier or '').strip().lower() in {'priority', 'secondary'}:
+                            tier_map[iid_row] = str(tier).strip().lower()
+        except Exception:
+            tier_map = {}
+        if tier_map:
+            tier_path = Path(outdir) / 'itol_baseline_tier.itol'
+            itol.write_baseline_tier_strip(str(tier_path), ids_in_order, tier_map)
+            logging.getLogger(__name__).info("[ITOL] Wrote baseline-tier ITOL to %s", tier_path)
     except Exception as e:
         logging.getLogger(__name__).warning("[ITOL] Failed to write dataset membership ITOL: %s", e)
 
@@ -2475,9 +2525,12 @@ def _cmd_performance_review_impl(args):
                             len(assessment_rows),
                         )
                         if _neighbourhood_result['resolved'] != len(assessment_rows):
-                            raise RuntimeError(
-                                f"local tree context resolved {_neighbourhood_result['resolved']}/"
-                                f"{len(assessment_rows)} assessed sequences"
+                            logging.getLogger(__name__).warning(
+                                "[NEIGHBOURHOOD] Local tree context resolved %d/%d assessed "
+                                "sequences; unresolved rows remain in neighbourhood_manifest.tsv "
+                                "with LocalNeighbourhoodFigure=NA",
+                                _neighbourhood_result['resolved'],
+                                len(assessment_rows),
                             )
                     else:
                         logging.getLogger(__name__).warning(
@@ -3251,6 +3304,8 @@ def build_parser():
         help='Output directory for tree, iTOL files, and reports (default: current directory).')
     filing_cabinet_parser.add_argument('--dataset', required=True,
         help='Label for this dataset stored in the DB (e.g. Hungate). Used to colour iTOL strips.')
+    filing_cabinet_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None,
+        help='Cultured baseline tier for this dataset: priority for Hungate, secondary for other rumen isolate genomes. Inferred from --dataset when omitted.')
     filing_cabinet_parser.add_argument('--shorten-ids', dest='shorten_ids',
         action=argparse.BooleanOptionalAction, default=False,
         help='Replace input headers with compact IDs (e.g. HUN001). Default is to preserve the IDs exactly as supplied.')
@@ -3389,6 +3444,8 @@ def build_parser():
         help='Optional baseline/context FASTA to load before evaluating the new sequences (e.g. Hungate 16S).')
     performance_review_parser.add_argument('--baseline-dataset', dest='baseline_dataset', required=False, default='Baseline',
         help='Dataset label for --baseline-fasta in the DB and default cultured-baseline novelty pool (default: Baseline). Must differ from --dataset.')
+    performance_review_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None,
+        help='Cultured baseline tier for --baseline-fasta: priority for Hungate, secondary for other rumen isolate genomes. Inferred from --baseline-dataset when omitted.')
     performance_review_parser.add_argument('--novelty-baseline-dataset', dest='novelty_baseline_datasets', action='append', default=[],
         help='Existing DB dataset label to include in the baseline/cultured novelty pool (repeatable; useful for Hungate plus other cultured isolate sets).')
     performance_review_parser.add_argument('--baseline-taxa-assignments', dest='baseline_taxa_assignments', required=False, default=None,
@@ -3950,6 +4007,7 @@ def build_parser():
     assistant_parser.add_argument('--alt-ref-name', action='append', default=[])
     assistant_parser.add_argument('--baseline-fasta', default=None)
     assistant_parser.add_argument('--baseline-dataset', default='Baseline')
+    assistant_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None)
     assistant_parser.add_argument('--baseline-taxa-assignments', default=None)
     assistant_parser.add_argument('--mwl', default=None)
     assistant_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default='bacteria')
@@ -4803,6 +4861,7 @@ def cmd_assistant(args):
             alt_ref=args.alt_ref, alt_taxa=args.alt_taxa, alt_ref_name=args.alt_ref_name,
             main_ref=args.ref_name, baseline_fasta=args.baseline_fasta,
             baseline_dataset=args.baseline_dataset,
+            baseline_tier=args.baseline_tier,
             baseline_taxa_assignments=args.baseline_taxa_assignments,
             baseline_skip_classify=False, baseline_colours=None, baseline_shorten_ids=False,
             novelty_baseline_datasets=[], mwl=args.mwl, mwl_sheet='MWL_V1', mwl_min_rank='p',

@@ -457,7 +457,7 @@ def build_sequence_assessment_rows(
     novelty_by_id = {}
     try:
         with open(novelty_metrics_tsv) as fh:
-            reader = csv.DictReader(fh, delimiter='\t')
+            reader = csv.DictReader(fh, delimiter='	')
             for row in reader:
                 qid = row.get('ID') or row.get('id')
                 if not qid:
@@ -470,29 +470,54 @@ def build_sequence_assessment_rows(
                             return got
                     return default
 
-                baseline_source = row.get('BaselineDensitySource') or ''
-                baseline_available = baseline_source not in ('', 'none', 'NA')
+                def source_available(*names) -> bool:
+                    source = val(*names, default='')
+                    return source not in ('', 'none', 'NA')
 
-                def baseline_val(name, default='NA'):
-                    if baseline_available:
-                        got = row.get(name)
-                        if got not in (None, ''):
-                            return got
-                    return default
+                cultured_available = source_available('CulturedRumenDensitySource', 'BaselineDensitySource')
+                hungate_available = source_available('HungateDensitySource')
+                secondary_available = source_available('SecondaryBaselineDensitySource')
+
+                def pool_val(prefix: str, field: str, *, available: bool, fallback_prefix: str | None = None, default='NA'):
+                    if not available:
+                        return default
+                    names = [prefix + field]
+                    if fallback_prefix:
+                        names.append(fallback_prefix + field)
+                    return val(*names, default=default)
 
                 novelty_by_id[qid] = {
-                    'nearest_identity': baseline_val('BaselineNearestIdentity'),
-                    'nearest_hit': baseline_val('BaselineNearestHit'),
-                    'nearest_query_coverage': baseline_val('BaselineNearestQueryCoverage'),
-                    'nearest_alignment_length': baseline_val('BaselineNearestAlignmentLength'),
-                    'novel': baseline_val('BaselineNovel'),
-                    'matches_ge_99': baseline_val('BaselineMatchesGE99'),
-                    'matches_ge_97': baseline_val('BaselineMatchesGE97'),
-                    'matches_ge_95': baseline_val('BaselineMatchesGE95'),
-                    'novelty_score': baseline_val('BaselineNoveltyScore'),
-                    'crowding': baseline_val('BaselineCrowding'),
-                    'sequencing_priority': baseline_val('BaselineSequencingPriority'),
-                    'density_source': baseline_val('BaselineDensitySource'),
+                    'baseline_evidence_class': val('BaselineEvidenceClass'),
+                    'hungate_nearest_identity': pool_val('Hungate', 'NearestIdentity', available=hungate_available),
+                    'hungate_nearest_hit': pool_val('Hungate', 'NearestHit', available=hungate_available),
+                    'hungate_nearest_query_coverage': pool_val('Hungate', 'NearestQueryCoverage', available=hungate_available),
+                    'hungate_nearest_alignment_length': pool_val('Hungate', 'NearestAlignmentLength', available=hungate_available),
+                    'hungate_novelty_score': pool_val('Hungate', 'NoveltyScore', available=hungate_available),
+                    'hungate_density_source': pool_val('Hungate', 'DensitySource', available=hungate_available),
+                    'secondary_baseline_nearest_identity': pool_val('SecondaryBaseline', 'NearestIdentity', available=secondary_available),
+                    'secondary_baseline_nearest_hit': pool_val('SecondaryBaseline', 'NearestHit', available=secondary_available),
+                    'secondary_baseline_nearest_query_coverage': pool_val('SecondaryBaseline', 'NearestQueryCoverage', available=secondary_available),
+                    'secondary_baseline_nearest_alignment_length': pool_val('SecondaryBaseline', 'NearestAlignmentLength', available=secondary_available),
+                    'secondary_baseline_novelty_score': pool_val('SecondaryBaseline', 'NoveltyScore', available=secondary_available),
+                    'secondary_baseline_density_source': pool_val('SecondaryBaseline', 'DensitySource', available=secondary_available),
+                    'cultured_rumen_nearest_identity': pool_val('CulturedRumen', 'NearestIdentity', available=cultured_available, fallback_prefix='Baseline'),
+                    'cultured_rumen_nearest_hit': pool_val('CulturedRumen', 'NearestHit', available=cultured_available, fallback_prefix='Baseline'),
+                    'cultured_rumen_nearest_query_coverage': pool_val('CulturedRumen', 'NearestQueryCoverage', available=cultured_available, fallback_prefix='Baseline'),
+                    'cultured_rumen_nearest_alignment_length': pool_val('CulturedRumen', 'NearestAlignmentLength', available=cultured_available, fallback_prefix='Baseline'),
+                    'cultured_rumen_novelty_score': pool_val('CulturedRumen', 'NoveltyScore', available=cultured_available, fallback_prefix='Baseline'),
+                    'cultured_rumen_density_source': pool_val('CulturedRumen', 'DensitySource', available=cultured_available, fallback_prefix='Baseline'),
+                    'nearest_identity': pool_val('CulturedRumen', 'NearestIdentity', available=cultured_available, fallback_prefix='Baseline'),
+                    'nearest_hit': pool_val('CulturedRumen', 'NearestHit', available=cultured_available, fallback_prefix='Baseline'),
+                    'nearest_query_coverage': pool_val('CulturedRumen', 'NearestQueryCoverage', available=cultured_available, fallback_prefix='Baseline'),
+                    'nearest_alignment_length': pool_val('CulturedRumen', 'NearestAlignmentLength', available=cultured_available, fallback_prefix='Baseline'),
+                    'novel': pool_val('CulturedRumen', 'Novel', available=cultured_available, fallback_prefix='Baseline'),
+                    'matches_ge_99': pool_val('CulturedRumen', 'MatchesGE99', available=cultured_available, fallback_prefix='Baseline'),
+                    'matches_ge_97': pool_val('CulturedRumen', 'MatchesGE97', available=cultured_available, fallback_prefix='Baseline'),
+                    'matches_ge_95': pool_val('CulturedRumen', 'MatchesGE95', available=cultured_available, fallback_prefix='Baseline'),
+                    'novelty_score': pool_val('CulturedRumen', 'NoveltyScore', available=cultured_available, fallback_prefix='Baseline'),
+                    'crowding': pool_val('CulturedRumen', 'Crowding', available=cultured_available, fallback_prefix='Baseline'),
+                    'sequencing_priority': pool_val('CulturedRumen', 'SequencingPriority', available=cultured_available, fallback_prefix='Baseline'),
+                    'density_source': pool_val('CulturedRumen', 'DensitySource', available=cultured_available, fallback_prefix='Baseline'),
                     'project_nearest_identity': val('ProjectNearestIdentity'),
                     'project_nearest_hit': val('ProjectNearestHit'),
                     'project_nearest_query_coverage': val('ProjectNearestQueryCoverage'),
@@ -526,14 +551,21 @@ def build_sequence_assessment_rows(
                     'genome_collection_matches_ge_97': val('GenomeCollectionMatchesGE97'),
                     'genome_collection_matches_ge_95': val('GenomeCollectionMatchesGE95'),
                     'related_genome_clade_ge_97': val('RelatedGenomeCladeGE97'),
+                    'hungate_genome_count_same_species': val('HungateGenomeCountSameAssessmentSpecies', default='0'),
+                    'secondary_baseline_genome_count_same_species': val('SecondaryBaselineGenomeCountSameAssessmentSpecies', default='0'),
+                    'cultured_rumen_genome_count_same_species': val(
+                        'CulturedRumenGenomeCountSameAssessmentSpecies',
+                        default=val('BaselineGenomeCountSameAssessmentSpecies', default='0'),
+                    ),
                     'genome_committed_count_same_species': val(
                         'CommittedGenomeCountSameAssessmentSpecies',
                         default=val('AvailableGenomeCountSameAssessmentSpecies',
                                     default=val('GenomeCommittedCountSameAssessmentSpecies')),
                     ),
                     'genome_available_count_same_species': val(
-                        'BaselineGenomeCountSameAssessmentSpecies',
-                        default=val('GenomeAvailableCountSameAssessmentSpecies'),
+                        'CulturedRumenGenomeCountSameAssessmentSpecies',
+                        default=val('BaselineGenomeCountSameAssessmentSpecies',
+                                    default=val('GenomeAvailableCountSameAssessmentSpecies')),
                     ),
                     'genome_selected_count_same_species': val(
                         'SequencedPartnerGenomeCountSameAssessmentSpecies',
@@ -554,19 +586,17 @@ def build_sequence_assessment_rows(
         )
 
     nearest_meta = {}
-    nearest_ids = sorted({
-        str(row.get('nearest_hit'))
-        for row in novelty_by_id.values()
-        if row.get('nearest_hit') not in (None, '', 'NA')
-    } | {
-        str(row.get('project_nearest_hit'))
-        for row in novelty_by_id.values()
-        if row.get('project_nearest_hit') not in (None, '', 'NA')
-    } | {
-        str(row.get('reference_nearest_hit'))
-        for row in novelty_by_id.values()
-        if row.get('reference_nearest_hit') not in (None, '', 'NA')
-    })
+    nearest_meta = {}
+    nearest_ids_set = set()
+    for row in novelty_by_id.values():
+        for key in (
+            'nearest_hit', 'hungate_nearest_hit', 'secondary_baseline_nearest_hit',
+            'cultured_rumen_nearest_hit', 'project_nearest_hit', 'reference_nearest_hit',
+        ):
+            hit = row.get(key)
+            if hit not in (None, '', 'NA', 'None'):
+                nearest_ids_set.add(str(hit))
+    nearest_ids = sorted(nearest_ids_set)
     if nearest_ids:
         try:
             with db.connect() as conn:
@@ -645,7 +675,13 @@ def build_sequence_assessment_rows(
         if in_tree == 'No' and cluster_rep == 'self':
             cluster_rep = 'duplicate'
 
-        baseline_hit_taxonomy = nearest_meta.get(str(n.get('nearest_hit')), {}).get('taxonomy', 'NA')
+        hungate_hit = n.get('hungate_nearest_hit', 'NA')
+        secondary_hit = n.get('secondary_baseline_nearest_hit', 'NA')
+        cultured_hit = n.get('cultured_rumen_nearest_hit', n.get('nearest_hit', 'NA'))
+        hungate_hit_taxonomy = nearest_meta.get(str(hungate_hit), {}).get('taxonomy', 'NA')
+        secondary_hit_taxonomy = nearest_meta.get(str(secondary_hit), {}).get('taxonomy', 'NA')
+        cultured_hit_taxonomy = nearest_meta.get(str(cultured_hit), {}).get('taxonomy', 'NA')
+        baseline_hit_taxonomy = cultured_hit_taxonomy
         baseline_agreement_rank, baseline_taxonomy_conflict = _taxonomy_agreement(
             _tax,
             baseline_hit_taxonomy,
@@ -665,7 +701,32 @@ def build_sequence_assessment_rows(
             'classification_target_length': c.get('target_length', 'NA'),
             'classification_mismatches': c.get('mismatches', 'NA'),
             'classification_gaps': c.get('gaps', 'NA'),
-            # NearestHit = best vsearch hit among registered baseline sequences already in the DB → drives NoveltyScore
+            'baseline_evidence_class': n.get('baseline_evidence_class', 'NA'),
+            'hungate_nearest_hit': hungate_hit,
+            'hungate_nearest_hit_dataset': nearest_meta.get(str(hungate_hit), {}).get('dataset', 'NA'),
+            'hungate_nearest_hit_taxonomy': hungate_hit_taxonomy,
+            'hungate_nearest_identity': n.get('hungate_nearest_identity', 'NA'),
+            'hungate_nearest_query_coverage': n.get('hungate_nearest_query_coverage', 'NA'),
+            'hungate_nearest_alignment_length': n.get('hungate_nearest_alignment_length', 'NA'),
+            'hungate_novelty_score': n.get('hungate_novelty_score', 'NA'),
+            'hungate_density_source': n.get('hungate_density_source', 'NA'),
+            'secondary_baseline_nearest_hit': secondary_hit,
+            'secondary_baseline_nearest_hit_dataset': nearest_meta.get(str(secondary_hit), {}).get('dataset', 'NA'),
+            'secondary_baseline_nearest_hit_taxonomy': secondary_hit_taxonomy,
+            'secondary_baseline_nearest_identity': n.get('secondary_baseline_nearest_identity', 'NA'),
+            'secondary_baseline_nearest_query_coverage': n.get('secondary_baseline_nearest_query_coverage', 'NA'),
+            'secondary_baseline_nearest_alignment_length': n.get('secondary_baseline_nearest_alignment_length', 'NA'),
+            'secondary_baseline_novelty_score': n.get('secondary_baseline_novelty_score', 'NA'),
+            'secondary_baseline_density_source': n.get('secondary_baseline_density_source', 'NA'),
+            'cultured_rumen_nearest_hit': cultured_hit,
+            'cultured_rumen_nearest_hit_dataset': nearest_meta.get(str(cultured_hit), {}).get('dataset', 'NA'),
+            'cultured_rumen_nearest_hit_taxonomy': cultured_hit_taxonomy,
+            'cultured_rumen_nearest_identity': n.get('cultured_rumen_nearest_identity', 'NA'),
+            'cultured_rumen_nearest_query_coverage': n.get('cultured_rumen_nearest_query_coverage', 'NA'),
+            'cultured_rumen_nearest_alignment_length': n.get('cultured_rumen_nearest_alignment_length', 'NA'),
+            'cultured_rumen_novelty_score': n.get('cultured_rumen_novelty_score', 'NA'),
+            'cultured_rumen_density_source': n.get('cultured_rumen_density_source', 'NA'),
+            # Older Baseline* output aliases mirror the combined cultured-rumen pool.
             'nearest_hit': n.get('nearest_hit', 'NA'),
             'nearest_hit_dataset': nearest_meta.get(str(n.get('nearest_hit')), {}).get('dataset', 'NA'),
             'nearest_hit_taxonomy': baseline_hit_taxonomy,
@@ -719,6 +780,9 @@ def build_sequence_assessment_rows(
             'genome_collection_matches_ge_95': n.get('genome_collection_matches_ge_95', 'NA'),
             'related_genome_clade_ge_97': n.get('related_genome_clade_ge_97', 'NA'),
             'genome_committed_count_same_species': n.get('genome_committed_count_same_species', 'NA'),
+            'hungate_genome_count_same_species': n.get('hungate_genome_count_same_species', 'NA'),
+            'secondary_baseline_genome_count_same_species': n.get('secondary_baseline_genome_count_same_species', 'NA'),
+            'cultured_rumen_genome_count_same_species': n.get('cultured_rumen_genome_count_same_species', 'NA'),
             'genome_available_count_same_species': n.get('genome_available_count_same_species', 'NA'),
             'genome_selected_count_same_species': n.get('genome_selected_count_same_species', 'NA'),
             'genome_pending_count_same_species': n.get('genome_pending_count_same_species', 'NA'),
@@ -797,6 +861,29 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         (f'{label}TargetLength', 'classification_target_length'),
         (f'{label}Mismatches', 'classification_mismatches'),
         (f'{label}Gaps', 'classification_gaps'),
+        ('BaselineEvidenceClass', 'baseline_evidence_class'),
+        ('HungateNearestHit', 'hungate_nearest_hit'), ('HungateNearestHitDataset', 'hungate_nearest_hit_dataset'),
+        ('HungateNearestHitTaxonomy', 'hungate_nearest_hit_taxonomy'),
+        ('HungateNearestIdentity', 'hungate_nearest_identity'),
+        ('HungateNearestQueryCoverage', 'hungate_nearest_query_coverage'),
+        ('HungateNearestAlignmentLength', 'hungate_nearest_alignment_length'),
+        ('HungateNoveltyScore', 'hungate_novelty_score'), ('HungateSource', 'hungate_density_source'),
+        ('SecondaryBaselineNearestHit', 'secondary_baseline_nearest_hit'),
+        ('SecondaryBaselineNearestHitDataset', 'secondary_baseline_nearest_hit_dataset'),
+        ('SecondaryBaselineNearestHitTaxonomy', 'secondary_baseline_nearest_hit_taxonomy'),
+        ('SecondaryBaselineNearestIdentity', 'secondary_baseline_nearest_identity'),
+        ('SecondaryBaselineNearestQueryCoverage', 'secondary_baseline_nearest_query_coverage'),
+        ('SecondaryBaselineNearestAlignmentLength', 'secondary_baseline_nearest_alignment_length'),
+        ('SecondaryBaselineNoveltyScore', 'secondary_baseline_novelty_score'),
+        ('SecondaryBaselineSource', 'secondary_baseline_density_source'),
+        ('CulturedRumenNearestHit', 'cultured_rumen_nearest_hit'),
+        ('CulturedRumenNearestHitDataset', 'cultured_rumen_nearest_hit_dataset'),
+        ('CulturedRumenNearestHitTaxonomy', 'cultured_rumen_nearest_hit_taxonomy'),
+        ('CulturedRumenNearestIdentity', 'cultured_rumen_nearest_identity'),
+        ('CulturedRumenNearestQueryCoverage', 'cultured_rumen_nearest_query_coverage'),
+        ('CulturedRumenNearestAlignmentLength', 'cultured_rumen_nearest_alignment_length'),
+        ('CulturedRumenNoveltyScore', 'cultured_rumen_novelty_score'),
+        ('CulturedRumenSource', 'cultured_rumen_density_source'),
         ('BaselineNearestHit', 'nearest_hit'), ('BaselineNearestHitDataset', 'nearest_hit_dataset'),
         ('BaselineNearestHitTaxonomy', 'nearest_hit_taxonomy'),
         ('BaselineTaxonomyAgreementRank', 'baseline_taxonomy_agreement_rank'),
@@ -837,6 +924,9 @@ def write_sequence_assessment_tsv(path: str | Path, rows, assessment_db_name: st
         ('GenomeCollectionMatchesGE97', 'genome_collection_matches_ge_97'),
         ('GenomeCollectionMatchesGE95', 'genome_collection_matches_ge_95'),
         ('RelatedGenomeCladeGE97', 'related_genome_clade_ge_97'),
+        ('HungateGenomesSameAssessmentSpecies', 'hungate_genome_count_same_species'),
+        ('SecondaryBaselineGenomesSameAssessmentSpecies', 'secondary_baseline_genome_count_same_species'),
+        ('CulturedRumenGenomesSameAssessmentSpecies', 'cultured_rumen_genome_count_same_species'),
         ('BaselineGenomesSameAssessmentSpecies', 'genome_available_count_same_species'),
         ('SequencedPartnerGenomesSameAssessmentSpecies', 'genome_selected_count_same_species'),
         ('SelectedPendingGenomesSameAssessmentSpecies', 'genome_pending_count_same_species'),
@@ -1143,6 +1233,16 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         f'{label}ClassificationIdentity',
         f'{label}QueryCoverage',
         'CulturedGap',
+        'BaselineEvidenceClass',
+        'HungateNearestHit',
+        'HungateNearestIdentity',
+        'HungateNearestQueryCoverage',
+        'SecondaryBaselineNearestHit',
+        'SecondaryBaselineNearestIdentity',
+        'SecondaryBaselineNearestQueryCoverage',
+        'CulturedRumenNearestHit',
+        'CulturedRumenNearestIdentity',
+        'CulturedRumenNearestQueryCoverage',
         'BaselineNearestHit',
         'BaselineNearestIdentity',
         'BaselineNearestQueryCoverage',
@@ -1162,6 +1262,9 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'MWLMatchedRank',
         'MWLMatchedTaxon',
         'MWLScore',
+        'HungateGenomesSameSpecies',
+        'SecondaryBaselineGenomesSameSpecies',
+        'CulturedRumenGenomesSameSpecies',
         'BaselineGenomesSameSpecies',
         'SequencedPartnerGenomesSameSpecies',
         'SelectedPendingGenomesSameSpecies',
@@ -1213,6 +1316,16 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('classification_identity', 'NA'),
                 row.get('classification_query_coverage', 'NA'),
                 support['cultured_gap'],
+                row.get('baseline_evidence_class', 'NA'),
+                row.get('hungate_nearest_hit', 'NA'),
+                row.get('hungate_nearest_identity', 'NA'),
+                row.get('hungate_nearest_query_coverage', 'NA'),
+                row.get('secondary_baseline_nearest_hit', 'NA'),
+                row.get('secondary_baseline_nearest_identity', 'NA'),
+                row.get('secondary_baseline_nearest_query_coverage', 'NA'),
+                row.get('cultured_rumen_nearest_hit', row.get('nearest_hit', 'NA')),
+                row.get('cultured_rumen_nearest_identity', row.get('nearest_identity', 'NA')),
+                row.get('cultured_rumen_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
                 row.get('nearest_hit', 'NA'),
                 row.get('nearest_identity', 'NA'),
                 row.get('nearest_query_coverage', 'NA'),
@@ -1232,6 +1345,9 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('mwl_matched_rank', 'NA'),
                 row.get('mwl_matched_taxon', 'NA'),
                 row.get('mwl_score', 'NA'),
+                row.get('hungate_genome_count_same_species', 'NA'),
+                row.get('secondary_baseline_genome_count_same_species', 'NA'),
+                row.get('cultured_rumen_genome_count_same_species', row.get('genome_available_count_same_species', 'NA')),
                 row.get('genome_available_count_same_species', 'NA'),
                 row.get('genome_selected_count_same_species', 'NA'),
                 row.get('genome_pending_count_same_species', 'NA'),
@@ -1248,29 +1364,38 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
 
 
 def write_baseline_hits_tsv(path: str | Path, rows):
-    """Write a concise nearest-baseline hit report for assessed sequences."""
+    """Write a concise tier-aware nearest cultured-baseline hit report."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        'ID', 'BaselineEvidenceClass',
+        'HungateNearestHit', 'HungateDataset', 'HungateNearestIdentity',
+        'HungateNearestQueryCoverage', 'HungateNearestTaxonomy', 'HungateNoveltyScore',
+        'SecondaryBaselineNearestHit', 'SecondaryBaselineDataset', 'SecondaryBaselineNearestIdentity',
+        'SecondaryBaselineNearestQueryCoverage', 'SecondaryBaselineNearestTaxonomy', 'SecondaryBaselineNoveltyScore',
+        'CulturedRumenNearestHit', 'CulturedRumenDataset', 'CulturedRumenNearestIdentity',
+        'CulturedRumenNearestQueryCoverage', 'CulturedRumenNearestTaxonomy', 'CulturedRumenNoveltyScore',
+    ]
     with open(p, 'w') as fh:
-        fh.write(
-            'ID\tNearestBaselineHit\tBaselineDataset\tNearestIdentity\t'
-            'NearestBaselineTaxonomy\tNoveltyScore\tCrowding\tSequencingPriority\n'
-        )
+        fh.write('\t'.join(fields) + '\n')
         for row in rows:
-            hit = row.get('nearest_hit', 'NA')
-            if hit in (None, '', 'NA'):
+            cultured_hit = row.get('cultured_rumen_nearest_hit') or row.get('nearest_hit', 'NA')
+            if cultured_hit in (None, '', 'NA', 'None'):
                 continue
-            source = row.get('density_source', 'NA')
-            if source not in (None, '', 'NA', 'none') and not str(source).startswith('baseline'):
-                continue
-            fh.write(
-                f"{row.get('id', 'NA')}\t"
-                f"{hit}\t"
-                f"{row.get('nearest_hit_dataset', 'NA')}\t"
-                f"{row.get('nearest_identity', 'NA')}\t"
-                f"{row.get('nearest_hit_taxonomy', 'NA')}\t"
-                f"{row.get('novelty_score', 'NA')}\t"
-                f"{row.get('crowding', 'NA')}\t"
-                f"{row.get('sequencing_priority', 'NA')}\n"
-            )
+            values = [
+                row.get('id', 'NA'), row.get('baseline_evidence_class', 'NA'),
+                row.get('hungate_nearest_hit', 'NA'), row.get('hungate_nearest_hit_dataset', 'NA'),
+                row.get('hungate_nearest_identity', 'NA'), row.get('hungate_nearest_query_coverage', 'NA'),
+                row.get('hungate_nearest_hit_taxonomy', 'NA'), row.get('hungate_novelty_score', 'NA'),
+                row.get('secondary_baseline_nearest_hit', 'NA'), row.get('secondary_baseline_nearest_hit_dataset', 'NA'),
+                row.get('secondary_baseline_nearest_identity', 'NA'), row.get('secondary_baseline_nearest_query_coverage', 'NA'),
+                row.get('secondary_baseline_nearest_hit_taxonomy', 'NA'), row.get('secondary_baseline_novelty_score', 'NA'),
+                cultured_hit, row.get('cultured_rumen_nearest_hit_dataset', row.get('nearest_hit_dataset', 'NA')),
+                row.get('cultured_rumen_nearest_identity', row.get('nearest_identity', 'NA')),
+                row.get('cultured_rumen_nearest_query_coverage', row.get('nearest_query_coverage', 'NA')),
+                row.get('cultured_rumen_nearest_hit_taxonomy', row.get('nearest_hit_taxonomy', 'NA')),
+                row.get('cultured_rumen_novelty_score', row.get('novelty_score', 'NA')),
+            ]
+            safe = [str(value if value is not None else 'NA').replace('\t', ' ').replace('\n', ' ') for value in values]
+            fh.write('\t'.join(safe) + '\n')
     return str(p)
