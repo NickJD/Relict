@@ -19,6 +19,7 @@ MWL_STRENGTH = {
     'order': 2, 'o': 2, 'class': 1, 'c': 1, 'phylum': 0, 'p': 0,
     'domain': 0, 'd': 0,
 }
+EVIDENCE_STRENGTH = {'HIGH': 2, 'MODERATE': 1, 'LOW': 0}
 DEFAULT_PANGENOME_TARGET = 9
 DEFAULT_CANDIDATE_SET_SIZE = 9
 DEFAULT_BASELINE_REDUNDANCY_IDENTITY = 99.8
@@ -313,6 +314,7 @@ def _evidence_tuple(row: dict) -> tuple:
     mwl_score = _float(row.get('mwl_score'), 0.0)
     return (
         _baseline_evidence_rank(row),
+        EVIDENCE_STRENGTH.get(_evidence_quality(row), 0),
         100.0 - float(baseline),
         100.0 - float(project),
         100.0 - float(reference),
@@ -527,46 +529,64 @@ def build_sequencing_sets(
                 row['sequencing_set_reason'] = 'genome already sequenced and available'
                 row['baseline_redundancy_status'] = 'NOT_APPLICABLE_COMMITTED'
                 row['baseline_extension_status'] = 'NOT_APPLICABLE_COMMITTED'
-            elif _selected(row):
+                continue
+            if _selected(row):
                 row['sequencing_set_role'] = 'COMMITTED'
                 row['sequencing_set_reason'] = 'already selected for genome sequencing; genome not yet available'
                 row['baseline_redundancy_status'] = 'NOT_APPLICABLE_COMMITTED'
                 row['baseline_extension_status'] = 'NOT_APPLICABLE_COMMITTED'
-            elif _evidence_quality(row) == 'LOW':
+                continue
+
+            evidence_quality = _evidence_quality(row)
+            extension_eligible = False
+            extension_status = row.get('baseline_extension_status', 'NOT_APPLICABLE_CANDIDATE_GROUP')
+            extension_reason = 'not a baseline-pangenome extension group'
+            if is_baseline_extension:
+                extension_eligible, extension_status, extension_reason = baseline_extension_evidence(
+                    row, extension_identity, extension_coverage,
+                )
+                row['baseline_extension_status'] = extension_status
+
+            redundant, identity, coverage = baseline_redundancy_evidence(
+                row, redundancy_identity, redundancy_coverage,
+            )
+            retained_for_gap = bool(
+                redundant and is_baseline_extension and extension_eligible and gap > 0
+            )
+            if retained_for_gap:
+                row['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP'
+
+            if redundant and not retained_for_gap:
+                redundant_count += 1
+                row['sequencing_set_role'] = 'BASELINE_REDUNDANT'
+                row['baseline_redundancy_status'] = 'EXCLUDED_NEAR_IDENTICAL_BASELINE'
+                if is_baseline_extension:
+                    row['baseline_extension_status'] = 'EXCLUDED_NEAR_IDENTICAL_BASELINE'
+                row['sequencing_set_reason'] = (
+                    f'nearest cultured baseline {identity:.2f}% across {coverage:.2f}% of the query; '
+                    f'excluded at >={redundancy_identity:.2f}% identity and '
+                    f'>={redundancy_coverage:.2f}% query coverage; MWL evidence does not override redundancy'
+                )
+                if evidence_quality == 'LOW':
+                    row['sequencing_set_reason'] += '; marker evidence also requires review'
+            elif evidence_quality == 'LOW':
                 row['sequencing_set_role'] = 'REVIEW_EVIDENCE'
                 row['sequencing_set_reason'] = 'marker evidence requires review before selection'
-                row['baseline_redundancy_status'] = 'NOT_EVALUATED_EVIDENCE'
-                row['baseline_extension_status'] = 'NOT_EVALUATED_EVIDENCE'
-            else:
-                if is_baseline_extension:
-                    extension_eligible, extension_status, extension_reason = baseline_extension_evidence(
-                        row, extension_identity, extension_coverage,
-                    )
-                    row['baseline_extension_status'] = extension_status
-                    if not extension_eligible:
-                        row['sequencing_set_role'] = 'PANGENOME_BOUNDARY_REVIEW'
-                        row['baseline_redundancy_status'] = 'NOT_EVALUATED_PANGENOME_BOUNDARY'
-                        row['sequencing_set_reason'] = (
-                            f'not admitted to baseline-pangenome extension: {extension_reason}; '
-                            'review as a possible separate candidate lineage'
-                        )
-                        continue
-                redundant, identity, coverage = baseline_redundancy_evidence(
-                    row, redundancy_identity, redundancy_coverage,
-                )
-                if redundant:
-                    redundant_count += 1
-                    row['sequencing_set_role'] = 'BASELINE_REDUNDANT'
-                    row['baseline_redundancy_status'] = 'EXCLUDED_NEAR_IDENTICAL_BASELINE'
-                    if is_baseline_extension:
-                        row['baseline_extension_status'] = 'EXCLUDED_NEAR_IDENTICAL_BASELINE'
-                    row['sequencing_set_reason'] = (
-                        f'nearest cultured baseline {identity:.2f}% across {coverage:.2f}% of the query; '
-                        f'excluded at >={redundancy_identity:.2f}% identity and '
-                        f'>={redundancy_coverage:.2f}% query coverage; MWL evidence does not override redundancy'
-                    )
+                if retained_for_gap:
+                    row['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP_PENDING_REVIEW'
+                    row['sequencing_set_reason'] += '; same-species pangenome gap remains'
                 else:
-                    eligible.append(row)
+                    row['baseline_redundancy_status'] = 'NOT_EVALUATED_EVIDENCE'
+                    row['baseline_extension_status'] = 'NOT_EVALUATED_EVIDENCE'
+            elif is_baseline_extension and not extension_eligible:
+                row['sequencing_set_role'] = 'PANGENOME_BOUNDARY_REVIEW'
+                row['baseline_redundancy_status'] = 'NOT_EVALUATED_PANGENOME_BOUNDARY'
+                row['sequencing_set_reason'] = (
+                    f'not admitted to baseline-pangenome extension: {extension_reason}; '
+                    'review as a possible separate candidate lineage'
+                )
+            else:
+                eligible.append(row)
 
         ranked = _farthest_first(eligible, committed_ids, distances)
         recommended = ranked[:min(set_size, len(ranked))]

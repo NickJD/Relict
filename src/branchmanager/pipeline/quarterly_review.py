@@ -584,36 +584,28 @@ def build_quarterly_review(
                     'recommendation_reason': 'already selected for sequencing; genome is not yet available',
                 })
                 recommendations[row['id']] = base
-            elif evidence == 'LOW' or (evidence == 'MODERATE' and not include_moderate):
-                base.update({
-                    'role': 'REVIEW', 'priority_tier': 'EVIDENCE_REVIEW',
-                    'baseline_redundancy_status': 'NOT_EVALUATED_EVIDENCE',
-                    'baseline_extension_status': 'NOT_EVALUATED_EVIDENCE',
-                    'recommendation_reason': f'{evidence.lower()} marker evidence; excluded pending review',
-                })
-                recommendations[row['id']] = base
             else:
+                extension_eligible = False
+                extension_status = base['baseline_extension_status']
+                extension_reason = 'not a baseline-pangenome extension group'
                 if is_baseline_extension:
                     extension_eligible, extension_status, extension_reason = baseline_extension_evidence(
                         row, extension_identity, extension_coverage,
                     )
                     base['baseline_extension_status'] = extension_status
-                    if not extension_eligible:
-                        base.update({
-                            'role': 'PANGENOME_BOUNDARY_REVIEW',
-                            'priority_tier': 'PANGENOME_BOUNDARY_REVIEW',
-                            'baseline_redundancy_status': 'NOT_EVALUATED_PANGENOME_BOUNDARY',
-                            'recommendation_reason': (
-                                f'not admitted to baseline-pangenome extension: {extension_reason}; '
-                                'review as a possible separate candidate lineage'
-                            ),
-                        })
-                        recommendations[row['id']] = base
-                        continue
+
                 redundant, identity, coverage = baseline_redundancy_evidence(
                     row, redundancy_identity, redundancy_coverage,
                 )
-                if redundant:
+                retained_for_gap = bool(
+                    redundant and is_baseline_extension and extension_eligible
+                    and base['coverage_gap_before'] > 0
+                )
+                if retained_for_gap:
+                    base['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP'
+
+                review_evidence = evidence == 'LOW' or (evidence == 'MODERATE' and not include_moderate)
+                if redundant and not retained_for_gap:
                     base.update({
                         'role': 'BASELINE_REDUNDANT',
                         'priority_tier': 'NEAR_IDENTICAL_CULTURED_BASELINE',
@@ -626,6 +618,31 @@ def build_quarterly_review(
                             f'nearest cultured baseline {identity:.2f}% across {coverage:.2f}% of the query; '
                             f'excluded at >={redundancy_identity:.2f}% identity and '
                             f'>={redundancy_coverage:.2f}% query coverage; MWL evidence does not override redundancy'
+                        ),
+                    })
+                    if review_evidence:
+                        base['recommendation_reason'] += '; marker evidence also requires review'
+                    recommendations[row['id']] = base
+                elif review_evidence:
+                    base.update({
+                        'role': 'REVIEW', 'priority_tier': 'EVIDENCE_REVIEW',
+                        'recommendation_reason': f'{evidence.lower()} marker evidence; excluded pending review',
+                    })
+                    if retained_for_gap:
+                        base['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP_PENDING_REVIEW'
+                        base['recommendation_reason'] += '; same-species pangenome gap remains'
+                    else:
+                        base['baseline_redundancy_status'] = 'NOT_EVALUATED_EVIDENCE'
+                        base['baseline_extension_status'] = 'NOT_EVALUATED_EVIDENCE'
+                    recommendations[row['id']] = base
+                elif is_baseline_extension and not extension_eligible:
+                    base.update({
+                        'role': 'PANGENOME_BOUNDARY_REVIEW',
+                        'priority_tier': 'PANGENOME_BOUNDARY_REVIEW',
+                        'baseline_redundancy_status': 'NOT_EVALUATED_PANGENOME_BOUNDARY',
+                        'recommendation_reason': (
+                            f'not admitted to baseline-pangenome extension: {extension_reason}; '
+                            'review as a possible separate candidate lineage'
                         ),
                     })
                     recommendations[row['id']] = base

@@ -1161,10 +1161,10 @@ def build_selection_decision(row: dict) -> dict:
         decision = 'ALREADY SEQUENCED'
     elif pending:
         decision = 'ALREADY SELECTED - GENOME PENDING'
-    elif evidence_quality == 'LOW':
-        decision = 'REVIEW BEFORE SELECTION'
     elif baseline_redundant:
         decision = 'EXCLUDE - BASELINE REDUNDANT'
+    elif evidence_quality == 'LOW':
+        decision = 'REVIEW BEFORE SELECTION'
     elif boundary_review:
         decision = 'REVIEW - PANGENOME BOUNDARY'
     elif set_role == 'PRIMARY':
@@ -1206,6 +1206,21 @@ def _board_recommendation(row: dict) -> tuple[str, str]:
     """Compatibility helper returning the transparent decision and rationale."""
     support = build_selection_decision(row)
     return support['decision'], support['decision_reason']
+
+
+def _marker_review_display(row: dict) -> str:
+    status = str(row.get('marker_manual_review_status') or 'NOT_REVIEWED').strip().upper()
+    qc_class = str(row.get('marker_qc_class') or '').strip().upper()
+    recommendation = str(row.get('marker_qc_recommendation') or '').strip().upper()
+    if status in {'', 'NA', 'NONE'}:
+        status = 'NOT_REVIEWED'
+    if (
+        status == 'NOT_REVIEWED'
+        and qc_class == 'PASS_HIGH_CONFIDENCE'
+        and recommendation in {'', 'ACCEPT', 'ACCEPTED'}
+    ):
+        return 'NOT_REQUIRED'
+    return status
 
 
 def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str = 'GTDB'):
@@ -1311,7 +1326,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('selection_group_type', 'NA'),
                 support['evidence_quality'],
                 row.get('marker_qc_class', 'QUALITY_UNVERIFIED'),
-                row.get('marker_manual_review_status', 'NOT_REVIEWED'),
+                _marker_review_display(row),
                 row.get('taxonomy', 'NA'),
                 row.get('classification_identity', 'NA'),
                 row.get('classification_query_coverage', 'NA'),

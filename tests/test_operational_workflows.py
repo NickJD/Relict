@@ -232,9 +232,16 @@ class OperationalWorkflowTests(unittest.TestCase):
             html = Path(outputs['html']).read_text()
             self.assertIn('Cumulative Project Overview', html)
             self.assertIn('Proposed sequences', html)
+            self.assertIn('QC-passed sequence files', html)
+            self.assertIn('Visual reports', html)
             self.assertIn('<td>Batch1</td><td>candidate</td><td></td><td>0</td><td>1</td><td>2</td>', html)
+            self.assertIn('QC-passed sequence files', Path(outputs['datasets']).read_text())
             self.assertIn('ISO1', Path(outputs['isolates']).read_text())
             self.assertTrue(Path(outputs['candidates']).is_file())
+            self.assertTrue(Path(outputs['visual_reports']).is_file())
+            self.assertTrue(Path(outputs['visual_gallery']).is_file())
+            self.assertTrue(Path(outputs['readme']).is_file())
+            self.assertTrue(Path(outputs['readme_html']).is_file())
             self.assertTrue(Path(outputs['removals']).is_file())
             self.assertTrue(Path(outputs['decision_changes']).is_file())
 
@@ -261,11 +268,63 @@ class OperationalWorkflowTests(unittest.TestCase):
                 'command': ['branchmanager', 'assistant', '--dataset', 'UoG_01'],
                 'error': 'local tree context resolved 49/50 assessed sequences',
             }))
+            interview_dir = root / '01_interview_UoG_01'
+            visual_dir = interview_dir / 'visual_reports'
+            failed_dir = interview_dir / 'failed_qc_sequences'
+            mailroom_dir = root / 'raw' / 'UoG_01' / 'mailroom'
+            for folder in (visual_dir, failed_dir, mailroom_dir):
+                folder.mkdir(parents=True, exist_ok=True)
+            sample_map = mailroom_dir / 'ab1_map.tsv'
+            sample_map.write_text('sequence_id\tpath\nUOG1\tUOG1.ab1\n')
+            assembly = interview_dir / 'assembly_report.tsv'
+            assembly.write_text(
+                'SequenceID\tQCClass\tRecommendation\n'
+                'UOG1\tPASS_HIGH_CONFIDENCE\tACCEPT\n'
+                'UOG2\tPASS_WITH_WARNINGS\tMANUAL_REVIEW\n'
+                'UOG3\tFAIL_QC\tRESEQUENCE\n'
+            )
+            read_qc = interview_dir / 'read_qc.tsv'
+            read_qc.write_text('ReadID\tSequenceID\tStatus\nR1\tUOG1\tkept\nR2\tUOG3\tfiltered\n')
+            failed_manifest = failed_dir / 'failed_qc_manifest.tsv'
+            failed_manifest.write_text('SequenceID\tQCClass\nUOG3\tFAIL_QC\n')
+            failed_read_manifest = failed_dir / 'failed_read_manifest.tsv'
+            failed_read_manifest.write_text('SequenceID\tReadID\nUOG3\tR2\n')
+            preview_png = visual_dir / 'read_error_profiles' / 'page.png'
+            preview_png.parent.mkdir(parents=True)
+            preview_png.write_bytes(b'\x89PNG\r\n\x1a\n')
+            visual_manifest = visual_dir / 'visual_report_manifest.tsv'
+            visual_manifest.write_text('Report\tPage\tFile\nread_error_profiles\t1\tvisual_reports/read_error_profiles/page.png\n')
+            (interview_dir / 'run_manifest.json').write_text(json.dumps({
+                'workflow': 'interview',
+                'status': 'COMPLETE',
+                'started_at': '2026-07-17T07:30:00Z',
+                'completed_at': '2026-07-17T07:31:00Z',
+                'command': ['branchmanager', 'interview', '--mailroom', str(mailroom_dir)],
+                'inputs': [{'role': 'sample_map', 'path': str(sample_map), 'sha256': 'map-1'}],
+                'outputs': [
+                    {'role': 'assembly_tsv', 'path': str(assembly)},
+                    {'role': 'read_qc_tsv', 'path': str(read_qc)},
+                    {'role': 'failed_manifest_tsv', 'path': str(failed_manifest)},
+                    {'role': 'failed_read_manifest_tsv', 'path': str(failed_read_manifest)},
+                    {'role': 'visual_manifest_tsv', 'path': str(visual_manifest)},
+                ],
+            }))
 
             outputs = write_annual_report(db, root / 'annual_report')
             html = Path(outputs['html']).read_text()
             self.assertIn('<td>UoG_01</td><td>candidate</td><td></td><td>0</td><td>0</td><td>2</td>', html)
+            self.assertIn('<td>interview</td><td>UoG_01</td>', html)
             self.assertIn('FAILED', html)
+            dataset_summary = Path(outputs['datasets']).read_text()
+            self.assertIn('UoG_01\tcandidate\t\t0\t0\t2\t0\t0\t0\t2\t1\t1\t1\t2\t1\t1', dataset_summary)
+            visual_summary = Path(outputs['visual_reports']).read_text()
+            self.assertIn('UoG_01\tinterview\tPaper Trail visual pages\t1', visual_summary)
+            gallery_summary = Path(outputs['visual_gallery']).read_text()
+            self.assertIn('UoG_01\tinterview\tRead Error Profiles', gallery_summary)
+            self.assertIn('<h2>Embedded visual previews</h2>', html)
+            self.assertIn('<img ', html)
+            self.assertIn('annual_report_guide.html', html)
+            self.assertIn('BranchManager Annual Report Guide', Path(outputs['readme']).read_text())
             self.assertIn('UOG1', Path(outputs['isolates']).read_text())
             self.assertIn('NOT YET ASSESSED', Path(outputs['candidates']).read_text())
 

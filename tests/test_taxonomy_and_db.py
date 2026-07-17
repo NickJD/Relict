@@ -2431,6 +2431,9 @@ class OutputHelperTests(unittest.TestCase):
                     'cluster_representative': 'self',
                     'cluster_size': '1',
                     'placement_flags': '',
+                    'marker_qc_class': 'PASS_HIGH_CONFIDENCE',
+                    'marker_qc_recommendation': 'ACCEPT',
+                    'marker_manual_review_status': 'NOT_REVIEWED',
                     'local_neighbourhood_figure': 'neighbourhoods/clade_001.png',
                 },
                 {
@@ -2481,6 +2484,7 @@ class OutputHelperTests(unittest.TestCase):
                 'Iso001\tQUB\tFalse\tNA\tPRIORITISE - SET PRIMARY\tSET_A\tPRIMARY\t1\tNA\tNA\tHIGH',
                 text,
             )
+            self.assertIn('HIGH	PASS_HIGH_CONFIDENCE	NOT_REQUIRED', text)
             self.assertIn('MWL target match (g__Novel)', text)
             self.assertIn('neighbourhoods/clade_001.png', text)
             self.assertIn('Iso002\tUoG\tFalse\tNA\tLOWER PRIORITY - TARGET MET\tSET_B\tTARGET_MET', text)
@@ -2553,6 +2557,35 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('CommittedGenomeCount\tCommittedGenomeIDs\tPangenomeTarget\tPangenomeGap', text)
             self.assertIn('\tBACKUP\t4\tHIGH\t', text)
 
+    def test_sequencing_set_order_prefers_marker_quality_when_other_evidence_matches(self):
+        taxonomy = 'd__Bacteria; g__Novel; s__Novel species'
+        common = {
+            'partner_id': 'QUB', 'taxonomy': taxonomy,
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'classification_query_coverage': '100.0',
+            'nearest_identity': '94.0', 'nearest_query_coverage': '100.0',
+            'project_nearest_identity': '96.0', 'reference_nearest_identity': '97.0',
+            'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+            'genome_available_count_same_species': '0',
+            'genome_selected_count_same_species': '0',
+            'genome_committed_count_same_species': '0',
+            'in_tree': 'Yes', 'cluster_representative': 'self',
+        }
+        rows = [
+            {**common, 'id': 'MODERATE_MARKER', 'placement_flags': 'LOW_CLASSIFICATION'},
+            {**common, 'id': 'HIGH_MARKER', 'placement_flags': ''},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = selection_sets_pipeline.build_sequencing_sets(
+                rows, Path(tmpdir) / 'sequencing_sets.tsv',
+                pangenome_target=1, candidate_set_size=2,
+            )
+            written = list(csv.DictReader(open(output), delimiter='\t'))
+
+        ranks = {row['CandidateID']: row['SetRank'] for row in written}
+        self.assertEqual(ranks['HIGH_MARKER'], '1')
+        self.assertEqual(ranks['MODERATE_MARKER'], '2')
+
     def test_sequencing_sets_count_every_baseline_as_genome_available(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -2608,6 +2641,10 @@ class OutputHelperTests(unittest.TestCase):
         rows = [
             {**common, 'id': 'EXTENSION', 'nearest_identity': '99.10'},
             {**common, 'id': 'REDUNDANT', 'nearest_identity': '99.90'},
+            {
+                **common, 'id': 'WARN_REDUNDANT', 'nearest_identity': '99.90',
+                'placement_flags': 'MARKER_QC_REVIEW_REQUIRED',
+            },
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             output = selection_sets_pipeline.build_sequencing_sets(
@@ -2619,12 +2656,18 @@ class OutputHelperTests(unittest.TestCase):
         redundant = next(row for row in rows if row['id'] == 'REDUNDANT')
         self.assertTrue(extension['sequencing_set_id'].startswith('BMEXT_'))
         self.assertEqual(extension['selection_group_type'], 'HUNGATE_BASELINE_EXTENSION')
+        warning = next(row for row in rows if row['id'] == 'WARN_REDUNDANT')
         self.assertEqual(extension['sequencing_set_role'], 'PRIMARY')
         self.assertEqual(extension['sequencing_set_rank'], '1')
         self.assertEqual(extension['baseline_extension_status'], 'ELIGIBLE_BASELINE_PANGENOME_EXTENSION')
-        self.assertEqual(redundant['sequencing_set_role'], 'BASELINE_REDUNDANT')
+        self.assertEqual(redundant['sequencing_set_role'], 'PRIMARY')
+        self.assertEqual(redundant['baseline_redundancy_status'], 'RETAINED_FOR_PANGENOME_GAP')
+        self.assertEqual(build_selection_decision(redundant)['decision'], 'PRIORITISE - SET PRIMARY')
+        self.assertEqual(warning['sequencing_set_role'], 'REVIEW_EVIDENCE')
+        self.assertEqual(warning['baseline_redundancy_status'], 'RETAINED_FOR_PANGENOME_GAP_PENDING_REVIEW')
         self.assertEqual(written[0]['PangenomeGap'], '8')
         self.assertEqual(written[0]['BaselineAnchorIDs'], 'BASELINE_1')
+        self.assertIn('RETAINED_FOR_PANGENOME_GAP', {row['BaselineRedundancyStatus'] for row in written})
 
     def test_secondary_baseline_extension_reports_tier_counts(self):
         taxonomy = 'd__Bacteria; g__Anchor; s__Anchor species'
@@ -2684,6 +2727,26 @@ class OutputHelperTests(unittest.TestCase):
         self.assertEqual(rows[1]['baseline_extension_status'], 'BASELINE_IDENTITY_BELOW_EXTENSION_THRESHOLD')
         self.assertEqual(rows[2]['baseline_extension_status'], 'BASELINE_COVERAGE_BELOW_EXTENSION_THRESHOLD')
         self.assertTrue(all(row['sequencing_set_rank'] == 'NA' for row in rows))
+
+    def test_low_marker_evidence_does_not_hide_baseline_redundancy(self):
+        row = {
+            'id': 'WARN_REDUNDANT', 'partner_id': 'UoG',
+            'taxonomy': 'd__Bacteria; g__Known; s__Known species',
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'nearest_hit': 'HUN001', 'nearest_identity': '99.90',
+            'nearest_query_coverage': '100.0',
+            'project_nearest_identity': '95.0', 'reference_nearest_identity': '95.0',
+            'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+            'genome_committed_count_same_species': '0',
+            'placement_flags': 'MARKER_QC_REVIEW_REQUIRED',
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_sets_pipeline.build_sequencing_sets([row], Path(tmpdir) / 'sequencing_sets.tsv')
+
+        self.assertEqual(row['sequencing_set_role'], 'BASELINE_REDUNDANT')
+        self.assertEqual(row['baseline_redundancy_status'], 'EXCLUDED_NEAR_IDENTICAL_BASELINE')
+        self.assertIn('marker evidence also requires review', row['sequencing_set_reason'])
+        self.assertEqual(build_selection_decision(row)['decision'], 'EXCLUDE - BASELINE REDUNDANT')
 
     def test_sequencing_sets_rank_nine_diverse_candidates_and_exclude_baseline_duplicate(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2942,6 +3005,36 @@ class OutputHelperTests(unittest.TestCase):
         self.assertEqual(by_id['EXTENSION']['selection_group_type'], 'HUNGATE_BASELINE_EXTENSION')
         self.assertEqual(by_id['BOUNDARY']['role'], 'PANGENOME_BOUNDARY_REVIEW')
         self.assertEqual(by_id['BOUNDARY']['baseline_extension_status'], 'BASELINE_SPECIES_MISMATCH')
+
+    def test_quarterly_review_retains_baseline_extension_when_pangenome_gap_remains(self):
+        taxonomy = 'd__Bacteria; g__Anchor; s__Anchor species'
+        rows = [{
+            'id': 'EXTENSION_REDUNDANT', 'partner_id': 'QUB',
+            'taxonomy': taxonomy, 'classification_identity': '99.5',
+            'classification_confidence': '0.99',
+            'nearest_hit': 'BASELINE_1', 'nearest_hit_taxonomy': taxonomy,
+            'nearest_identity': '99.90', 'nearest_query_coverage': '100.0',
+            'project_nearest_identity': '98.0', 'reference_nearest_identity': '98.0',
+            'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+            'genome_available_count_same_species': '1',
+            'genome_committed_count_same_species': '1',
+            'placement_flags': '',
+        }]
+
+        recommendations = quarterly_review_pipeline.build_quarterly_review(
+            rows, genome_budget=1, backups_per_primary=0, pangenome_target=3,
+        )
+        by_id = {row['sequence_id']: row for row in recommendations}
+
+        self.assertEqual(by_id['EXTENSION_REDUNDANT']['role'], 'PRIMARY')
+        self.assertEqual(
+            by_id['EXTENSION_REDUNDANT']['baseline_redundancy_status'],
+            'RETAINED_FOR_PANGENOME_GAP',
+        )
+        self.assertEqual(
+            by_id['EXTENSION_REDUNDANT']['baseline_extension_status'],
+            'ELIGIBLE_BASELINE_PANGENOME_EXTENSION',
+        )
 
     def test_quarterly_review_excludes_near_identical_baseline_even_with_mwl(self):
         common = {

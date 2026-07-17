@@ -4318,6 +4318,26 @@ def _resolve_mailroom_interview_input(
     return str(map_path), str(summary_path), status
 
 
+
+def _infer_qc_dataset_from_path(value) -> str:
+    raw = str(value or '').strip()
+    if not raw:
+        return ''
+    try:
+        parts = [part for part in Path(raw).parts if part not in {'', '/'}]
+    except TypeError:
+        return ''
+    for index, part in enumerate(parts):
+        if part == 'mailroom' and index > 0:
+            return parts[index - 1]
+    for part in reversed(parts):
+        if part.startswith('01_interview_') and len(part) > len('01_interview_'):
+            return part[len('01_interview_'):]
+    for index, part in enumerate(parts):
+        if part in {'01_onboarding', '02_paper_trail_merge_meeting'} and index > 0:
+            return parts[index - 1]
+    return ''
+
 def cmd_interview(args):
     """Run standalone AB1 QC from a validated Mailroom batch."""
     sample_map, summary, status = _resolve_mailroom_interview_input(
@@ -4356,6 +4376,14 @@ def cmd_paper_trail(args):
             )
         primer_sequences[name.strip().upper()] = sequence
     manifest = RunManifest(outdir, workflow_name)
+    dataset_hint = (
+        _infer_qc_dataset_from_path(sample_map)
+        or _infer_qc_dataset_from_path(getattr(args, 'mailroom_summary', None))
+        or _infer_qc_dataset_from_path(outdir)
+    )
+    if dataset_hint:
+        manifest.data['dataset'] = dataset_hint
+        manifest.write()
     for source, role in (
         (sample_map, 'sample_map'),
         (getattr(args, 'mailroom_summary', None), 'mailroom_summary'),
