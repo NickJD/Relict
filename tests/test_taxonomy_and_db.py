@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -480,8 +481,8 @@ class DatabaseBehaviourTests(unittest.TestCase):
             'warn_n_percent', 'max_n_percent', 'warn_internal_low_quality_run',
             'max_internal_low_quality_run', 'secondary_peak_ratio',
             'max_mixed_peak_percent', 'mixed_peak_min_quality',
-            'max_conflict_density', 'quality_difference', 'min_overlap',
-            'min_overlap_identity',
+            'max_conflict_density', 'max_ambiguous_overlap_conflicts_without_review',
+            'quality_difference', 'min_overlap', 'min_overlap_identity',
         ):
             self.assertEqual(getattr(paper_trail, field), getattr(assistant, field), field)
         self.assertEqual(assistant.baseline_extension_min_identity, 98.65)
@@ -1364,10 +1365,85 @@ class OutputHelperTests(unittest.TestCase):
                 min_overlap_identity=0.85,
             )
 
-            report = Path(out['assembly_tsv']).read_text()
-            self.assertIn('IsoGap\tassembled\t2\t2', report)
-            self.assertIn('biopython_pairwise_overlap', report)
-            self.assertIn('ambiguous_overlap_conflicts_1', report)
+            with open(out['assembly_tsv']) as handle:
+                rows = {row['SequenceID']: row for row in csv.DictReader(handle, delimiter='\t')}
+            self.assertEqual(rows['IsoGap']['Status'], 'assembled')
+            self.assertEqual(rows['IsoGap']['AmbiguousConflicts'], '1')
+            self.assertEqual(rows['IsoGap']['MergeMethod'], 'biopython_pairwise_overlap')
+            self.assertIn('overlap_conflict_density_gt_1', rows['IsoGap']['Reasons'])
+
+            strict = paper_trail_pipeline.run_paper_trail(
+                [str(reads)],
+                tmp / 'strict',
+                min_quality=20,
+                min_length=8,
+                min_overlap=18,
+                min_overlap_identity=0.85,
+                max_ambiguous_overlap_conflicts_without_review=0,
+            )
+            with open(strict['assembly_tsv']) as handle:
+                strict_rows = {row['SequenceID']: row for row in csv.DictReader(handle, delimiter='\t')}
+            self.assertIn('ambiguous_overlap_conflicts_1', strict_rows['IsoGap']['Reasons'])
+
+    def test_ambiguous_overlap_conflict_tolerance_requires_clear_excess(self):
+        group = [
+            SimpleNamespace(
+                quality_available=True,
+                status='kept',
+                qc_class='PASS_HIGH_CONFIDENCE',
+                read_id='read1',
+                qc_reasons=[],
+            ),
+            SimpleNamespace(
+                quality_available=True,
+                status='kept',
+                qc_class='PASS_HIGH_CONFIDENCE',
+                read_id='read2',
+                qc_reasons=[],
+            ),
+        ]
+        consensus = 'A' * 1000
+        qualities = [35] * len(consensus)
+        common = dict(
+            consensus=consensus,
+            qualities=qualities,
+            group=group,
+            final_min_length=800,
+            min_mean_quality=20.0,
+            max_output_expected_errors=5.0,
+            warn_n_percent=3.0,
+            max_n_percent=5.0,
+            max_conflict_density=1.0,
+            max_ambiguous_overlap_conflicts_without_review=2,
+            processing_mode='assemble',
+            mode_warning='',
+        )
+
+        tolerated = paper_trail_pipeline._classify_output_qc(
+            stats={
+                'status': 'assembled',
+                'conflicts': 2,
+                'ambiguous_conflicts': 2,
+                'used_read_ids': ['read1', 'read2'],
+            },
+            **common,
+        )
+        self.assertEqual(tolerated['qc_class'], 'PASS_HIGH_CONFIDENCE')
+        self.assertEqual(tolerated['recommendation'], 'ACCEPT')
+        self.assertNotIn('ambiguous_overlap_conflicts_2', tolerated['reasons'])
+
+        review = paper_trail_pipeline._classify_output_qc(
+            stats={
+                'status': 'assembled',
+                'conflicts': 3,
+                'ambiguous_conflicts': 3,
+                'used_read_ids': ['read1', 'read2'],
+            },
+            **common,
+        )
+        self.assertEqual(review['qc_class'], 'PASS_WITH_WARNINGS')
+        self.assertEqual(review['recommendation'], 'MANUAL_REVIEW')
+        self.assertIn('ambiguous_overlap_conflicts_3', review['reasons'])
 
     def test_paper_trail_uses_batch_map_when_filenames_do_not_encode_primer(self):
         with tempfile.TemporaryDirectory() as tmpdir:

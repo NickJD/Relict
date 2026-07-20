@@ -33,6 +33,7 @@ class PaperTrailQCPolicy:
     warn_internal_low_quality_run: int = 5
     max_internal_low_quality_run: int = 20
     max_conflict_density: float = 1.0
+    max_ambiguous_overlap_conflicts_without_review: int = 2
     secondary_peak_ratio: float = 0.33
     max_mixed_peak_percent: float = 15.0
     mixed_peak_min_quality: int = 20
@@ -41,7 +42,7 @@ class PaperTrailQCPolicy:
     min_overlap_identity: float = 0.95
 
 
-PAPER_TRAIL_QC_POLICY_VERSION = '2.1'
+PAPER_TRAIL_QC_POLICY_VERSION = '2.2'
 DEFAULT_QC_POLICY = PaperTrailQCPolicy()
 
 
@@ -1314,6 +1315,7 @@ def _classify_output_qc(
     warn_n_percent: float,
     max_n_percent: float,
     max_conflict_density: float,
+    max_ambiguous_overlap_conflicts_without_review: int,
     processing_mode: str,
     mode_warning: str,
 ) -> dict[str, object]:
@@ -1356,7 +1358,7 @@ def _classify_output_qc(
         fail_reasons.append(status)
     elif status in {'single_read'} and len(group) > 1 and processing_mode == 'assemble':
         warn_reasons.append('only_one_primer_read_passed_qc')
-    if ambiguous:
+    if ambiguous > int(max_ambiguous_overlap_conflicts_without_review):
         warn_reasons.append(f'ambiguous_overlap_conflicts_{ambiguous}')
     unmerged = str(stats.get('unmerged_reads') or '').strip()
     if unmerged and processing_mode == 'assemble':
@@ -2296,6 +2298,7 @@ def _validate_qc_policy(
     warn_internal_low_quality_run: int,
     max_internal_low_quality_run: int,
     max_conflict_density: float,
+    max_ambiguous_overlap_conflicts_without_review: int,
     secondary_peak_ratio: float,
     max_mixed_peak_percent: float,
     mixed_peak_min_quality: int,
@@ -2320,6 +2323,7 @@ def _validate_qc_policy(
         'warn_internal_low_quality_run': warn_internal_low_quality_run,
         'max_internal_low_quality_run': max_internal_low_quality_run,
         'max_conflict_density': max_conflict_density,
+        'max_ambiguous_overlap_conflicts_without_review': max_ambiguous_overlap_conflicts_without_review,
         'mixed_peak_min_quality': mixed_peak_min_quality,
         'quality_difference': quality_difference,
     }
@@ -2365,6 +2369,7 @@ def run_paper_trail(
     warn_internal_low_quality_run: int = DEFAULT_QC_POLICY.warn_internal_low_quality_run,
     max_internal_low_quality_run: int = DEFAULT_QC_POLICY.max_internal_low_quality_run,
     max_conflict_density: float = DEFAULT_QC_POLICY.max_conflict_density,
+    max_ambiguous_overlap_conflicts_without_review: int = DEFAULT_QC_POLICY.max_ambiguous_overlap_conflicts_without_review,
     secondary_peak_ratio: float = DEFAULT_QC_POLICY.secondary_peak_ratio,
     max_mixed_peak_percent: float = DEFAULT_QC_POLICY.max_mixed_peak_percent,
     mixed_peak_min_quality: int = DEFAULT_QC_POLICY.mixed_peak_min_quality,
@@ -2400,6 +2405,7 @@ def run_paper_trail(
         warn_internal_low_quality_run=warn_internal_low_quality_run,
         max_internal_low_quality_run=max_internal_low_quality_run,
         max_conflict_density=max_conflict_density,
+        max_ambiguous_overlap_conflicts_without_review=max_ambiguous_overlap_conflicts_without_review,
         secondary_peak_ratio=secondary_peak_ratio,
         max_mixed_peak_percent=max_mixed_peak_percent,
         mixed_peak_min_quality=mixed_peak_min_quality,
@@ -2702,6 +2708,7 @@ def run_paper_trail(
                 warn_n_percent=float(warn_n_percent),
                 max_n_percent=float(max_n_percent),
                 max_conflict_density=float(max_conflict_density),
+                max_ambiguous_overlap_conflicts_without_review=int(max_ambiguous_overlap_conflicts_without_review),
                 processing_mode=processing_mode,
                 mode_warning=mode_warning,
             )
@@ -2979,6 +2986,7 @@ def run_paper_trail(
             f'warn_internal_low_quality_run\t{int(warn_internal_low_quality_run)}\tInternal low-quality/ambiguous run above which manual review is required',
             f'max_internal_low_quality_run\t{int(max_internal_low_quality_run)}\tLongest internal low-quality/ambiguous run allowed before read failure',
             f'max_conflict_density\t{float(max_conflict_density):g}\tMaximum overlap conflicts per 100 final bases before final failure',
+            f'max_ambiguous_overlap_conflicts_without_review\t{int(max_ambiguous_overlap_conflicts_without_review)}\tUnresolved overlap conflicts tolerated as N before manual review is required',
             f'secondary_peak_ratio\t{float(secondary_peak_ratio):g}\tSecondary dye peak divided by called-base peak used to flag mixed-template evidence',
             f'mixed_peak_review_percent\t{max(1.0, float(max_mixed_peak_percent) / 2.0):g}\tMixed-peak percent above which a passing read requires manual review',
             f'max_mixed_peak_percent\t{float(max_mixed_peak_percent):g}\tMaximum retained high-quality bases with secondary-peak evidence',

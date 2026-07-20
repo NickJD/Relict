@@ -3789,6 +3789,8 @@ def build_parser():
         help='Maximum internal low-quality/ambiguous run length before read failure (default: 20 bp).')
     paper_trail_parser.add_argument('--max-conflict-density', dest='max_conflict_density', type=float, default=paper_trail_policy.max_conflict_density,
         help='Maximum overlap conflicts per 100 final bases before final QC failure (default: 1.0).')
+    paper_trail_parser.add_argument('--max-ambiguous-overlap-conflicts-without-review', dest='max_ambiguous_overlap_conflicts_without_review', type=int, default=paper_trail_policy.max_ambiguous_overlap_conflicts_without_review,
+        help='Unresolved overlap conflicts tolerated as N before manual review is required (default: 2).')
     paper_trail_parser.add_argument('--quality-difference', dest='quality_difference', type=int, default=paper_trail_policy.quality_difference,
         help='Minimum Phred-scaled posterior odds required to resolve a conflicting overlap base (default: 10).')
     paper_trail_parser.add_argument('--allow-missing-quality', dest='allow_missing_quality',
@@ -4055,6 +4057,8 @@ def build_parser():
         help='Minimum Phred score for a mixed-peak position to count (default: 20).')
     assistant_parser.add_argument('--max-conflict-density', type=float, default=paper_trail_policy.max_conflict_density,
         help='Maximum overlap conflicts per 100 final bases before QC failure (default: 1.0).')
+    assistant_parser.add_argument('--max-ambiguous-overlap-conflicts-without-review', type=int, default=paper_trail_policy.max_ambiguous_overlap_conflicts_without_review,
+        help='Unresolved overlap conflicts tolerated as N before manual review is required (default: 2).')
     assistant_parser.add_argument('--quality-difference', type=int, default=paper_trail_policy.quality_difference,
         help='Phred-scaled posterior odds required to resolve an overlap conflict (default: 10).')
     assistant_parser.add_argument('--allow-missing-quality', action='store_true', default=False,
@@ -4434,6 +4438,7 @@ def cmd_paper_trail(args):
             warn_internal_low_quality_run=int(setting('warn_internal_low_quality_run', policy.warn_internal_low_quality_run)),
             max_internal_low_quality_run=int(setting('max_internal_low_quality_run', policy.max_internal_low_quality_run)),
             max_conflict_density=float(setting('max_conflict_density', policy.max_conflict_density)),
+            max_ambiguous_overlap_conflicts_without_review=int(setting('max_ambiguous_overlap_conflicts_without_review', policy.max_ambiguous_overlap_conflicts_without_review)),
             quality_difference=int(setting('quality_difference', policy.quality_difference)),
             allow_missing_quality=bool(getattr(args, 'allow_missing_quality', False)),
             min_overlap=int(setting('min_overlap', policy.min_overlap)),
@@ -4858,6 +4863,7 @@ def cmd_assistant(args):
                 max_mixed_peak_percent=args.max_mixed_peak_percent,
                 mixed_peak_min_quality=args.mixed_peak_min_quality,
                 max_conflict_density=args.max_conflict_density,
+                max_ambiguous_overlap_conflicts_without_review=args.max_ambiguous_overlap_conflicts_without_review,
                 quality_difference=args.quality_difference,
                 allow_missing_quality=args.allow_missing_quality,
                 min_overlap=args.min_overlap, min_overlap_identity=args.min_overlap_identity,
