@@ -42,7 +42,27 @@ from branchmanager.utils.fasta import read_fasta, write_fasta
 from branchmanager.utils.subprocess import run_cmd
 
 logger = logging.getLogger(__name__)
-VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl'
+VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl+qcov+tcov'
+
+
+def _alignment_evidence(parts: list[str]) -> tuple[Optional[float], Optional[int]]:
+    """Return VSEARCH query coverage and alignment length from a userout row."""
+    if len(parts) < 12:
+        return None, None
+    try:
+        alignment_length = int(float(parts[3]))
+        query_length = int(float(parts[10]))
+    except (TypeError, ValueError):
+        return None, None
+    try:
+        query_coverage = float(parts[12]) if len(parts) >= 14 else (
+            100.0 * alignment_length / query_length if query_length > 0 else None
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        query_coverage = None
+    if query_coverage is not None:
+        query_coverage = max(0.0, min(100.0, query_coverage))
+    return query_coverage, alignment_length
 
 
 def run_novelty(
@@ -226,15 +246,7 @@ def _parse_best_hits(matches_path: str) -> dict[str, tuple[float, str, Optional[
                     pct_id = float(parts[2])
                 except ValueError:
                     continue
-                query_coverage = None
-                alignment_length = None
-                if len(parts) >= 12:
-                    try:
-                        alignment_length = int(float(parts[3]))
-                        query_length = int(float(parts[10]))
-                        query_coverage = 100.0 * alignment_length / query_length if query_length > 0 else None
-                    except (TypeError, ValueError, ZeroDivisionError):
-                        pass
+                query_coverage, alignment_length = _alignment_evidence(parts)
                 if qid not in best or pct_id > best[qid][0]:
                     best[qid] = (pct_id, hit_id, query_coverage, alignment_length)
     except FileNotFoundError:
@@ -748,15 +760,7 @@ def _run_nearest_search(
                 except Exception:
                     continue
                 if parts[0] not in best or pct > best[parts[0]][0]:
-                    query_coverage = None
-                    alignment_length = None
-                    if len(parts) >= 12:
-                        try:
-                            alignment_length = int(float(parts[3]))
-                            query_length = int(float(parts[10]))
-                            query_coverage = 100.0 * alignment_length / query_length if query_length > 0 else None
-                        except (TypeError, ValueError, ZeroDivisionError):
-                            pass
+                    query_coverage, alignment_length = _alignment_evidence(parts)
                     best[parts[0]] = (pct, parts[1], query_coverage, alignment_length)
     return best
 
@@ -1187,6 +1191,8 @@ def _baseline_evidence_class(qid, hungate_metrics, secondary_metrics, cultured_m
     hungate = hungate_metrics.get(qid, {})
     secondary = secondary_metrics.get(qid, {})
     cultured = cultured_metrics.get(qid, {})
+    hungate_available = _pool_has_hit(hungate)
+    secondary_available = _pool_has_hit(secondary)
     if not any(_pool_has_hit(row) for row in (hungate, secondary, cultured)):
         return 'NO CULTURED BASELINE AVAILABLE'
     if any(
@@ -1194,15 +1200,26 @@ def _baseline_evidence_class(qid, hungate_metrics, secondary_metrics, cultured_m
         for row in (hungate, secondary)
     ):
         return 'CULTURED BASELINE REDUNDANT'
-    if _passes_identity_coverage(
+    hungate_covered = _passes_identity_coverage(
         hungate, DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY, DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
-    ):
-        return 'HUNGATE COVERED'
-    if _passes_identity_coverage(
+    )
+    secondary_covered = _passes_identity_coverage(
         secondary, DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY, DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE,
-    ):
-        return 'HUNGATE GAP / SECONDARY COVERED'
-    return 'NOVEL TO BOTH BASELINES'
+    )
+    if hungate_covered:
+        return 'HUNGATE COVERED'
+    if secondary_covered:
+        return (
+            'HUNGATE GAP / SECONDARY COVERED' if hungate_available
+            else 'SECONDARY COVERED / HUNGATE NOT ASSESSED'
+        )
+    if hungate_available and secondary_available:
+        return 'NOVEL TO BOTH BASELINES'
+    if hungate_available:
+        return 'NOVEL TO HUNGATE / SECONDARY NOT ASSESSED'
+    if secondary_available:
+        return 'NOVEL TO SECONDARY BASELINE / HUNGATE NOT ASSESSED'
+    return 'NO CULTURED BASELINE AVAILABLE'
 
 
 def _write_novelty_metrics_table(

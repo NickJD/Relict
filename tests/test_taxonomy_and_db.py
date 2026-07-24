@@ -25,6 +25,7 @@ from branchmanager.pipeline import novelty as novelty_pipeline
 from branchmanager.pipeline import neighbourhood as neighbourhood_pipeline
 from branchmanager.pipeline import cluster_report as cluster_report_pipeline
 from branchmanager.pipeline import background_check as background_check_pipeline
+from branchmanager.pipeline import diversity_metadata as diversity_pipeline
 from branchmanager.pipeline import mwl as mwl_pipeline
 from branchmanager.pipeline import selection_sets as selection_sets_pipeline
 from branchmanager.pipeline import quarterly_review as quarterly_review_pipeline
@@ -500,6 +501,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             '--mwl', 'MWL.xlsx',
             '--mwl-sheet', 'MWL_V1',
             '--mwl-min-rank', 'order',
+            '--diversity-metadata', 'diversity.tsv',
             '--partner-metadata', 'partner_metadata.tsv',
             '--baseline-fasta', 'hungate.fna',
             '--baseline-dataset', 'Hungate',
@@ -514,6 +516,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.mwl, 'MWL.xlsx')
         self.assertEqual(args.mwl_sheet, 'MWL_V1')
         self.assertEqual(args.mwl_min_rank, 'order')
+        self.assertEqual(args.diversity_metadata, 'diversity.tsv')
         self.assertEqual(args.partner_metadata, 'partner_metadata.tsv')
         self.assertEqual(args.baseline_fasta, 'hungate.fna')
         self.assertEqual(args.baseline_dataset, 'Hungate')
@@ -545,6 +548,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
             '--genome-budget', '24', '--backups-per-primary', '2',
             '--tree', 'current_tree.nwk', '--alignment', 'current_alignment.fasta',
             '--assessment', 'sequence_assessment.tsv',
+            '--diversity-metadata', 'diversity.tsv',
         ])
         self.assertEqual(args.command, 'quarterly-review')
         self.assertEqual(args.genome_budget, 24)
@@ -555,6 +559,7 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.baseline_extension_min_query_coverage, 95.0)
         self.assertEqual(args.alignment, 'current_alignment.fasta')
         self.assertEqual(args.assessment, ['sequence_assessment.tsv'])
+        self.assertEqual(args.diversity_metadata, 'diversity.tsv')
 
     def test_find_preferred_id_map_prefers_filing_cabinet_mapping(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2468,6 +2473,26 @@ class OutputHelperTests(unittest.TestCase):
             self.assertEqual(rows[0]['reference_nearest_hit_taxonomy'], 'd__Bacteria; p__Bacillota')
             self.assertEqual(rows[0]['reference_novelty_score'], '33.60')
 
+    def test_diversity_metadata_annotation_prefers_rare_metadata_combinations(self):
+        rows = [
+            {'id': 'cow_uk', 'partner_id': 'QUB'},
+            {'id': 'yak_np', 'partner_id': 'QUB'},
+            {'id': 'cow_uk_2', 'partner_id': 'QUB'},
+        ]
+        metadata = [
+            {'source_id': 'cow_uk', 'metadata': {'host': 'cow', 'country': 'UK'}},
+            {'source_id': 'yak_np', 'metadata': {'host': 'yak', 'country': 'Nepal'}},
+            {'source_id': 'cow_uk_2', 'metadata': {'host': 'cow', 'country': 'UK'}},
+        ]
+        matched, warnings = diversity_pipeline.annotate_assessment_rows(rows, metadata)
+        self.assertEqual(matched, 3)
+        self.assertEqual(warnings, [])
+        by_id = {row['id']: row for row in rows}
+        self.assertEqual(by_id['yak_np']['diversity_metadata_present'], 'Yes')
+        self.assertEqual(by_id['yak_np']['diversity_metadata_strength'], 'HIGH')
+        self.assertGreater(float(by_id['yak_np']['diversity_metadata_score']), float(by_id['cow_uk']['diversity_metadata_score']))
+        self.assertIn('host=yak', by_id['yak_np']['diversity_metadata_reason'])
+
     def test_write_selection_summary_tsv_keeps_board_facing_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / 'selection_summary.tsv'
@@ -2503,6 +2528,11 @@ class OutputHelperTests(unittest.TestCase):
                     'mwl_matched_rank': 'genus',
                     'mwl_matched_taxon': 'g__Novel',
                     'mwl_score': '88.00',
+                    'diversity_metadata_present': 'Yes',
+                    'diversity_metadata_strength': 'HIGH',
+                    'diversity_metadata_score': '95.00',
+                    'diversity_metadata_informative_fields': '2',
+                    'diversity_metadata_reason': 'host=yak (1/2); country=nepal (1/2)',
                     'in_tree': 'Yes',
                     'cluster_representative': 'self',
                     'cluster_size': '1',
@@ -2562,6 +2592,8 @@ class OutputHelperTests(unittest.TestCase):
             )
             self.assertIn('HIGH	PASS_HIGH_CONFIDENCE	NOT_REQUIRED', text)
             self.assertIn('MWL target match (g__Novel)', text)
+            self.assertIn('diversity metadata supports an underrepresented isolate', text)
+            self.assertIn('DiversityMetadataPresent', text)
             self.assertIn('neighbourhoods/clade_001.png', text)
             self.assertIn('Iso002\tUoG\tFalse\tNA\tLOWER PRIORITY - TARGET MET\tSET_B\tTARGET_MET', text)
             self.assertIn('assessment-species pangenome target already met', text)
@@ -2804,7 +2836,7 @@ class OutputHelperTests(unittest.TestCase):
         self.assertEqual(rows[2]['baseline_extension_status'], 'BASELINE_COVERAGE_BELOW_EXTENSION_THRESHOLD')
         self.assertTrue(all(row['sequencing_set_rank'] == 'NA' for row in rows))
 
-    def test_low_marker_evidence_does_not_hide_baseline_redundancy(self):
+    def test_low_marker_evidence_keeps_baseline_redundancy_provisional(self):
         row = {
             'id': 'WARN_REDUNDANT', 'partner_id': 'UoG',
             'taxonomy': 'd__Bacteria; g__Known; s__Known species',
@@ -2816,13 +2848,96 @@ class OutputHelperTests(unittest.TestCase):
             'genome_committed_count_same_species': '0',
             'placement_flags': 'MARKER_QC_REVIEW_REQUIRED',
         }
+        quarterly_input = dict(row)
         with tempfile.TemporaryDirectory() as tmpdir:
             selection_sets_pipeline.build_sequencing_sets([row], Path(tmpdir) / 'sequencing_sets.tsv')
+            quarterly = quarterly_review_pipeline.build_quarterly_review(
+                [quarterly_input], genome_budget=1, backups_per_primary=0,
+            )
 
-        self.assertEqual(row['sequencing_set_role'], 'BASELINE_REDUNDANT')
-        self.assertEqual(row['baseline_redundancy_status'], 'EXCLUDED_NEAR_IDENTICAL_BASELINE')
-        self.assertIn('marker evidence also requires review', row['sequencing_set_reason'])
-        self.assertEqual(build_selection_decision(row)['decision'], 'EXCLUDE - BASELINE REDUNDANT')
+        self.assertEqual(row['sequencing_set_role'], 'REVIEW_EVIDENCE')
+        self.assertEqual(
+            row['baseline_redundancy_status'],
+            'PENDING_REVIEW_NEAR_IDENTICAL_BASELINE',
+        )
+        self.assertIn('provisional near-identical cultured-baseline match', row['sequencing_set_reason'])
+        self.assertEqual(build_selection_decision(row)['decision'], 'REVIEW BEFORE SELECTION')
+        self.assertEqual(quarterly[0]['role'], 'REVIEW')
+        self.assertEqual(
+            quarterly[0]['baseline_redundancy_status'],
+            'PENDING_REVIEW_NEAR_IDENTICAL_BASELINE',
+        )
+
+    def test_missing_baseline_tier_is_reported_as_not_assessed(self):
+        hungate = {
+            'ISO1': {
+                'density_source': 'hungate_baseline:Hungate',
+                'nearest_identity': 94.0,
+                'nearest_query_coverage': 100.0,
+            },
+        }
+        secondary = {
+            'ISO1': {
+                'density_source': 'secondary_baseline:OtherRumen',
+                'nearest_identity': 94.0,
+                'nearest_query_coverage': 100.0,
+            },
+        }
+        self.assertEqual(
+            novelty_pipeline._baseline_evidence_class('ISO1', hungate, {}, hungate),
+            'NOVEL TO HUNGATE / SECONDARY NOT ASSESSED',
+        )
+        self.assertEqual(
+            novelty_pipeline._baseline_evidence_class('ISO1', hungate, secondary, hungate),
+            'NOVEL TO BOTH BASELINES',
+        )
+        covered_secondary = {
+            'ISO1': {
+                'density_source': 'secondary_baseline:OtherRumen',
+                'nearest_identity': 99.1,
+                'nearest_query_coverage': 100.0,
+            },
+        }
+        self.assertEqual(
+            novelty_pipeline._baseline_evidence_class(
+                'ISO1', {}, covered_secondary, covered_secondary,
+            ),
+            'SECONDARY COVERED / HUNGATE NOT ASSESSED',
+        )
+
+    def test_novelty_parser_uses_vsearch_query_coverage(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            matches = Path(tmpdir) / 'matches.tsv'
+            matches.write_text(
+                'ISO1\tHUN119\t91.5\t1114\t87\t8\t1\t1114\t1\t1384\t1114\t1384\t99.3\t79.9\n'
+            )
+            hit = novelty_pipeline._parse_best_hits(str(matches))['ISO1']
+        self.assertEqual(hit[2], 99.3)
+        self.assertEqual(hit[3], 1114)
+
+    def test_chimera_detected_is_blocked_in_selection_and_quarterly_review(self):
+        row = {
+            'id': 'QUB_0048', 'partner_id': 'QUB',
+            'taxonomy': 'd__Bacteria;g__Lachnospira;s__Lachnospira eligens_A',
+            'classification_identity': '95.4', 'classification_confidence': '0.954',
+            'classification_query_coverage': '100.0',
+            'nearest_identity': '93.6', 'nearest_query_coverage': '99.7',
+            'project_nearest_identity': '99.8', 'reference_nearest_identity': '95.4',
+            'selected_for_genome_sequencing': 'False', 'already_sequenced': 'False',
+            'genome_committed_count_same_species': '0',
+            'placement_flags': 'CHIMERA_DETECTED',
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_row = dict(row)
+            selection_sets_pipeline.build_sequencing_sets(
+                [selection_row], Path(tmpdir) / 'sequencing_sets.tsv',
+            )
+            quarterly = quarterly_review_pipeline.build_quarterly_review(
+                [dict(row)], genome_budget=1, backups_per_primary=0,
+            )
+
+        self.assertEqual(selection_row['sequencing_set_role'], 'REVIEW_EVIDENCE')
+        self.assertEqual(quarterly[0]['role'], 'REVIEW')
 
     def test_sequencing_sets_rank_nine_diverse_candidates_and_exclude_baseline_duplicate(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2868,6 +2983,29 @@ class OutputHelperTests(unittest.TestCase):
             text = Path(output).read_text()
             self.assertIn('DiversityPanelSize\tEligibleCandidateCount\tRankedCandidateCount', text)
             self.assertIn('BaselineRedundancyIdentityThreshold', text)
+
+    def test_selection_fallback_prefers_diversity_metadata_on_boundary_ties(self):
+        common = {
+            'partner_id': 'QUB',
+            'taxonomy': 'd__Bacteria; g__Panel; s__Panel species',
+            'classification_identity': '99.0', 'classification_confidence': '0.99',
+            'nearest_query_coverage': '100.0', 'project_nearest_identity': '98.0',
+            'reference_nearest_identity': '98.0', 'selected_for_genome_sequencing': 'False',
+            'already_sequenced': 'False', 'genome_committed_count_same_species': '0',
+            'placement_flags': '',
+            'nearest_identity': '97.5',
+        }
+        rows = [
+            {**common, 'id': 'COMMON', 'diversity_metadata_present': 'Yes', 'diversity_metadata_strength': 'LOW', 'diversity_metadata_score': '10.00', 'diversity_metadata_reason': 'host=cow (10/10)'},
+            {**common, 'id': 'DIVERSE', 'diversity_metadata_present': 'Yes', 'diversity_metadata_strength': 'HIGH', 'diversity_metadata_score': '92.00', 'diversity_metadata_reason': 'host=yak (1/10)'},
+            {**common, 'id': 'MWL', 'mwl_matched_rank': 'species', 'mwl_score': '100', 'diversity_metadata_present': 'No', 'diversity_metadata_strength': 'NA', 'diversity_metadata_score': '0.00', 'diversity_metadata_reason': 'no diversity metadata supplied'},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_sets_pipeline.build_sequencing_sets(rows, Path(tmpdir) / 'sets.tsv')
+
+        ranks = {row['id']: int(row['sequencing_set_rank']) for row in rows}
+        self.assertEqual(ranks['DIVERSE'], 1)
+        self.assertLess(ranks['DIVERSE'], ranks['COMMON'])
 
     def test_selection_fallback_ranks_diversity_before_mwl_and_uses_mwl_as_tiebreak(self):
         common = {

@@ -1,0 +1,24 @@
+sequence_id	partner_id	dataset	host	country	sampling_site	notes
+QUB_0001	QUB	QUB_01	cow	UK	rumen	typical host/location
+QUB_0005	QUB	QUB_01	yak	Nepal	rumen	rare host
+QUB_0047	QUB	QUB_01	sheep	UK	rumen	typical host/location
+QUB_0050	QUB	QUB_01	goat	UK	rumen	typical host/location
+SW_0017	UoG	UoG_01	cow	UK	faecal	typical host/location
+SW_0027	UoG	UoG_01	sheep	UK	rumen	typical host/location
+SW_0050	UoG	UoG_01	deer	Scotland	rumen	rare host/location
+SW_0114	UoG	UoG_01	cattle	Ireland	rumen	rare country
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

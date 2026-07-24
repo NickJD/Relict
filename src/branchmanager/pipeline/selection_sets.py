@@ -19,6 +19,7 @@ MWL_STRENGTH = {
     'order': 2, 'o': 2, 'class': 1, 'c': 1, 'phylum': 0, 'p': 0,
     'domain': 0, 'd': 0,
 }
+DIVERSITY_STRENGTH = {'high': 2, 'moderate': 1, 'low': 0, 'na': 0}
 EVIDENCE_STRENGTH = {'HIGH': 2, 'MODERATE': 1, 'LOW': 0}
 DEFAULT_PANGENOME_TARGET = 9
 DEFAULT_CANDIDATE_SET_SIZE = 9
@@ -26,6 +27,13 @@ DEFAULT_BASELINE_REDUNDANCY_IDENTITY = 99.8
 DEFAULT_BASELINE_REDUNDANCY_QUERY_COVERAGE = 95.0
 DEFAULT_BASELINE_EXTENSION_MIN_IDENTITY = 98.65
 DEFAULT_BASELINE_EXTENSION_MIN_QUERY_COVERAGE = 95.0
+SELECTION_BLOCKING_PLACEMENT_FLAGS = frozenset({
+    'NO_REFERENCE_HIT', 'NO_CLASSIFICATION',
+    'CHIMERA', 'CHIMERA_CONFIRMED', 'CHIMERA_DETECTED',
+    'CHIMERA_INDETERMINATE', 'CHIMERA_CHECK_SKIPPED', 'CHIMERA_NOT_RUN',
+    'VERY_SHORT', 'HIGH_N_CONTENT', 'MARKER_QC_FAILED',
+    'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED',
+})
 
 
 def _float(value, default: Optional[float] = None) -> Optional[float]:
@@ -64,12 +72,7 @@ def _evidence_quality(row: dict) -> str:
     confidence = _float(row.get('classification_confidence'))
     coverage = _float(row.get('classification_query_coverage'))
     taxonomy = str(row.get('taxonomy') or '').strip().lower()
-    # Use exact flag matching to avoid CHIMERA_INDETERMINATE being caught by a 'CHIMERA' substring check.
-    if flag_set & {
-        'NO_REFERENCE_HIT', 'NO_CLASSIFICATION', 'CHIMERA', 'CHIMERA_CONFIRMED',
-        'VERY_SHORT', 'HIGH_N_CONTENT', 'MARKER_QC_FAILED',
-        'MARKER_QC_REVIEW_REQUIRED', 'MARKER_QC_UNVERIFIED',
-    }:
+    if flag_set & SELECTION_BLOCKING_PLACEMENT_FLAGS:
         return 'LOW'
     # MARKER_QC_REVIEW_APPROVED: manual approval has addressed QC concerns; fall through to
     # standard identity/coverage checks so clean assemblies can still reach HIGH.
@@ -119,7 +122,12 @@ def _stable_set_id(group_key: str, prefix: str = 'BMSET') -> str:
 def _novel_looking(rows: Iterable[dict]) -> bool:
     for row in rows:
         evidence_class = str(row.get('baseline_evidence_class') or '').upper()
-        if evidence_class in {'NOVEL TO BOTH BASELINES', 'HUNGATE GAP / SECONDARY COVERED'}:
+        if evidence_class in {
+            'NOVEL TO BOTH BASELINES',
+            'NOVEL TO HUNGATE / SECONDARY NOT ASSESSED',
+            'NOVEL TO SECONDARY BASELINE / HUNGATE NOT ASSESSED',
+            'HUNGATE GAP / SECONDARY COVERED',
+        }:
             return True
         baseline = _float(row.get('nearest_identity'))
         reference = _float(row.get('reference_nearest_identity'))
@@ -186,8 +194,11 @@ def _baseline_evidence_rank(row: dict) -> int:
     evidence_class = str(row.get('baseline_evidence_class') or '').strip().upper()
     ranks = {
         'NOVEL TO BOTH BASELINES': 4,
+        'NOVEL TO HUNGATE / SECONDARY NOT ASSESSED': 3,
+        'NOVEL TO SECONDARY BASELINE / HUNGATE NOT ASSESSED': 3,
         'HUNGATE GAP / SECONDARY COVERED': 3,
         'HUNGATE COVERED': 2,
+        'SECONDARY COVERED / HUNGATE NOT ASSESSED': 2,
         'NO CULTURED BASELINE AVAILABLE': 1,
         'CULTURED BASELINE REDUNDANT': 0,
     }
@@ -310,6 +321,8 @@ def _evidence_tuple(row: dict) -> tuple:
     reference = _float(row.get('reference_nearest_identity'), 100.0)
     isolation = _float(row.get('phylo_isolation'), 0.0)
     confidence = _float(row.get('classification_confidence'), 0.0)
+    diversity_rank = DIVERSITY_STRENGTH.get(str(row.get('diversity_metadata_strength') or '').strip().lower(), 0)
+    diversity_score = _float(row.get('diversity_metadata_score'), 0.0)
     mwl = MWL_STRENGTH.get(str(row.get('mwl_matched_rank') or '').lower(), 0)
     mwl_score = _float(row.get('mwl_score'), 0.0)
     return (
@@ -319,6 +332,8 @@ def _evidence_tuple(row: dict) -> tuple:
         100.0 - float(project),
         100.0 - float(reference),
         float(isolation),
+        diversity_rank,
+        float(diversity_score),
         mwl,
         float(mwl_score),
         float(confidence),
@@ -336,6 +351,10 @@ def _ranking_reason(row: dict, opening: str, spread: Optional[float]) -> str:
     project = _float(row.get('project_nearest_identity'))
     if project is not None and project > 0:
         parts.append(f'nearest project marker {project:.2f}%')
+    diversity_strength = str(row.get('diversity_metadata_strength') or '').strip().upper()
+    if diversity_strength in {'HIGH', 'MODERATE'}:
+        reason = str(row.get('diversity_metadata_reason') or '').strip()
+        parts.append(f'diversity metadata {diversity_strength.lower()} confidence' + (f' ({reason})' if reason else ''))
     mwl_rank = str(row.get('mwl_matched_rank') or '').strip()
     if mwl_rank not in {'', 'NA', 'None'}:
         parts.append(f'MWL {mwl_rank}-level context')
@@ -556,7 +575,24 @@ def build_sequencing_sets(
             if retained_for_gap:
                 row['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP'
 
-            if redundant and not retained_for_gap:
+            if evidence_quality == 'LOW':
+                row['sequencing_set_role'] = 'REVIEW_EVIDENCE'
+                row['sequencing_set_reason'] = 'marker evidence requires review before selection'
+                if redundant and not retained_for_gap:
+                    row['baseline_redundancy_status'] = 'PENDING_REVIEW_NEAR_IDENTICAL_BASELINE'
+                    if is_baseline_extension:
+                        row['baseline_extension_status'] = 'PENDING_REVIEW_NEAR_IDENTICAL_BASELINE'
+                    row['sequencing_set_reason'] += (
+                        f'; provisional near-identical cultured-baseline match ({identity:.2f}% identity, '
+                        f'{coverage:.2f}% query coverage) must not drive exclusion before review'
+                    )
+                elif retained_for_gap:
+                    row['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP_PENDING_REVIEW'
+                    row['sequencing_set_reason'] += '; same-species pangenome gap remains'
+                else:
+                    row['baseline_redundancy_status'] = 'NOT_EVALUATED_EVIDENCE'
+                    row['baseline_extension_status'] = 'NOT_EVALUATED_EVIDENCE'
+            elif redundant and not retained_for_gap:
                 redundant_count += 1
                 row['sequencing_set_role'] = 'BASELINE_REDUNDANT'
                 row['baseline_redundancy_status'] = 'EXCLUDED_NEAR_IDENTICAL_BASELINE'
@@ -567,17 +603,6 @@ def build_sequencing_sets(
                     f'excluded at >={redundancy_identity:.2f}% identity and '
                     f'>={redundancy_coverage:.2f}% query coverage; MWL evidence does not override redundancy'
                 )
-                if evidence_quality == 'LOW':
-                    row['sequencing_set_reason'] += '; marker evidence also requires review'
-            elif evidence_quality == 'LOW':
-                row['sequencing_set_role'] = 'REVIEW_EVIDENCE'
-                row['sequencing_set_reason'] = 'marker evidence requires review before selection'
-                if retained_for_gap:
-                    row['baseline_redundancy_status'] = 'RETAINED_FOR_PANGENOME_GAP_PENDING_REVIEW'
-                    row['sequencing_set_reason'] += '; same-species pangenome gap remains'
-                else:
-                    row['baseline_redundancy_status'] = 'NOT_EVALUATED_EVIDENCE'
-                    row['baseline_extension_status'] = 'NOT_EVALUATED_EVIDENCE'
             elif is_baseline_extension and not extension_eligible:
                 row['sequencing_set_role'] = 'PANGENOME_BOUNDARY_REVIEW'
                 row['baseline_redundancy_status'] = 'NOT_EVALUATED_PANGENOME_BOUNDARY'

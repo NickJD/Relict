@@ -14,6 +14,7 @@ from branchmanager.taxonomy import (
     taxonomy_matches_kingdom,
 )
 from branchmanager.utils.fasta import read_fasta
+from branchmanager.pipeline.selection_sets import SELECTION_BLOCKING_PLACEMENT_FLAGS
 
 
 ClassificationRow = Dict[str, object]
@@ -1081,8 +1082,7 @@ def _evidence_quality(row: dict) -> str:
         return 'LOW'
     # MARKER_QC_REVIEW_APPROVED: manual approval has addressed QC concerns; fall through to
     # standard identity/coverage checks so clean assemblies can still reach HIGH.
-    # Use exact flag membership to avoid CHIMERA_INDETERMINATE matching as CHIMERA.
-    severe = bool(flags & {'NO_CLASSIFICATION', 'CHIMERA', 'CHIMERA_CONFIRMED', 'VERY_SHORT', 'HIGH_N_CONTENT'})
+    severe = bool(flags & SELECTION_BLOCKING_PLACEMENT_FLAGS)
     if severe or (classification_identity is not None and classification_identity < 90.0):
         return 'LOW'
     if query_coverage is not None and query_coverage < 80.0:
@@ -1118,6 +1118,8 @@ def build_selection_decision(row: dict) -> dict:
     mwl_rank = str(row.get('mwl_matched_rank') or '').lower()
     strong_mwl = mwl_match and mwl_rank in ('species', 's', 'genus', 'g', 'family', 'f')
     moderate_mwl = mwl_match and mwl_rank in ('order', 'o')
+    diversity_strength = str(row.get('diversity_metadata_strength') or '').strip().upper()
+    strong_diversity = diversity_strength in {'HIGH', 'MODERATE'}
     baseline_identity = _as_float(row.get('nearest_identity'))
     project_identity = _as_float(row.get('project_nearest_identity'))
     reference_identity = _as_float(row.get('reference_nearest_identity'))
@@ -1133,6 +1135,9 @@ def build_selection_decision(row: dict) -> dict:
         positive.append(f'MWL target match ({matched})')
     elif moderate_mwl:
         positive.append(f'MWL order-level context ({row.get("mwl_matched_taxon", "NA")})')
+    if strong_diversity:
+        reason = str(row.get('diversity_metadata_reason') or '').strip()
+        positive.append('diversity metadata supports an underrepresented isolate' + (f' ({reason})' if reason else ''))
     if baseline_identity is not None and _pool_available(row, 'density_source') and baseline_identity < 97.0:
         positive.append(f'no close cultured isolate ({baseline_identity:.2f}%)')
     if project_identity is not None and _pool_available(row, 'project_density_source') and project_identity < 97.0:
@@ -1161,10 +1166,10 @@ def build_selection_decision(row: dict) -> dict:
         decision = 'ALREADY SEQUENCED'
     elif pending:
         decision = 'ALREADY SELECTED - GENOME PENDING'
-    elif baseline_redundant:
-        decision = 'EXCLUDE - BASELINE REDUNDANT'
     elif evidence_quality == 'LOW':
         decision = 'REVIEW BEFORE SELECTION'
+    elif baseline_redundant:
+        decision = 'EXCLUDE - BASELINE REDUNDANT'
     elif boundary_review:
         decision = 'REVIEW - PANGENOME BOUNDARY'
     elif set_role == 'PRIMARY':
@@ -1277,6 +1282,16 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'MWLMatchedRank',
         'MWLMatchedTaxon',
         'MWLScore',
+        'DiversityMetadataPresent',
+        'DiversityMetadataStrength',
+        'DiversityMetadataScore',
+        'DiversityMetadataInformativeFields',
+        'DiversityMetadataReason',
+        'DiversityMetadataPresent',
+        'DiversityMetadataStrength',
+        'DiversityMetadataScore',
+        'DiversityMetadataInformativeFields',
+        'DiversityMetadataReason',
         'HungateGenomesSameSpecies',
         'SecondaryBaselineGenomesSameSpecies',
         'CulturedRumenGenomesSameSpecies',
@@ -1360,6 +1375,16 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('mwl_matched_rank', 'NA'),
                 row.get('mwl_matched_taxon', 'NA'),
                 row.get('mwl_score', 'NA'),
+                row.get('diversity_metadata_present', 'No'),
+                row.get('diversity_metadata_strength', 'NA'),
+                row.get('diversity_metadata_score', '0.00'),
+                row.get('diversity_metadata_informative_fields', '0'),
+                row.get('diversity_metadata_reason', 'NA'),
+                row.get('diversity_metadata_present', 'No'),
+                row.get('diversity_metadata_strength', 'NA'),
+                row.get('diversity_metadata_score', '0.00'),
+                row.get('diversity_metadata_informative_fields', '0'),
+                row.get('diversity_metadata_reason', 'NA'),
                 row.get('hungate_genome_count_same_species', 'NA'),
                 row.get('secondary_baseline_genome_count_same_species', 'NA'),
                 row.get('cultured_rumen_genome_count_same_species', row.get('genome_available_count_same_species', 'NA')),

@@ -22,6 +22,7 @@ from branchmanager.onboarding import validate_submission, write_onboarding_outpu
 from branchmanager.marker_provenance import load_marker_provenance, marker_qc_flag
 from branchmanager.personnel import load_exit_requests
 from branchmanager.pipeline.classify import _parse_vsearch_match
+from branchmanager.pipeline.chimera import _parse_uchime_row
 from branchmanager.pipeline.tree import _orient_tree_input_fasta
 from branchmanager.pipeline.workflow_helpers import build_selection_decision
 from branchmanager.project_state import import_genome_results
@@ -456,6 +457,46 @@ class OperationalWorkflowTests(unittest.TestCase):
         self.assertEqual(hit['gaps'], 6)
         self.assertAlmostEqual(hit['query_coverage'], 85.7142857)
         self.assertEqual(hit['target_coverage'], 80.0)
+
+    def test_classification_match_uses_vsearch_coverage_fields(self):
+        hit = _parse_vsearch_match([
+            'ISO1', 'GTDB1', '91.5', '1114', '87', '8',
+            '1', '1114', '1', '1384', '1114', '1384', '99.3', '79.9',
+        ])
+        self.assertEqual(hit['query_coverage'], 99.3)
+        self.assertEqual(hit['target_coverage'], 79.9)
+
+        legacy = _parse_vsearch_match([
+            'ISO1', 'GTDB1', '99.0', '101', '0', '1',
+            '1', '100', '1', '101', '100', '101',
+        ])
+        self.assertEqual(legacy['query_coverage'], 100.0)
+
+    def test_uchime_parser_uses_score_first_output_columns(self):
+        sequence_id, result = _parse_uchime_row(
+            '0.3055\tQUB_0048\tPARENT_A\tPARENT_B\t*\tY\n'
+        )
+        self.assertEqual(sequence_id, 'QUB_0048')
+        self.assertEqual(result['call'], 'CHIMERA')
+        self.assertEqual(result['score'], 0.3055)
+        self.assertEqual(result['left_parent'], 'PARENT_A')
+        self.assertEqual(result['right_parent'], 'PARENT_B')
+
+    def test_all_nonpassing_chimera_states_force_selection_review(self):
+        for flag in (
+            'CHIMERA_DETECTED', 'CHIMERA_INDETERMINATE',
+            'CHIMERA_CHECK_SKIPPED', 'CHIMERA_NOT_RUN',
+        ):
+            with self.subTest(flag=flag):
+                decision = build_selection_decision({
+                    'taxonomy': 'd__Bacteria;s__Example species',
+                    'classification_identity': '99.0',
+                    'classification_query_coverage': '100.0',
+                    'sequencing_set_role': 'PRIMARY',
+                    'placement_flags': flag,
+                })
+                self.assertEqual(decision['evidence_quality'], 'LOW')
+                self.assertEqual(decision['decision'], 'REVIEW BEFORE SELECTION')
 
     def test_older_project_database_is_migrated_deterministically(self):
         with tempfile.TemporaryDirectory() as tmpdir:

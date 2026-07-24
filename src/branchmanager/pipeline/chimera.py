@@ -10,6 +10,24 @@ from branchmanager.utils.fasta import read_fasta
 from branchmanager.utils.subprocess import run_cmd
 
 
+def _parse_uchime_row(line: str) -> tuple[str, dict] | None:
+    """Parse VSEARCH's score-first UCHIME output format."""
+    parts = line.rstrip('\n').split('\t')
+    if len(parts) < 2 or not parts[1]:
+        return None
+    call = str(parts[-1]).strip().upper()
+    try:
+        score = float(parts[0])
+    except (TypeError, ValueError):
+        score = None
+    return parts[1], {
+        'call': 'CHIMERA' if call == 'Y' else ('PASS' if call == 'N' else 'INDETERMINATE'),
+        'score': score,
+        'left_parent': parts[2] if len(parts) > 2 else '',
+        'right_parent': parts[3] if len(parts) > 3 else '',
+    }
+
+
 def run_reference_screen(query_fasta: str, reference_fasta: str, outdir: str, *, threads: int = 4) -> tuple[str, dict[str, dict]]:
     output = Path(outdir)
     output.mkdir(parents=True, exist_ok=True)
@@ -27,20 +45,11 @@ def run_reference_screen(query_fasta: str, reference_fasta: str, outdir: str, *,
     if raw.is_file():
         with open(raw) as handle:
             for line in handle:
-                parts = line.rstrip('\n').split('\t')
-                if not parts or not parts[0]:
+                parsed_row = _parse_uchime_row(line)
+                if parsed_row is None:
                     continue
-                call = str(parts[-1]).strip().upper() if len(parts) > 1 else '?'
-                try:
-                    score = float(parts[1])
-                except (IndexError, ValueError):
-                    score = None
-                parsed[parts[0]] = {
-                    'call': 'CHIMERA' if call == 'Y' else ('PASS' if call == 'N' else 'INDETERMINATE'),
-                    'score': score,
-                    'left_parent': parts[2] if len(parts) > 2 else '',
-                    'right_parent': parts[3] if len(parts) > 3 else '',
-                }
+                sequence_id, result = parsed_row
+                parsed[sequence_id] = result
     report = output / 'chimera_screen.tsv'
     with open(report, 'w') as handle:
         handle.write('SequenceID\tChimeraCall\tUCHIMEScore\tLeftParent\tRightParent\n')

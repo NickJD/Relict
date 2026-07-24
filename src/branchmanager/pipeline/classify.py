@@ -36,7 +36,7 @@ from branchmanager.pipeline.tree import is_ref_anchor
 logger = logging.getLogger(__name__)
 
 
-VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl'
+VSEARCH_USERFIELDS = 'query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl+qcov+tcov'
 
 
 def _parse_vsearch_match(parts: list[str]) -> Optional[dict]:
@@ -61,10 +61,21 @@ def _parse_vsearch_match(parts: list[str]) -> Optional[dict]:
                 'query_length': int(float(parts[10])),
                 'target_length': int(float(parts[11])),
             })
-            if result['query_length'] > 0:
-                result['query_coverage'] = 100.0 * result['alignment_length'] / result['query_length']
-            if result['target_length'] > 0:
-                result['target_coverage'] = 100.0 * result['alignment_length'] / result['target_length']
+            if len(parts) >= 14:
+                result['query_coverage'] = max(0.0, min(100.0, float(parts[12])))
+                result['target_coverage'] = max(0.0, min(100.0, float(parts[13])))
+            else:
+                # Compatibility for older cached 12-column matches. Alignment length
+                # includes gap columns, so it is only a fallback and must never yield
+                # biologically impossible coverage above 100%.
+                if result['query_length'] > 0:
+                    result['query_coverage'] = min(
+                        100.0, 100.0 * result['alignment_length'] / result['query_length'],
+                    )
+                if result['target_length'] > 0:
+                    result['target_coverage'] = min(
+                        100.0, 100.0 * result['alignment_length'] / result['target_length'],
+                    )
         except (TypeError, ValueError, ZeroDivisionError):
             pass
     return result
