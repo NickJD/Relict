@@ -1504,6 +1504,15 @@ def _cmd_filing_cabinet_impl(args):
         try:
             tree_path = Path(outdir) / 'current_tree.nwk'
             tfile = str(tree_path) if tree_path.exists() else _find_tree_file_in_dir(outdir)
+            if tfile == None:
+                logging.getLogger(__name__).info(
+                    "[FILING CABINET] No tree generated but there probably should have been?"
+                )
+                # write brief explanations for files produced by the Filing Cabinet
+                try:
+                    _write_output_explanations(outdir)
+                except Exception:
+                    pass
             itol.generate_itol_colours(str(combined_tax), outdir, user_colour_csv=getattr(args, 'colours', None), id_map=id_map, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
             logging.getLogger(__name__).info("[FILING CABINET] Generated iTOL colour files in %s", outdir)
         except TypeError:
@@ -3350,8 +3359,8 @@ def build_parser():
         help='Replace input headers with compact IDs (e.g. HUN001). Default is to preserve the IDs exactly as supplied.')
     filing_cabinet_parser.add_argument('--classify', action='store_true',
         help='Classify sequences against --ref and store taxonomy in the DB. Requires --ref.')
-    filing_cabinet_parser.add_argument('--build-tree', action='store_true',
-        help='Build the backbone MAFFT + FastTree phylogenetic tree after loading.')
+    filing_cabinet_parser.add_argument('--build-tree', action='store_false',
+        help='Don\'t build the backbone MAFFT + FastTree phylogenetic tree after loading.')
     filing_cabinet_parser.add_argument('--ref', required=False,
         help='Reference FASTA (GTDB/SILVA reps) for classification and tree orientation. Preferred over --taxa-assignments for externally classified inputs.')
     filing_cabinet_parser.add_argument('--taxa', required=False,
@@ -4426,7 +4435,8 @@ def cmd_paper_trail(args):
         primer_sequences[name.strip().upper()] = sequence
     manifest = RunManifest(outdir, workflow_name)
     dataset_hint = (
-        _infer_qc_dataset_from_path(sample_map)
+        str(getattr(args, 'dataset', '') or '').strip()
+        or _infer_qc_dataset_from_path(sample_map)
         or _infer_qc_dataset_from_path(getattr(args, 'mailroom_summary', None))
         or _infer_qc_dataset_from_path(outdir)
     )
@@ -4894,6 +4904,7 @@ def cmd_assistant(args):
         if args.sample_map:
             trace_args = argparse.Namespace(
                 command='paper-trail', input=[], out=str(paper_trail_dir),
+                dataset=args.dataset,
                 sample_map=str(onboarding_dir / 'normalised_read_map.tsv'), primers=args.primers,
                 primer_sequences=args.primer_sequences, trim_primers=args.trim_primers,
                 min_quality=args.min_quality, min_length=args.min_length,

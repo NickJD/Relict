@@ -232,3 +232,5 @@ AGENTS.md
 *.db-wal
 *.lock
 src/branchmanager/.../
+
+~$anchmanager_overview.docx

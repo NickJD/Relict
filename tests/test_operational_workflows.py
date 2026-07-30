@@ -26,7 +26,7 @@ from branchmanager.pipeline.chimera import _parse_uchime_row
 from branchmanager.pipeline.tree import _orient_tree_input_fasta
 from branchmanager.pipeline.workflow_helpers import build_selection_decision
 from branchmanager.project_state import import_genome_results
-from branchmanager.reporting import write_annual_report
+from branchmanager.reporting import _manifest_dataset, write_annual_report
 from branchmanager.run_manifest import file_record
 from branchmanager.utils.subprocess import run_cmd
 
@@ -245,6 +245,68 @@ class OperationalWorkflowTests(unittest.TestCase):
             self.assertTrue(Path(outputs['readme_html']).is_file())
             self.assertTrue(Path(outputs['removals']).is_file())
             self.assertTrue(Path(outputs['decision_changes']).is_file())
+
+    def test_manifest_dataset_prefers_command_dataset_over_assistant_suffix(self):
+        data = {
+            'workflow': 'paper_trail',
+            'dataset': 'QUB_01_assistant',
+            'command': ['branchmanager', 'assistant', '--dataset', 'QUB_01'],
+        }
+        self.assertEqual(_manifest_dataset(data), 'QUB_01')
+
+    def test_annual_report_uses_logical_dataset_for_assistant_subruns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = Database(str(root / 'project.sqlite'))
+            db.initialise()
+            db.insert_sequences([('QUB1', 'ACGT')], dataset='QUB_01')
+            db.upsert_dataset_role('QUB_01', 'candidate')
+
+            paper_trail_dir = root / 'QUB_01_assistant' / '02_paper_trail_merge_meeting'
+            paper_trail_dir.mkdir(parents=True)
+            assembly = paper_trail_dir / 'assembly_report.tsv'
+            assembly.write_text(
+                'SequenceID\tQCClass\tRecommendation\n'
+                'QUB1\tPASS_HIGH_CONFIDENCE\tACCEPT\n'
+            )
+            read_qc = paper_trail_dir / 'read_qc.tsv'
+            read_qc.write_text('ReadID\tSequenceID\tStatus\nR1\tQUB1\tkept\n')
+            failed_manifest = paper_trail_dir / 'failed_qc_manifest.tsv'
+            failed_manifest.write_text('SequenceID\tQCClass\n')
+            failed_read_manifest = paper_trail_dir / 'failed_read_manifest.tsv'
+            failed_read_manifest.write_text('SequenceID\tReadID\n')
+            visual_dir = paper_trail_dir / 'visual_reports'
+            visual_dir.mkdir()
+            preview = visual_dir / 'read_error_profiles.png'
+            preview.write_bytes(b'\x89PNG\r\n\x1a\n')
+            visual_manifest = paper_trail_dir / 'visual_report_manifest.tsv'
+            visual_manifest.write_text(
+                'Report\tPage\tFile\n'
+                'read_error_profiles\t1\tvisual_reports/read_error_profiles.png\n'
+            )
+            (paper_trail_dir / 'run_manifest.json').write_text(json.dumps({
+                'workflow': 'paper_trail',
+                'status': 'COMPLETE',
+                'started_at': '2026-07-29T14:08:14Z',
+                'completed_at': '2026-07-29T14:09:11Z',
+                'dataset': 'QUB_01_assistant',
+                'command': ['branchmanager', 'assistant', '--dataset', 'QUB_01'],
+                'outputs': [
+                    {'role': 'assembly_tsv', 'path': str(assembly)},
+                    {'role': 'read_qc_tsv', 'path': str(read_qc)},
+                    {'role': 'failed_manifest_tsv', 'path': str(failed_manifest)},
+                    {'role': 'failed_read_manifest_tsv', 'path': str(failed_read_manifest)},
+                    {'role': 'visual_manifest_tsv', 'path': str(visual_manifest)},
+                ],
+            }))
+
+            outputs = write_annual_report(db, root / 'annual_report')
+            dataset_summary = Path(outputs['datasets']).read_text()
+            html = Path(outputs['html']).read_text()
+            self.assertIn('QUB_01\tcandidate', dataset_summary)
+            self.assertNotIn('QUB_01_assistant', dataset_summary)
+            self.assertNotIn('<td>QUB_01_assistant</td>', html)
+            self.assertGreaterEqual(html.count('<td>QUB_01</td>'), 3)
 
     def test_annual_report_discovers_failed_manifest_and_staged_dataset(self):
         with tempfile.TemporaryDirectory() as tmpdir:

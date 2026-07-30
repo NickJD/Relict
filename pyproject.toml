@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "BranchManager"
+version = "0.1.0"
+authors = [
+    {name = "Nicholas Dimonaco", email = "nicholas@dimonaco.co.uk"}
+]
+description = "BranchManager: Answers the critical question — Has this microbial lineage already been isolated and characterised, or is it sufficiently novel and underrepresented to justify whole-genome sequencing (WGS) investment?"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+keywords = ["Isolate Collection", "Marker Gene", "Whole Genome Sequencing", "Microbial Lineage", "Novelty Assessment"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "matplotlib>=3.10.8"
+]
+
+[project.urls]
+Homepage = "https://github.com/NickJD/BranchManager"
+"Bug Tracker" = "https://github.com/NickJD/BranchManager/issues"
+
+[project.scripts]
+BranchManager = "BranchManager.cli:main"
+
+
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["BranchManager*"]
+
+[tool.setuptools.package-data]
+BranchManager = [
+    # anchors
+    "db/*",
+
+]

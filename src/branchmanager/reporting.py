@@ -254,7 +254,10 @@ def _dataset_from_path_hint(value: object) -> str:
 
 
 def _manifest_dataset(data: dict, path: Path | None = None) -> str:
-    direct = str(data.get('dataset') or _command_value(data.get('command'), '--dataset') or '').strip()
+    command_dataset = str(_command_value(data.get('command'), '--dataset') or '').strip()
+    if command_dataset:
+        return command_dataset
+    direct = str(data.get('dataset') or '').strip()
     if direct:
         return direct
     mailroom = _command_value(data.get('command'), '--mailroom')

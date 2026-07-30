@@ -1,45 +1,93 @@
-# BranchManager
+**SYSTEM OVERVIEW & GUIDE**
 
-**Research workflow for marker-gene assessment and genome-candidate selection.**
+**BranchManager**
 
-**Marker-gene QC, taxonomy, novelty scoring, and isolate prioritisation for genome-sequencing candidate selection.**
+Marker-Gene Quality Control, Novelty Scoring, & Genome-Candidate Prioritisation Toolkit
 
-BranchManager helps answer the question:
+**Core Mission:** _Answers the critical question - "Has this microbial lineage already been isolated and characterised, or is it sufficiently novel and underrepresented to justify whole-genome sequencing (WGS) investment?"_
 
-> Has this lineage already been seen and characterised, or is it still poorly represented enough to justify deeper follow-up such as whole-genome sequencing?
+**1\. Executive Summary**
 
-It combines Sanger/AB1 quality control, marker-gene taxonomic classification, nearest-neighbour novelty scoring, neighbourhood density (crowding), Most Wanted List matching, and phylogenetic tree visualisation into sequence assessment and selection reports.
+**BranchManager** is an end-to-end biological decision-support platform built for microbiology laboratories, research consortia, and biobanks managing large isolate collections. When processing thousands of physical isolates, determining which candidates warrant high-cost downstream sequencing is a major bottleneck.
 
+BranchManager streamlines this process by evaluating marker-gene sequences (such as 16S rRNA), performing strict quality control on raw instrument chromatograms, classifying sequences across multiple global taxonomy databases, measuring multi-layered biological novelty, and proposing optimal primary and backup candidate sets for whole-genome sequencing.
 
----
-## Core Ethos
-* Absence of a hit is not automatically **novelty**. It may indicate poor sequence quality, a chimera, contamination, inadequate coverage, or reference incompleteness.
-* Facts and recommendations remain separate. already_sequenced, genome QC, and DNA availability are factual states; PRIMARY and BACKUP are recommendations.
-* Uncertainty must survive into the final report. Do not collapse everything into one opaque score.
-* Selection-critical stages fail closed. An incomplete tree, novelty calculation, or candidate set must never produce a superficially successful report.
-* Every decision is reproducible from raw AB1 files.
-* Project-changing workflows use a staged SQLite copy and publish it only after required outputs and database integrity checks pass.
-* 16S supports selection groups, not definitive species or strain boundaries. The 98.65% boundary is useful as a heuristic but is not equivalent to genomic species assignment; published work estimates meaningful exceptions even above that threshold.
+| **🔬 Automated Quality Control**<br><br>Evaluates raw Sanger/AB1 chromatogram trace files, trims low-quality ends, detects mixed peaks, quality-weights overlapping reads, and isolates failed sequences for manual review. | **🌐 Multi-Lens Novelty**<br><br>Measures sequence divergence independently against internal physical lab baselines (The Hungate Collection), rolling multi-partner candidate collections, and global public references (GTDB, SILVA). | **🎯 Balanced Selection**<br><br>Maintains configurable pangenome targets per species, picking primary target candidates to fill genomic gaps while reserving backup strains for extraction failure resilience. |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 
-## Workflow vocabulary
+**2\. Core Operational Ethos & Principles**
 
-| Stage | Purpose |
-|---|---|
-| **Mailroom** | Inventory an AB1 delivery, reconcile supplier read IDs, and prepare the per-batch map |
-| **Interview** | Run standalone AB1 conversion, assembly, QC, and resequencing triage before project evaluation |
-| **Onboarding** | Validate partner IDs, metadata, and raw-file ownership before analysis |
-| **Paper Trail** | Read AB1 base calls, Phred scores, peak positions, dye channels, and mixed-peak evidence |
-| **Merge Meeting** | Trim primers and assemble multiple primer reads, or choose the best independent read |
-| **Filing Cabinet** | Register cultured baseline isolates and establish the initial phylogenetic context |
-| **Performance Review** | Classify markers, screen chimeras, score novelty, and update the MSA/tree |
-| **Hiring Panel** | Propose primary and backup isolate sets for the current evidence state |
-| **Quarterly Review** | Reconsider the complete collection for a later, budgeted genome tranche |
-| **Status Meeting** | Import factual isolate lifecycle progress |
-| **Records Update** | Import completed genome/QC/GTDB/ANI evidence |
-| **Annual Report** | Produce the cumulative marker-to-genome close-out report |
-| **Assistant to the Branch Manager** | Run Onboarding through the Hiring Panel for one submission |
+**• Absence of a Hit ≠ Novelty:** A sequence lacking close reference hits is not automatically novel. It may represent poor trace quality, chimeric sequences, contamination, or incomplete coverage. BranchManager enforces strict QC filtering before novelty scoring.
 
-The names are navigation aids. Manifests and reports always retain explicit scientific operation names and thresholds.
+**• Facts vs. Recommendations are Kept Distinct:** Factual states (e.g., physical DNA availability, confirmed genome presence, QC status) are maintained independently from recommendation states (e.g., Primary vs. Backup nomination). Recommendation flags never modify factual records automatically.
+
+**• Fail-Closed Safety Principles:** Selection-critical processes fail closed. An incomplete tree build, unverified quality score, or broken novelty calculation will halt report publication rather than generating superficially valid recommendations.
+
+**• Novelty is Relative to YOUR Project:** Novelty metrics specifically measure how unique an isolate is compared to what your project or lab has already characterised, helping to prevent redundant sequencing of strains already in your freezer.
+
+**3\. The Workflow Stages ("Office Vocabulary")**
+
+BranchManager uses an "office workflow" vocabulary to guide users through the multi-step candidate selection lifecycle from initial delivery to annual reporting:
+
+| **Workflow Stage**      | **Scientific Purpose**                                                                                            | **Key Outputs & Deliverables**                                                           |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **Mailroom**            | Inventories physical AB1 chromatogram deliveries, reconciles read IDs, and verifies primer metadata.              | Batch map (ab1_map.tsv), read inventory, missing/duplicate read reports.                 |
+| **Interview**           | Standalone chromatogram QC and resequencing triage without project database modifications.                        | QC assembly report, resequencing recommendations, failed trace manifests.                |
+| **Onboarding**          | Validates metadata ledgers, confirms isolate ownership, and enforces unique project ID mapping.                   | Normalised input datasets, partner ledger validation logs.                               |
+| **Paper Trail & Merge** | Converts raw AB1/FASTQ traces, trims low-quality ends, masks low-confidence bases, and merges multi-primer reads. | Assembled FASTA, per-base error profiles, trace visual reports, manual review templates. |
+| **Filing Cabinet**      | Registers cultured baseline datasets (e.g., Hungate) and constructs initial reference backbone trees.             | Baseline taxonomy tables, initial tree structures, baseline identity maps.               |
+| **Performance Review**  | Classifies marker sequences, screens chimeras, scores multi-lens novelty, and updates phylogenetic trees.         | Sequence audit table, novelty summary, iTOL metadata strips, local clade figures.        |
+| **Hiring Panel**        | Proposes group-level primary and backup isolate candidates based on current pangenome targets.                    | Selection summaries, primary/backup diversity plans, dashboard interface.                |
+| **Quarterly Review**    | Reconsiders full collections across partner batches to select budgeted genome sequencing tranches.                | Tranche nomination lists, marginal distance audits, updated clade visual maps.           |
+| **Status & Records**    | Imports factual lab progress (e.g., extraction success, completed WGS assemblies, ANI results).                   | Updated genome collections, factual isolate status logs, ANI quality gates.              |
+| **Annual Report**       | Generates cumulative, audit-ready marker-to-genome close-out reports for institutional stakeholders.              | Executive HTML dashboard, complete historical audit trail, ledger close-outs.            |
+
+**4\. Key System Tools & Operational Modules**
+
+**Unified Golden-Path Runner (assistant)**
+
+The primary standard execution route. It orchestrates Onboarding, Paper Trail quality control, Performance Review novelty calculations, and Hiring Panel candidate selection in an integrated sequence with zero manual intermediate handling.
+
+**Chromatogram Quality Control Engine (mailroom, interview, paper-trail)**
+
+Processes raw Sanger sequencing files. Performs Phred quality score evaluation, end-trimming, internal base masking, dye-channel peak analysis for mixed/heterozygous positions, and orientation-aware multi-read consensus assembly. Sequences failing QC are isolated in a dedicated triage folder with detailed diagnostic reason codes.
+
+**Baseline & Reference Classifier (filing-cabinet)**
+
+Loads physical baseline datasets (such as cultured strain biobanks) to anchor phylogenetic trees and establish the initial novelty threshold. Supports multi-database taxonomic reporting (GTDB, SILVA, GG2, NCBI).
+
+**Novelty Scoring & Selection Engine (performance-review, quarterly-review)**
+
+Evaluates incoming candidate datasets against the accumulating project database. Calculates neighbourhood crowding metrics, identifies baseline-redundant strains (≥99.8% identity across ≥95% alignment), and applies farthest-first phylogenetic branch distance calculations to pick optimal isolate subsets.
+
+**Focused Taxonomy Slicing & Tree Styling (org-chart, label-maker)**
+
+Allows researchers to instantly extract specific taxons (e.g., domain Archaea or family Lachnospiraceae) from existing alignments to generate high-resolution focused phylogenetic trees and customise interactive iTOL visual metadata strips without recomputing alignments.
+
+**5\. Candidate Selection & Decision Categories**
+
+BranchManager replaces subjective manual picking with a transparent, evidence-based selection model. Decisions are presented clearly for expert-human review:
+
+| **Decision Category**            | **Status Type**        | **Scientific Rationale & Use Case**                                                                                                       |
+| -------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| **PRIORITISE - SET PRIMARY**     | **Primary Nomination** | High-value candidate filling an unrepresented species gap or missing pangenome slot. Highest priority for WGS.                            |
+| **RESERVE - SET BACKUP**         | **Backup Candidate**   | Phylogenetically diverse strain retained as a secondary option in case the primary candidate fails DNA extraction or library preparation. |
+| **EXCLUDE - BASELINE REDUNDANT** | **Excluded Strain**    | Strain sharing ≥99.8% 16S identity over ≥95% coverage with an already-cultured baseline strain. Omitted to prevent redundant sequencing.  |
+| **REVIEW - PANGENOME BOUNDARY**  | **Manual Review**      | Sequence falls near species identity boundaries; requires manual review to confirm if it represents a distinct novel lineage.             |
+| **LOWER PRIORITY - TARGET MET**  | **Lower Priority**     | The maximum target number of genomes for this exact GTDB species has already been satisfied by existing baseline or pending genomes.      |
+
+**6\. Core Benefits & Strategic Value**
+
+**• Sequencing Budget Optimisation:** Prevents spending WGS resources on isolates that duplicate strains already characterised in internal or public biobanks.
+
+**• Multi-Partner Harmonisation:** Provides a single source of truth database across multiple contributing laboratories, ensuring consistent ID mapping and metadata tracking.
+
+**• Maximum Diversity Capture:** Utilises branch-length algorithms to pick candidates that maximise phylogenetic spread across target clades.
+
+**• Full Auditability & Reproducibility:** Every candidate recommendation is linked to raw chromatograms, specific quality metrics, component novelty scores, and paginated visual trace reports.
+
+**• Scalable Tranche Management:** Supports phased sequencing rounds (e.g., quarterly budgets), automatically updating recommendations as newly sequenced genomes become available.
+
 
 ## Quick start
 
