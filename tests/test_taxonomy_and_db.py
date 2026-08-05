@@ -25,7 +25,6 @@ from branchmanager.pipeline import novelty as novelty_pipeline
 from branchmanager.pipeline import neighbourhood as neighbourhood_pipeline
 from branchmanager.pipeline import cluster_report as cluster_report_pipeline
 from branchmanager.pipeline import background_check as background_check_pipeline
-from branchmanager.pipeline import diversity_metadata as diversity_pipeline
 from branchmanager.pipeline import mwl as mwl_pipeline
 from branchmanager.pipeline import selection_sets as selection_sets_pipeline
 from branchmanager.pipeline import quarterly_review as quarterly_review_pipeline
@@ -501,7 +500,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
             '--mwl', 'MWL.xlsx',
             '--mwl-sheet', 'MWL_V1',
             '--mwl-min-rank', 'order',
-            '--diversity-metadata', 'diversity.tsv',
             '--partner-metadata', 'partner_metadata.tsv',
             '--baseline-fasta', 'hungate.fna',
             '--baseline-dataset', 'Hungate',
@@ -516,7 +514,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.mwl, 'MWL.xlsx')
         self.assertEqual(args.mwl_sheet, 'MWL_V1')
         self.assertEqual(args.mwl_min_rank, 'order')
-        self.assertEqual(args.diversity_metadata, 'diversity.tsv')
         self.assertEqual(args.partner_metadata, 'partner_metadata.tsv')
         self.assertEqual(args.baseline_fasta, 'hungate.fna')
         self.assertEqual(args.baseline_dataset, 'Hungate')
@@ -548,7 +545,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
             '--genome-budget', '24', '--backups-per-primary', '2',
             '--tree', 'current_tree.nwk', '--alignment', 'current_alignment.fasta',
             '--assessment', 'sequence_assessment.tsv',
-            '--diversity-metadata', 'diversity.tsv',
         ])
         self.assertEqual(args.command, 'quarterly-review')
         self.assertEqual(args.genome_budget, 24)
@@ -559,7 +555,6 @@ class DatabaseBehaviourTests(unittest.TestCase):
         self.assertEqual(args.baseline_extension_min_query_coverage, 95.0)
         self.assertEqual(args.alignment, 'current_alignment.fasta')
         self.assertEqual(args.assessment, ['sequence_assessment.tsv'])
-        self.assertEqual(args.diversity_metadata, 'diversity.tsv')
 
     def test_find_preferred_id_map_prefers_filing_cabinet_mapping(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -889,6 +884,155 @@ class DatabaseBehaviourTests(unittest.TestCase):
                 cur.execute('SELECT id FROM sequences WHERE dataset = ? ORDER BY id', ('run1',))
                 rows = [r[0] for r in cur.fetchall()]
             self.assertEqual(rows, ['B1'])
+
+    def test_performance_review_runs_alt_classification_even_after_domain_prefilter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            input_fasta = tmp / 'input.fasta'
+            input_fasta.write_text('>B1\nACGT\n')
+            partner_metadata = tmp / 'partner_metadata.tsv'
+            partner_metadata.write_text(
+                'sequence_id\tpartner_id\talready_sequenced\n'
+                'B1\tUoG\tno\n'
+            )
+            baseline_fasta = tmp / 'baseline.fasta'
+            baseline_fasta.write_text('>HUN_BASELINE\nACGT\n')
+            ref_fasta = tmp / 'gtdb.fasta'
+            ref_fasta.write_text('>REF1 d__Bacteria;p__Bacillota\nACGT\n')
+            alt_ref = tmp / 'gg2.fasta'
+            alt_ref.write_text('>ALT1 d__Bacteria;p__Bacillota\nACGT\n')
+            outdir = tmp / 'out'
+            db_path = tmp / 'test.sqlite'
+            db = Database(str(db_path))
+            db.initialise()
+
+            def fake_run_classification(input_path, out_path, ref_fasta=None, taxa_tsv=None, threads=None):
+                class_path = Path(out_path) / 'taxonomy.tsv'
+                class_path.write_text(
+                    'ID\tBestHit\tIdentity\tTaxon\tConfidence\n'
+                    'B1\tREF1\t99.0\td__Bacteria; p__Bacillota\t0.95\n'
+                )
+                return str(class_path)
+
+            def fake_run_all_classifications(
+                input_fasta, out_path, primary_ref, primary_taxa=None,
+                primary_name='main', alt_refs=None, threads=None, main_db=None,
+            ):
+                class_path = Path(out_path) / 'taxonomy.tsv'
+                class_path.write_text(
+                    'ID\tBestHit\tIdentity\tTaxon\tConfidence\n'
+                    'B1\tREF1\t99.0\td__Bacteria; p__Bacillota\t0.95\n'
+                )
+                return str(class_path), {
+                    primary_name: {
+                        'B1': ('REF1', 99.0, 'd__Bacteria; p__Bacillota', 0.95, 100.0, 100.0, 4, 4, 4, 0, 0),
+                    },
+                    'GG2_2024_09': {
+                        'B1': ('ALT1', 98.5, 'd__Bacteria; p__Bacillota;g__Alt', 0.90, 100.0, 99.0, 4, 4, 4, 0, 0),
+                    },
+                }
+
+            def fake_run_novelty(input_path, _ref_path, out_path, id_threshold=0.97, threads=None, **kwargs):
+                novelty_path = Path(out_path) / 'novelty.tsv'
+                novelty_path.write_text(
+                    'ID\tNearestIdentity\tNearestHit\tNovel\n'
+                    'B1\t99.0\tREF1\tFalse\n'
+                )
+                return str(novelty_path)
+
+            def fake_build_reference_novelty_metrics(input_path, _ref_path, out_path, threads=None, **kwargs):
+                metrics_path = Path(out_path) / 'novelty_metrics.tsv'
+                metrics_path.write_text(
+                    'ID\tNearestIdentity\tNearestHit\tNovel\tMatchesGE99\tMatchesGE97\tMatchesGE95\tNoveltyScore\tCrowding\tSequencingPriority\n'
+                    'B1\t99.00\tREF1\tFalse\t1\t1\t1\t1.00\tdense\tLOW\n'
+                )
+                return str(metrics_path)
+
+            def fake_initialise_or_update_tree(*_args, **_kwargs):
+                tree_outdir = Path(outdir) / 'tree'
+                tree_outdir.mkdir(parents=True, exist_ok=True)
+                (tree_outdir / 'current_alignment.fasta').write_text('>B1\nACGT\n')
+                (tree_outdir / 'current_tree.nwk').write_text('(B1:0.1);\n')
+                return str(tree_outdir / 'current_tree.nwk')
+
+            args = Namespace(
+                command='performance-review',
+                input=str(input_fasta),
+                partner_metadata=str(partner_metadata),
+                db=str(db_path),
+                out=str(outdir),
+                ref=str(ref_fasta),
+                taxa=None,
+                dataset='run1',
+                min_len=1,
+                max_n_percent=100.0,
+                threads=1,
+                previous_review=None,
+                kingdom=None,
+                sequence_domain='bacteria',
+                collapse=False,
+                collapse_threshold=99.8,
+                taxa_assignments=None,
+                user_colours=None,
+                anchor_file=None,
+                shorten_ids=False,
+                ref_name='GTDB_r232',
+                alt_ref=[str(alt_ref)],
+                alt_taxa=[],
+                alt_ref_name=['GG2_2024_09'],
+                main_ref='GTDB_r232',
+                mwl=None,
+                mwl_sheet='MWL_V1',
+                mwl_min_rank='p',
+                baseline_fasta=str(baseline_fasta),
+                baseline_dataset='Hungate',
+                baseline_tier=None,
+                baseline_taxa_assignments=None,
+                baseline_skip_classify=False,
+                baseline_colours=None,
+                baseline_shorten_ids=False,
+                novelty_baseline_datasets=[],
+                marker_qc=None,
+                marker_review=None,
+                accept_unverified_marker_qc=False,
+                chimera_ref=None,
+                skip_chimera_check=True,
+                pangenome_target=9,
+                candidate_set_size=9,
+                baseline_redundancy_identity=99.8,
+                baseline_redundancy_min_query_coverage=95.0,
+                baseline_extension_min_identity=98.65,
+                baseline_extension_min_query_coverage=95.0,
+                group_phyla=None,
+                functional=None,
+                draft_rumen_functions=False,
+            )
+
+            with mock.patch('branchmanager.cli.qc.run_qc', side_effect=lambda *a, **k: str(input_fasta)), \
+                 mock.patch('branchmanager.cli.classify.run_classification', side_effect=fake_run_classification) as classify_mock, \
+                 mock.patch('branchmanager.cli.classify.run_all_classifications', side_effect=fake_run_all_classifications) as all_classify_mock, \
+                 mock.patch('branchmanager.cli.novelty.run_novelty', side_effect=fake_run_novelty), \
+                 mock.patch('branchmanager.cli.novelty.build_reference_novelty_metrics', side_effect=fake_build_reference_novelty_metrics), \
+                 mock.patch('branchmanager.cli.tree.initialise_or_update_tree', side_effect=fake_initialise_or_update_tree), \
+                 mock.patch('branchmanager.cli.tree.collect_tree_build_warnings', return_value=[]), \
+                 mock.patch('branchmanager.cli.tree.summarise_alignment_quality', return_value=[]), \
+                 mock.patch('branchmanager.cli.itol.generate_itol_colours'), \
+                 mock.patch('branchmanager.cli.novelty.build_run_novelty_itol'):
+                cmd_performance_review(args)
+
+            self.assertGreaterEqual(classify_mock.call_count, 1)
+            self.assertEqual(all_classify_mock.call_count, 1)
+
+            with db.connect() as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT ref_db, taxonomy, confidence FROM taxonomy_alt ORDER BY ref_db')
+                alt_rows = cur.fetchall()
+            self.assertEqual(alt_rows, [('GG2_2024_09', 'd__Bacteria; p__Bacillota;g__Alt', 0.9)])
+
+            assessment = (outdir / 'assessment' / 'sequence_assessment.tsv').read_text().splitlines()
+            header = assessment[0].split('\t')
+            self.assertIn('Taxonomy_GG2_2024_09', header)
+            self.assertIn('ClassificationHit_GG2_2024_09', header)
 
     def test_performance_review_passes_previous_review_to_tree_builder(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2473,26 +2617,6 @@ class OutputHelperTests(unittest.TestCase):
             self.assertEqual(rows[0]['reference_nearest_hit_taxonomy'], 'd__Bacteria; p__Bacillota')
             self.assertEqual(rows[0]['reference_novelty_score'], '33.60')
 
-    def test_diversity_metadata_annotation_prefers_rare_metadata_combinations(self):
-        rows = [
-            {'id': 'cow_uk', 'partner_id': 'QUB'},
-            {'id': 'yak_np', 'partner_id': 'QUB'},
-            {'id': 'cow_uk_2', 'partner_id': 'QUB'},
-        ]
-        metadata = [
-            {'source_id': 'cow_uk', 'metadata': {'host': 'cow', 'country': 'UK'}},
-            {'source_id': 'yak_np', 'metadata': {'host': 'yak', 'country': 'Nepal'}},
-            {'source_id': 'cow_uk_2', 'metadata': {'host': 'cow', 'country': 'UK'}},
-        ]
-        matched, warnings = diversity_pipeline.annotate_assessment_rows(rows, metadata)
-        self.assertEqual(matched, 3)
-        self.assertEqual(warnings, [])
-        by_id = {row['id']: row for row in rows}
-        self.assertEqual(by_id['yak_np']['diversity_metadata_present'], 'Yes')
-        self.assertEqual(by_id['yak_np']['diversity_metadata_strength'], 'HIGH')
-        self.assertGreater(float(by_id['yak_np']['diversity_metadata_score']), float(by_id['cow_uk']['diversity_metadata_score']))
-        self.assertIn('host=yak', by_id['yak_np']['diversity_metadata_reason'])
-
     def test_write_selection_summary_tsv_keeps_board_facing_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir) / 'selection_summary.tsv'
@@ -2521,6 +2645,8 @@ class OutputHelperTests(unittest.TestCase):
                     'genome_selected_count_same_species': '0',
                     'pangenome_target': '3',
                     'pangenome_gap': '3',
+                    'nearest_genome_identity': '99.20',
+                    'cluster_size': '4',
                     'sequencing_set_id': 'SET_A',
                     'sequencing_set_role': 'PRIMARY',
                     'sequencing_set_rank': '1',
@@ -2528,14 +2654,9 @@ class OutputHelperTests(unittest.TestCase):
                     'mwl_matched_rank': 'genus',
                     'mwl_matched_taxon': 'g__Novel',
                     'mwl_score': '88.00',
-                    'diversity_metadata_present': 'Yes',
-                    'diversity_metadata_strength': 'HIGH',
-                    'diversity_metadata_score': '95.00',
-                    'diversity_metadata_informative_fields': '2',
-                    'diversity_metadata_reason': 'host=yak (1/2); country=nepal (1/2)',
                     'in_tree': 'Yes',
                     'cluster_representative': 'self',
-                    'cluster_size': '1',
+                    'cluster_size': '4',
                     'placement_flags': '',
                     'marker_qc_class': 'PASS_HIGH_CONFIDENCE',
                     'marker_qc_recommendation': 'ACCEPT',
@@ -2568,6 +2689,7 @@ class OutputHelperTests(unittest.TestCase):
                     'genome_selected_count_same_species': '1',
                     'pangenome_target': '3',
                     'pangenome_gap': '0',
+                    'cluster_size': '1',
                     'sequencing_set_id': 'SET_B',
                     'sequencing_set_role': 'TARGET_MET',
                     'mwl_match': 'No',
@@ -2592,11 +2714,10 @@ class OutputHelperTests(unittest.TestCase):
             )
             self.assertIn('HIGH	PASS_HIGH_CONFIDENCE	NOT_REQUIRED', text)
             self.assertIn('MWL target match (g__Novel)', text)
-            self.assertIn('diversity metadata supports an underrepresented isolate', text)
-            self.assertIn('DiversityMetadataPresent', text)
             self.assertIn('neighbourhoods/clade_001.png', text)
             self.assertIn('Iso002\tUoG\tFalse\tNA\tLOWER PRIORITY - TARGET MET\tSET_B\tTARGET_MET', text)
             self.assertIn('assessment-species pangenome target already met', text)
+            self.assertIn('POSSIBLE TAXONOMY SPLIT - 99.20% nearest genome within a 4-member cluster', text)
 
     def test_selection_decision_does_not_treat_related_available_genome_as_duplicate(self):
         decision = build_selection_decision({
@@ -2983,29 +3104,6 @@ class OutputHelperTests(unittest.TestCase):
             text = Path(output).read_text()
             self.assertIn('DiversityPanelSize\tEligibleCandidateCount\tRankedCandidateCount', text)
             self.assertIn('BaselineRedundancyIdentityThreshold', text)
-
-    def test_selection_fallback_prefers_diversity_metadata_on_boundary_ties(self):
-        common = {
-            'partner_id': 'QUB',
-            'taxonomy': 'd__Bacteria; g__Panel; s__Panel species',
-            'classification_identity': '99.0', 'classification_confidence': '0.99',
-            'nearest_query_coverage': '100.0', 'project_nearest_identity': '98.0',
-            'reference_nearest_identity': '98.0', 'selected_for_genome_sequencing': 'False',
-            'already_sequenced': 'False', 'genome_committed_count_same_species': '0',
-            'placement_flags': '',
-            'nearest_identity': '97.5',
-        }
-        rows = [
-            {**common, 'id': 'COMMON', 'diversity_metadata_present': 'Yes', 'diversity_metadata_strength': 'LOW', 'diversity_metadata_score': '10.00', 'diversity_metadata_reason': 'host=cow (10/10)'},
-            {**common, 'id': 'DIVERSE', 'diversity_metadata_present': 'Yes', 'diversity_metadata_strength': 'HIGH', 'diversity_metadata_score': '92.00', 'diversity_metadata_reason': 'host=yak (1/10)'},
-            {**common, 'id': 'MWL', 'mwl_matched_rank': 'species', 'mwl_score': '100', 'diversity_metadata_present': 'No', 'diversity_metadata_strength': 'NA', 'diversity_metadata_score': '0.00', 'diversity_metadata_reason': 'no diversity metadata supplied'},
-        ]
-        with tempfile.TemporaryDirectory() as tmpdir:
-            selection_sets_pipeline.build_sequencing_sets(rows, Path(tmpdir) / 'sets.tsv')
-
-        ranks = {row['id']: int(row['sequencing_set_rank']) for row in rows}
-        self.assertEqual(ranks['DIVERSE'], 1)
-        self.assertLess(ranks['DIVERSE'], ranks['COMMON'])
 
     def test_selection_fallback_ranks_diversity_before_mwl_and_uses_mwl_as_tiebreak(self):
         common = {

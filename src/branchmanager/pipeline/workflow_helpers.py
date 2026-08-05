@@ -1056,7 +1056,7 @@ def _genome_coverage(row: dict) -> str:
     if committed is not None and gap is not None:
         if gap <= 0:
             return f'TARGET MET - {committed}/{target} assessment-species genomes'
-        return f'PANGENOME GAP - {committed}/{target} genomes committed; {gap} required'
+        return f'PANGENOME GAP - {committed}/{target} assessment-species genomes committed; {gap} required'
     identity = _as_float(row.get('nearest_genome_identity'))
     if identity is None or identity <= 0:
         return 'NOT REPRESENTED'
@@ -1065,6 +1065,27 @@ def _genome_coverage(row: dict) -> str:
     if identity >= 97.0:
         return f'RELATED AVAILABLE GENOME - {identity:.2f}%'
     return f'NOT CLOSELY REPRESENTED - nearest {identity:.2f}%'
+
+
+def _species_context(row: dict) -> str:
+    pangenome_gap = _as_int(row.get('pangenome_gap'))
+    if pangenome_gap is None or pangenome_gap <= 0:
+        return ''
+    nearest = _as_float(row.get('nearest_genome_identity'))
+    if nearest is None or nearest <= 0:
+        return ''
+    cluster_size = _as_int(row.get('cluster_size'))
+    project_identity = _as_float(row.get('project_nearest_identity'))
+    project_hits = _as_int(row.get('project_matches_ge_97'))
+    if nearest >= 98.65:
+        if cluster_size is not None and cluster_size > 1:
+            return f'POSSIBLE TAXONOMY SPLIT - {nearest:.2f}% nearest genome within a {cluster_size}-member cluster'
+        return f'POSSIBLE TAXONOMY SPLIT - {nearest:.2f}% nearest genome'
+    if project_identity is not None and project_identity >= 97.0 and project_hits is not None and project_hits > 0:
+        return f'POSSIBLE TAXONOMY SPLIT - {project_hits} project neighbour(s) at >=97%'
+    if cluster_size is not None and cluster_size > 1:
+        return f'CLUSTER CONTEXT - {cluster_size}-member local cluster'
+    return ''
 
 
 def _evidence_quality(row: dict) -> str:
@@ -1106,6 +1127,7 @@ def build_selection_decision(row: dict) -> dict:
     project_coverage = _project_coverage(row)
     reference_context = _reference_context(row)
     genome_coverage = _genome_coverage(row)
+    species_context = _species_context(row)
     evidence_quality = _evidence_quality(row)
     selected = genome_coverage == 'CURRENT ISOLATE ALREADY SEQUENCED'
     pending = genome_coverage == 'CURRENT ISOLATE SELECTED - GENOME PENDING'
@@ -1203,6 +1225,7 @@ def build_selection_decision(row: dict) -> dict:
         'project_coverage': project_coverage,
         'reference_context': reference_context,
         'genome_coverage': genome_coverage,
+        'species_context': species_context,
         'decision_reason': '; '.join(reasons),
     }
 
@@ -1302,6 +1325,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
         'PangenomeTarget',
         'PangenomeGap',
         'GenomeCoverage',
+        'SpeciesContext',
         'LocalTreeFigure',
         'RecommendationReason',
     ]
@@ -1395,6 +1419,7 @@ def write_selection_summary_tsv(path: str | Path, rows, assessment_db_name: str 
                 row.get('pangenome_target', 'NA'),
                 row.get('pangenome_gap', 'NA'),
                 support['genome_coverage'],
+                support['species_context'] or 'NA',
                 row.get('local_neighbourhood_figure', 'NA'),
                 support['decision_reason'],
             ]

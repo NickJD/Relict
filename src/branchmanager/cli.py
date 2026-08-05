@@ -34,7 +34,6 @@ from branchmanager.pipeline import (
     tree,
 )
 from branchmanager.pipeline import cluster_report as _cluster_report
-from branchmanager.pipeline import diversity_metadata as _diversity_metadata
 from branchmanager.pipeline import mwl as _mwl
 from branchmanager.pipeline import selection_sets as _selection_sets
 from branchmanager.pipeline.classify import _derive_db_name as _classify_derive_db_name
@@ -153,33 +152,6 @@ def _write_partner_metadata_warnings(path: str | Path, warning_rows):
             handle.write(f'{source_id}\t{reason}\n')
     return str(p)
 
-
-def _write_diversity_metadata_warnings(path: str | Path, warning_rows):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, 'w') as handle:
-        handle.write('SourceID\tReason\n')
-        for source_id, reason in warning_rows:
-            handle.write(f'{source_id}\t{reason}\n')
-    return str(p)
-
-
-def _load_diversity_metadata_for_rows(args, rows, outdir: str, command: str):
-    metadata_path = getattr(args, 'diversity_metadata', None)
-    if metadata_path:
-        try:
-            metadata_rows = _diversity_metadata.load_diversity_metadata(metadata_path)
-        except Exception as e:
-            raise SystemExit(f'[{command.upper()}] Failed to read diversity metadata {metadata_path}: {e}')
-    else:
-        metadata_rows = []
-    matched_count, warnings = _diversity_metadata.annotate_assessment_rows(rows, metadata_rows)
-    if metadata_path and warnings:
-        warn_path = _write_diversity_metadata_warnings(Path(outdir) / 'diversity_metadata_warnings.tsv', warnings)
-        logging.getLogger(__name__).warning(
-            '[%s] Diversity metadata warnings written to %s', command.upper(), warn_path,
-        )
-    return matched_count
 
 def _load_partner_metadata_for_run(args, db: Database, outdir: str, orig_to_short: dict, run_ids):
     metadata_path = getattr(args, 'partner_metadata', None)
@@ -453,7 +425,7 @@ def _write_detailed_output_guide(outdir: Path, rows):
         "- `CulturedGap`: distance from the cultured baseline: large below 97 percent, moderate from 97 to below 98.65 percent, small at or above 98.65 percent.",
         "- `ProjectCoverage`: number of other partner candidates at or above 97 percent identity, including the current rolling collection but excluding the query itself.",
         "- `ReferenceContext`: divergence from the external reference using 94.5 and 98.65 percent full-length 16S heuristic boundaries.",
-        "- `CommittedGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeTarget`, `PangenomeGap`: exact GTDB-species coverage and commitments. Baselines and completed partner genomes are available; selected pending isolates reserve planned slots.",
+        "- `CommittedGenomesSameAssessmentSpecies`, `SelectedPendingGenomesSameAssessmentSpecies`, `PangenomeTarget`, `PangenomeGap`: exact GTDB-species coverage and commitments. Baselines and completed partner genomes are available; selected pending isolates reserve planned slots. `SpeciesContext` adds a soft near-species or cluster-level note without relaxing the hard species gate.",
         "- `LocalTreeFigure`: relative path to the grouped local-clade PNG for visual inspection.",
         "",
         "These boundaries are decision-support heuristics, not declarations of a new species or genus. Genome analysis remains necessary for formal novelty claims.",
@@ -1504,15 +1476,6 @@ def _cmd_filing_cabinet_impl(args):
         try:
             tree_path = Path(outdir) / 'current_tree.nwk'
             tfile = str(tree_path) if tree_path.exists() else _find_tree_file_in_dir(outdir)
-            if tfile == None:
-                logging.getLogger(__name__).info(
-                    "[FILING CABINET] No tree generated but there probably should have been?"
-                )
-                # write brief explanations for files produced by the Filing Cabinet
-                try:
-                    _write_output_explanations(outdir)
-                except Exception:
-                    pass
             itol.generate_itol_colours(str(combined_tax), outdir, user_colour_csv=getattr(args, 'colours', None), id_map=id_map, tree_file=tfile, phylum_groups=getattr(args, 'group_phyla', None))
             logging.getLogger(__name__).info("[FILING CABINET] Generated iTOL colour files in %s", outdir)
         except TypeError:
@@ -1965,30 +1928,36 @@ def _cmd_performance_review_impl(args):
         # Only run classification here if we did not already run an early
         # pre-insert classification for kingdom filtering and the user did
         # not supply taxa_assignments.
-        if 'early_class_out' in locals() and early_class_out:
+        alt_databases = _build_alt_databases(args)
+        ref_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
+        run_main_db_name = getattr(args, 'main_ref', None) or ref_name
+
+        if alt_databases:
+            if early_class_out:
+                logging.getLogger(__name__).info(
+                    "[PERFORMANCE REVIEW] Domain-filter preclassification will not be reused for final output; "
+                    "running multi-database classification so alternate taxonomy is persisted."
+                )
+            logging.getLogger(__name__).info(
+                "[PERFORMANCE REVIEW] Multi-database classification: primary=%s, alt=%s, main=%s",
+                ref_name, [n for _, _, n in alt_databases], run_main_db_name,
+            )
+            class_out, all_class_results = classify.run_all_classifications(
+                str(current_dataset_fasta), outdir,
+                primary_ref=effective_ref,
+                primary_taxa=effective_taxa_tsv,
+                primary_name=ref_name,
+                alt_refs=alt_databases,
+                threads=threads,
+                main_db=run_main_db_name,
+            )
+            _store_alt_taxonomy_in_db(db, all_class_results, run_main_db_name)
+        elif early_class_out:
             class_out = early_class_out
         else:
-            alt_databases = _build_alt_databases(args)
-            ref_name = getattr(args, 'ref_name', None) or _classify_derive_db_name(effective_ref)
-            run_main_db_name = getattr(args, 'main_ref', None) or ref_name
-
-            if alt_databases:
-                logging.getLogger(__name__).info(
-                    "[PERFORMANCE REVIEW] Multi-database classification: primary=%s, alt=%s, main=%s",
-                    ref_name, [n for _, _, n in alt_databases], run_main_db_name,
-                )
-                class_out, all_class_results = classify.run_all_classifications(
-                    str(current_dataset_fasta), outdir,
-                    primary_ref=effective_ref,
-                    primary_taxa=effective_taxa_tsv,
-                    primary_name=ref_name,
-                    alt_refs=alt_databases,
-                    threads=threads,
-                    main_db=run_main_db_name,
-                )
-                _store_alt_taxonomy_in_db(db, all_class_results, run_main_db_name)
-            else:
-                class_out = classify.run_classification(str(current_dataset_fasta), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads)
+            class_out = classify.run_classification(
+                str(current_dataset_fasta), outdir, ref_fasta=effective_ref, taxa_tsv=effective_taxa_tsv, threads=threads
+            )
 
     if (
         getattr(args, 'command', None) == 'performance-review'
@@ -2489,7 +2458,6 @@ def _cmd_performance_review_impl(args):
                         if chimera_flag not in flags:
                             flags.append(chimera_flag)
                         assessment_row['placement_flags'] = ';'.join(flags)
-                _load_diversity_metadata_for_rows(args, assessment_rows, outdir, 'performance-review')
                 mwl_path = getattr(args, 'mwl', None)
                 mwl_entries = []
                 if mwl_path:
@@ -2663,19 +2631,9 @@ def _cmd_performance_review_impl(args):
                 try:
                     snapshot_id = f'{run_dataset}:{Path(outdir).resolve()}'
                     snapshot_source = Path(outdir).resolve() / 'assessment' / 'sequence_assessment.tsv'
-                    snapshot_rows = []
-                    for assessment_row in assessment_rows:
-                        stripped = dict(assessment_row)
-                        for key in (
-                            'diversity_metadata_present', 'diversity_metadata_strength',
-                            'diversity_metadata_score', 'diversity_metadata_informative_fields',
-                            'diversity_metadata_reason',
-                        ):
-                            stripped.pop(key, None)
-                        snapshot_rows.append(stripped)
                     saved = db.save_assessment_snapshot(
                         snapshot_id,
-                        snapshot_rows,
+                        assessment_rows,
                         dataset=run_dataset,
                         source_path=str(snapshot_source),
                     )
@@ -2748,7 +2706,7 @@ def cmd_performance_review(args):
     for role, source in (
         ('marker_fasta', args.input), ('partner_metadata', getattr(args, 'partner_metadata', None)),
         ('primary_reference', getattr(args, 'ref', None)), ('reference_taxonomy', getattr(args, 'taxa', None)),
-        ('baseline_fasta', getattr(args, 'baseline_fasta', None)), ('mwl', getattr(args, 'mwl', None)), ('diversity_metadata', getattr(args, 'diversity_metadata', None)),
+        ('baseline_fasta', getattr(args, 'baseline_fasta', None)), ('mwl', getattr(args, 'mwl', None)),
         ('marker_qc', getattr(args, 'marker_qc', None)), ('marker_review', getattr(args, 'marker_review', None)),
         ('baseline_taxonomy', getattr(args, 'baseline_taxa_assignments', None)),
         ('chimera_reference', getattr(args, 'chimera_ref', None)),
@@ -3359,8 +3317,8 @@ def build_parser():
         help='Replace input headers with compact IDs (e.g. HUN001). Default is to preserve the IDs exactly as supplied.')
     filing_cabinet_parser.add_argument('--classify', action='store_true',
         help='Classify sequences against --ref and store taxonomy in the DB. Requires --ref.')
-    filing_cabinet_parser.add_argument('--build-tree', action='store_false',
-        help='Don\'t build the backbone MAFFT + FastTree phylogenetic tree after loading.')
+    filing_cabinet_parser.add_argument('--build-tree', action='store_true',
+        help='Build the backbone MAFFT + FastTree phylogenetic tree after loading.')
     filing_cabinet_parser.add_argument('--ref', required=False,
         help='Reference FASTA (GTDB/SILVA reps) for classification and tree orientation. Preferred over --taxa-assignments for externally classified inputs.')
     filing_cabinet_parser.add_argument('--taxa', required=False,
@@ -3477,8 +3435,6 @@ def build_parser():
         help='Most Wanted List workbook/TSV/CSV. GTDB taxonomy is matched against this list and MWL columns are added to sequence_assessment.tsv.')
     performance_review_parser.add_argument('--mwl-sheet', dest='mwl_sheet', required=False, default='MWL_V1',
         help='Sheet name to read from an MWL .xlsx workbook (default: MWL_V1).')
-    performance_review_parser.add_argument('--diversity-metadata', dest='diversity_metadata', required=False, default=None,
-        help='Optional CSV/TSV sidecar metadata with isolate-level host/country/site fields used to bias boundary selections toward diversity.')
     performance_review_parser.add_argument('--mwl-min-rank', dest='mwl_min_rank', required=False, default='p',
         choices=['domain', 'd', 'phylum', 'p', 'class', 'c', 'order', 'o', 'family', 'f', 'genus', 'g', 'species', 's'],
         help='Minimum matched rank required for an MWL hit (default: phylum). Domain-only MWL entries still match at domain.')
@@ -3649,8 +3605,6 @@ def build_parser():
         help='Import a full sequence_assessment.tsv before selection (repeatable; later files supersede earlier rows). Future Performance Reviews store snapshots automatically.')
     quarterly_review_parser.add_argument('--partner-metadata', '--sequencing-metadata', dest='partner_metadata', default=None,
         help='Optional cumulative metadata TSV/CSV used to refresh confirmed already_sequenced status before this round.')
-    quarterly_review_parser.add_argument('--diversity-metadata', dest='diversity_metadata', default=None,
-        help='Optional CSV/TSV sidecar metadata with isolate-level host/country/site fields used to bias boundary selections toward diversity.')
     quarterly_review_parser.add_argument('--tree', default=None,
         help='Latest cumulative Newick tree. Enables marginal patristic-diversity ranking.')
     quarterly_review_parser.add_argument('--alignment', default=None,
@@ -4064,8 +4018,6 @@ def build_parser():
     assistant_parser.add_argument('--baseline-tier', choices=['priority', 'secondary'], default=None)
     assistant_parser.add_argument('--baseline-taxa-assignments', default=None)
     assistant_parser.add_argument('--mwl', default=None)
-    assistant_parser.add_argument('--diversity-metadata', dest='diversity_metadata', default=None,
-        help='Optional CSV/TSV sidecar metadata with isolate-level host/country/site fields used to bias boundary selections toward diversity.')
     assistant_parser.add_argument('--sequence-domain', choices=SEQUENCE_DOMAIN_CHOICES, default='bacteria')
     assistant_parser.add_argument('--threads', type=int, default=4,
         help='CPU threads for vsearch and MAFFT (default: 4).')
@@ -4435,8 +4387,7 @@ def cmd_paper_trail(args):
         primer_sequences[name.strip().upper()] = sequence
     manifest = RunManifest(outdir, workflow_name)
     dataset_hint = (
-        str(getattr(args, 'dataset', '') or '').strip()
-        or _infer_qc_dataset_from_path(sample_map)
+        _infer_qc_dataset_from_path(sample_map)
         or _infer_qc_dataset_from_path(getattr(args, 'mailroom_summary', None))
         or _infer_qc_dataset_from_path(outdir)
     )
@@ -4868,7 +4819,7 @@ def cmd_assistant(args):
         ('partner_metadata', args.partner_metadata), ('marker_qc', args.marker_qc),
         ('marker_review', args.marker_review),
         ('primary_reference', args.ref), ('reference_taxonomy', args.taxa),
-        ('baseline_fasta', args.baseline_fasta), ('mwl', args.mwl), ('diversity_metadata', args.diversity_metadata),
+        ('baseline_fasta', args.baseline_fasta), ('mwl', args.mwl),
         ('baseline_taxonomy', args.baseline_taxa_assignments),
         ('chimera_reference', args.chimera_ref),
     ):
@@ -4904,7 +4855,6 @@ def cmd_assistant(args):
         if args.sample_map:
             trace_args = argparse.Namespace(
                 command='paper-trail', input=[], out=str(paper_trail_dir),
-                dataset=args.dataset,
                 sample_map=str(onboarding_dir / 'normalised_read_map.tsv'), primers=args.primers,
                 primer_sequences=args.primer_sequences, trim_primers=args.trim_primers,
                 min_quality=args.min_quality, min_length=args.min_length,
@@ -4946,7 +4896,7 @@ def cmd_assistant(args):
         performance_review_dir = root / '03_performance_review_hiring_panel'
         performance_review_args = argparse.Namespace(
             command='performance-review', input=str(marker_input),
-            partner_metadata=args.partner_metadata, diversity_metadata=args.diversity_metadata, db=args.db, dataset=args.dataset,
+            partner_metadata=args.partner_metadata, db=args.db, dataset=args.dataset,
             out=str(performance_review_dir), ref=args.ref, taxa=args.taxa, ref_name=args.ref_name,
             alt_ref=args.alt_ref, alt_taxa=args.alt_taxa, alt_ref_name=args.alt_ref_name,
             main_ref=args.ref_name, baseline_fasta=args.baseline_fasta,
@@ -5049,9 +4999,6 @@ def _cmd_quarterly_review_impl(args):
             'BranchManager version or provide --assessment path/to/sequence_assessment.tsv.'
         )
 
-    diversity_rows = list(latest.values())
-    _load_diversity_metadata_for_rows(args, diversity_rows, outdir, 'quarterly-review')
-
     tree_path = getattr(args, 'tree', None)
     if not tree_path and getattr(args, 'from_dir', None):
         tree_path = _find_tree_file_in_dir(args.from_dir)
@@ -5093,7 +5040,7 @@ def _cmd_quarterly_review_impl(args):
         'AssessmentRows': len(latest),
     }
     recommendations = quarterly_review.build_quarterly_review(
-        diversity_rows,
+        list(latest.values()),
         db=db,
         tree_path=tree_path,
         alignment_path=alignment_path,
@@ -5182,7 +5129,6 @@ def cmd_quarterly_review(args):
         manifest.add_input(source, role='assessment_import')
     for role, source in (
         ('partner_metadata', getattr(args, 'partner_metadata', None)),
-        ('diversity_metadata', getattr(args, 'diversity_metadata', None)),
         ('tree', getattr(args, 'tree', None)), ('alignment', getattr(args, 'alignment', None)),
     ):
         if source:

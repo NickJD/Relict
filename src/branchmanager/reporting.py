@@ -34,7 +34,7 @@ def write_performance_review_dashboard(selection_summary: str | Path, outdir: st
         'SequenceID', 'PartnerID', 'Recommendation', 'SequencingSetRole',
         'SequencingSetRank', 'SelectionGroupType', 'SelectionDiversityDistance', 'EvidenceQuality', 'MarkerQC',
         'GTDBTaxonomy', 'CulturedGap', 'BaselineExtensionStatus', 'BaselineRedundancyStatus', 'ProjectCoverage',
-        'MWLMatchedRank', 'GenomeCoverage', 'LocalTreeFigure', 'RecommendationReason',
+        'MWLMatchedRank', 'GenomeCoverage', 'SpeciesContext', 'LocalTreeFigure', 'RecommendationReason',
     ]
     available = list(rows[0]) if rows else []
     columns = [column for column in columns if column in available]
