@@ -2717,7 +2717,7 @@ class OutputHelperTests(unittest.TestCase):
             self.assertIn('neighbourhoods/clade_001.png', text)
             self.assertIn('Iso002\tUoG\tFalse\tNA\tLOWER PRIORITY - TARGET MET\tSET_B\tTARGET_MET', text)
             self.assertIn('assessment-species pangenome target already met', text)
-            self.assertIn('POSSIBLE TAXONOMY SPLIT - 99.20% nearest genome within a 4-member cluster', text)
+            self.assertIn('POSSIBLE TAXONOMY SPLIT - 99.20% nearest genome within a 4-member cluster; labels may split near-identical genomes', text)
 
     def test_selection_decision_does_not_treat_related_available_genome_as_duplicate(self):
         decision = build_selection_decision({

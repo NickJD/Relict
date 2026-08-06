@@ -1079,10 +1079,10 @@ def _species_context(row: dict) -> str:
     project_hits = _as_int(row.get('project_matches_ge_97'))
     if nearest >= 98.65:
         if cluster_size is not None and cluster_size > 1:
-            return f'POSSIBLE TAXONOMY SPLIT - {nearest:.2f}% nearest genome within a {cluster_size}-member cluster'
-        return f'POSSIBLE TAXONOMY SPLIT - {nearest:.2f}% nearest genome'
+            return f'POSSIBLE TAXONOMY SPLIT - {nearest:.2f}% nearest genome within a {cluster_size}-member cluster; labels may split near-identical genomes'
+        return f'POSSIBLE TAXONOMY SPLIT - {nearest:.2f}% nearest genome; labels may split near-identical genomes'
     if project_identity is not None and project_identity >= 97.0 and project_hits is not None and project_hits > 0:
-        return f'POSSIBLE TAXONOMY SPLIT - {project_hits} project neighbour(s) at >=97%'
+        return f'POSSIBLE TAXONOMY SPLIT - {project_hits} project neighbour(s) at >=97%; labels may split near-identical genomes'
     if cluster_size is not None and cluster_size > 1:
         return f'CLUSTER CONTEXT - {cluster_size}-member local cluster'
     return ''
