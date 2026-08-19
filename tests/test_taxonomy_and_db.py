@@ -627,6 +627,38 @@ class DatabaseBehaviourTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 db.register_filing_cabinet(str(fasta), dataset='Hungate', outdir=str(tmp), shorten_ids=False)
 
+    def test_filing_cabinet_strips_pipe_suffix_from_ids_when_shortening_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fasta = tmp / 'baseline.fasta'
+            fasta.write_text(
+                '>BHURE-022|Enterococcus_Enterococcus_mundtii_BHURE-022_Enterococcus\nACGT\n'
+                '>H1000-P-2593339267|Streptococcus_Streptococcus_equinus_H1000-P-2593339267_Streptococcus\nTGCA\n'
+            )
+            db = Database(os.path.join(tmpdir, 'test.sqlite'))
+            db.initialise()
+
+            alias_entries, mapped_fasta = db.register_filing_cabinet(
+                str(fasta),
+                dataset='Hungate',
+                outdir=str(tmp),
+                shorten_ids=False,
+            )
+
+            self.assertEqual(
+                alias_entries,
+                [
+                    ('BHURE-022', 'BHURE-022|Enterococcus_Enterococcus_mundtii_BHURE-022_Enterococcus'),
+                    ('H1000-P-2593339267', 'H1000-P-2593339267|Streptococcus_Streptococcus_equinus_H1000-P-2593339267_Streptococcus'),
+                ],
+            )
+            headers = [h for h, _ in read_fasta(mapped_fasta)]
+            self.assertEqual(headers, ['BHURE-022', 'H1000-P-2593339267'])
+            with db.connect() as conn:
+                cur = conn.cursor()
+                cur.execute('SELECT id FROM sequences ORDER BY id')
+                self.assertEqual([row[0] for row in cur.fetchall()], ['BHURE-022', 'H1000-P-2593339267'])
+
     def test_performance_review_uses_external_fasta_taxa_assignments_as_reference(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

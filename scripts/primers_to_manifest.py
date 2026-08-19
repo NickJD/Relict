@@ -6,6 +6,70 @@ import csv
 from pathlib import Path
 
 
+AB1_SUFFIXES = ('.ab1', '.abi', '.ab1.gz', '.abi.gz')
+
+
+def _strip_ab1_suffix(value):
+    name = Path(str(value)).name
+    lower = name.lower()
+    for suffix in sorted(AB1_SUFFIXES, key=len, reverse=True):
+        if lower.endswith(suffix):
+            return name[:-len(suffix)]
+    return Path(name).stem
+
+
+def _build_source_index(source_dir):
+    index = {}
+    for child in source_dir.rglob('*'):
+        if not child.is_file():
+            continue
+        stem = _strip_ab1_suffix(child)
+        keys = {
+            child.name.casefold(),
+            child.stem.casefold(),
+            stem.casefold(),
+            Path(stem).name.casefold(),
+        }
+        for key in keys:
+            if not key:
+                continue
+            index.setdefault(key, []).append(child)
+    return index
+
+
+def _resolve_source_file(source_dir, value, source_index):
+    supplied = Path(str(value)).expanduser()
+    if supplied.is_absolute() and supplied.is_file():
+        return supplied
+
+    direct = source_dir / supplied
+    if direct.is_file():
+        return direct
+
+    stem = _strip_ab1_suffix(value)
+    candidates = {
+        str(value).strip().casefold(),
+        Path(str(value)).name.casefold(),
+        supplied.name.casefold(),
+        stem.casefold(),
+        Path(stem).name.casefold(),
+    }
+
+    for suffix in AB1_SUFFIXES:
+        candidates.add(f"{stem}{suffix}".casefold())
+
+    matches = []
+    seen = set()
+    for key in candidates:
+        for path in source_index.get(key, []):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            matches.append(resolved)
+            seen.add(resolved)
+    return sorted(matches)[0] if matches else None
+
+
 def process_files(input_excel, input_dir, output_dir, manifest_name):
     # Convert strings to Path objects
     input_path = Path(input_excel)
@@ -35,6 +99,7 @@ def process_files(input_excel, input_dir, output_dir, manifest_name):
             print(f"Found columns: {df.columns.tolist()}")
             return
 
+        source_index = _build_source_index(source_dir)
         manifest_data = []
 
         print("Processing rows...")
@@ -85,14 +150,14 @@ def process_files(input_excel, input_dir, output_dir, manifest_name):
                     direction = primer_identifier
 
 
-                src_file = source_dir / filename
+                src_file = _resolve_source_file(source_dir, filename, source_index)
 
-                if src_file.exists():
-                    dest_file = dest_dir / filename
+                if src_file:
+                    dest_file = dest_dir / src_file.name
                     shutil.copy2(src_file, dest_file)
 
                     # Append to manifest list: [ID, filename, direction, clean_primer_name]
-                    manifest_data.append([sample_id, filename, direction, primer_name])
+                    manifest_data.append([sample_id, src_file.name, direction, primer_name])
                 else:
                     print(f"Warning: File not found: {filename} (Sample: {sample_id})")
 

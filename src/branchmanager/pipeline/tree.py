@@ -586,6 +586,36 @@ def _resolve_iqtree_binary() -> Optional[str]:
     return None
 
 
+def _resolve_tree_builder_binary(tree_method: str) -> tuple[Optional[str], tuple[str, ...]]:
+    if tree_method in ("iqtree", "iqtree-fast"):
+        return _resolve_iqtree_binary(), ("iqtree2", "iqtree", "IQ-TREE", "iqtree-omp")
+    for candidate in ("FastTree", "fasttree"):
+        found = _shutil.which(candidate)
+        if found:
+            return found, ("FastTree", "fasttree")
+    return None, ("FastTree", "fasttree")
+
+
+def preflight_tree_tools(tree_method: str = "fasttree", *, require_mafft: bool = True) -> None:
+    """Fail fast when tree-building dependencies are unavailable."""
+    details: list[str] = []
+
+    if require_mafft and not _shutil.which("mafft"):
+        details.append("mafft (mafft)")
+
+    tree_binary, tree_candidates = _resolve_tree_builder_binary(tree_method)
+    if not tree_binary:
+        tool = "iqtree" if tree_method in ("iqtree", "iqtree-fast") else "FastTree"
+        details.append(f"{tool} ({', '.join(tree_candidates)})")
+
+    if details:
+        raise RuntimeError(
+            "Missing required external tools for tree building: "
+            + "; ".join(details)
+            + ". Install them and rerun the command."
+        )
+
+
 def _run_iqtree(
     aln_path: Path,
     tree_path: Path,
@@ -979,6 +1009,8 @@ def initialise_or_update_tree(
     current_aln = out / "current_alignment.fasta"
     current_tree = out / "current_tree.nwk"
     threads = int(threads) if threads and int(threads) > 0 else 4
+
+    preflight_tree_tools(tree_method, require_mafft=True)
 
     resolved_anchor_file = get_anchor_file(anchor_file)
     orientation_summary = out / 'tree_orientation_summary.tsv'

@@ -926,9 +926,9 @@ class Database:
         """Return the runtime ID to use for a sequence.
 
         When `shorten_ids` is True, generate a deterministic compact ID.
-        Otherwise, use the source FASTA header exactly as supplied (trimmed)
-        and fail fast on exact collisions so users do not silently merge
-        distinct records.
+        Otherwise, use the leading sequence token from the FASTA header
+        (trimmed at whitespace and `|`) and fail fast on exact collisions so
+        users do not silently merge distinct records.
         """
         if shorten_ids:
             return self.generate_short_id(header, used_set)
@@ -947,6 +947,11 @@ class Database:
         if header is None:
             return None
         value = str(header).strip()
+        if not value:
+            return None
+        #value = value.split()[0] - was trimming on any empty space
+        if '|' in value:
+            value = value.split('|', 1)[0]
         return value or None
 
     def _canonical_from_header(self, header: str) -> str:

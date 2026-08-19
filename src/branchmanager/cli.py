@@ -1551,6 +1551,8 @@ def cmd_filing_cabinet(args):
     outdir.mkdir(parents=True, exist_ok=True)
     original = Path(args.db).expanduser().resolve()
     original.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'build_tree', False):
+        tree.preflight_tree_tools(getattr(args, 'tree_method', 'fasttree'))
     manifest = RunManifest(outdir, 'filing_cabinet')
     manifest.add_input(args.fasta, role='baseline_fasta')
     for role, source in (
@@ -2697,6 +2699,7 @@ def cmd_performance_review(args):
     original_db = Path(args.db).expanduser().resolve()
     if str(args.db) == ':memory:':
         raise SystemExit('[PERFORMANCE REVIEW] A persistent --db path is required for the rolling workflow.')
+    tree.preflight_tree_tools(getattr(args, 'tree_method', 'fasttree'))
     outdir = Path(args.out).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     original_db.parent.mkdir(parents=True, exist_ok=True)
@@ -3015,6 +3018,7 @@ def _build_org_chart(
     import re
 
     out = Path(outdir)
+    tree.preflight_tree_tools('fasttree', require_mafft=False)
     # Reuse an existing alignment when available.
     aln_candidates = [
         Path(from_dir) / 'current_alignment.fasta',
@@ -3069,6 +3073,7 @@ def _build_org_chart(
             return
 
     log.info("[ORG-CHART] Slow path: full MAFFT + FastTree build")
+    tree.preflight_tree_tools('fasttree', require_mafft=True)
     seqs_fasta = out / 'org_chart_input_sequences.fasta'
     write_fasta([(sid, seq) for sid, seq, *_ in matched], str(seqs_fasta))
 
